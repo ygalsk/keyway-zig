@@ -1,0 +1,25 @@
+.{
+    .name = .keystone,
+    .version = "0.1.0",
+    .minimum_zig_version = "0.15.0",
+    .fingerprint = 0xc202aef8eec77191,
+
+    .dependencies = .{
+        .libxev = .{
+            .url = "https://github.com/mitchellh/libxev/archive/refs/heads/main.tar.gz",
+            .hash = "libxev-0.0.0-86vtcz8bEwB9PLXxMMckZwulRxoKleuLsrffobuUv993",
+        },
+        .luajit = .{
+            .url = "https://github.com/sackosoft/zig-luajit/archive/refs/heads/main.tar.gz",
+            .hash = "luajit-2.1.0-nMGF0kPDAwCHuZVz5A5rFIuxewhLyhCBaar1YJbtICyi",
+        },
+    },
+
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+        "scripts",
+        "examples",
+    },
+}
