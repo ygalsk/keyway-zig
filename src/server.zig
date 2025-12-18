@@ -4,6 +4,7 @@ const Loop = @import("loop.zig").Loop;
 const Connection = @import("handler.zig").Connection;
 const RadixRouter = @import("radix_router.zig").RadixRouter;
 const LuaState = @import("lua_state.zig").LuaState;
+const bpf_reuseport = @import("bpf_reuseport.zig");
 
 // TCP socket configuration
 const DEFAULT_BACKLOG: u31 = 128;
@@ -23,6 +24,7 @@ pub const Server = struct {
     pub const Config = struct {
         host: []const u8 = "127.0.0.1",
         port: u16 = 8080,
+        enable_bpf_affinity: bool = false, // Enable BPF connection affinity (disabled by default due to race conditions)
     };
 
     /// Initialize server
@@ -32,6 +34,9 @@ pub const Server = struct {
         config: Config,
         router: *RadixRouter,
         lua_state: *LuaState,
+        num_workers: u32,
+        worker_id: u32,
+        bpf_ready: ?*std.atomic.Value(bool),
     ) !Server {
         // Parse address
         const addr = try std.net.Address.parseIp(config.host, config.port);
@@ -63,6 +68,47 @@ pub const Server = struct {
 
         // Bind
         try std.posix.bind(socket, &addr.any, addr.getOsSockLen());
+
+        // Synchronization: All workers must reach this point before Worker 0 attaches BPF
+        // This ensures Worker 0 calls listen() FIRST
+        if (config.enable_bpf_affinity and num_workers > 1) {
+            if (bpf_ready) |ready| {
+                if (worker_id != 0) {
+                    // Other workers: Wait for Worker 0 to attach BPF
+                    while (!ready.load(.acquire)) {
+                        std.atomic.spinLoopHint();
+                    }
+                }
+                // Worker 0 continues immediately to attach BPF
+            }
+        }
+
+        // Attach BPF filter for connection affinity (only first worker)
+        // BPF filter applies to all sockets in SO_REUSEPORT group
+        // CRITICAL: Must attach BPF BEFORE any worker calls listen()
+        blk: {
+            if (!config.enable_bpf_affinity or worker_id != 0 or num_workers <= 1) break :blk;
+
+            const bpf_prog = bpf_reuseport.generateBpfProgram(allocator, num_workers) catch |err| {
+                std.log.warn("BPF affinity unavailable: {} (connections may hit different Lua states)", .{err});
+                break :blk;
+            };
+            defer allocator.free(bpf_prog);
+
+            bpf_reuseport.attachToSocket(socket, bpf_prog) catch |err| {
+                std.log.warn("BPF attachment failed: {} (connections may hit different Lua states)", .{err});
+                break :blk;
+            };
+
+            std.log.info("BPF connection affinity enabled for {} workers", .{num_workers});
+        }
+
+        // Worker 0 signals completion, allowing other workers to proceed to listen()
+        if (config.enable_bpf_affinity and num_workers > 1 and worker_id == 0) {
+            if (bpf_ready) |ready| {
+                ready.store(true, .release);
+            }
+        }
 
         // Listen
         try std.posix.listen(socket, DEFAULT_BACKLOG);
@@ -170,7 +216,7 @@ test "server init and deinit" {
     var router = try RadixRouter.init(allocator);
     defer router.deinit();
 
-    var lua_state = try LuaState.init(allocator);
+    var lua_state = try LuaState.init(allocator, &router);
     defer lua_state.deinit();
 
     const config = Server.Config{
@@ -178,6 +224,6 @@ test "server init and deinit" {
         .port = 0, // Let OS assign port
     };
 
-    var server = try Server.init(allocator, &loop, config, &router, &lua_state);
+    var server = try Server.init(allocator, &loop, config, &router, &lua_state, 1, 0, null);
     defer server.deinit();
 }

@@ -125,8 +125,9 @@ pub const RadixRouter = struct {
                 if (!gop.found_existing) {
                     // Create new node with duplicated segment (owned by us)
                     const segment_copy = try self.allocator.dupe(u8, segment);
+                    // HashMap owns the segment string; node gets empty prefix to avoid double-free
                     gop.key_ptr.* = segment_copy; // Update HashMap key to use our copy
-                    const child_node = try Node.init(self.allocator, segment_copy);
+                    const child_node = try Node.init(self.allocator, "");
                     gop.value_ptr.* = child_node;
                 }
                 node = gop.value_ptr.*;

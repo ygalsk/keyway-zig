@@ -19,6 +19,8 @@ pub const Worker = struct {
         allocator: std.mem.Allocator,
         config: Server.Config,
         worker_id: usize,
+        num_workers: usize,
+        bpf_ready: *std.atomic.Value(bool),
     };
 
     /// Spawn a worker thread
@@ -26,12 +28,16 @@ pub const Worker = struct {
         allocator: std.mem.Allocator,
         config: Server.Config,
         worker_id: usize,
+        num_workers: usize,
+        bpf_ready: *std.atomic.Value(bool),
     ) !Worker {
         const ctx = try allocator.create(Context);
         ctx.* = Context{
             .allocator = allocator,
             .config = config,
             .worker_id = worker_id,
+            .num_workers = num_workers,
+            .bpf_ready = bpf_ready,
         };
 
         const thread = try std.Thread.spawn(.{}, workerMain, .{ctx});
@@ -78,6 +84,9 @@ pub const Worker = struct {
             ctx.config,
             &router,
             &lua_state,
+            @intCast(ctx.num_workers),
+            @intCast(ctx.worker_id),
+            ctx.bpf_ready,
         );
         defer server.deinit();
 
@@ -95,6 +104,7 @@ pub const Worker = struct {
 pub const ThreadPool = struct {
     allocator: std.mem.Allocator,
     workers: []Worker,
+    bpf_ready: *std.atomic.Value(bool),
 
     /// Create thread pool with one worker per CPU core
     pub fn init(
@@ -107,14 +117,20 @@ pub const ThreadPool = struct {
         const workers = try allocator.alloc(Worker, num_cpus);
         errdefer allocator.free(workers);
 
+        // Create BPF synchronization flag
+        const bpf_ready = try allocator.create(std.atomic.Value(bool));
+        bpf_ready.* = std.atomic.Value(bool).init(false);
+        errdefer allocator.destroy(bpf_ready);
+
         // Spawn workers
         for (workers, 0..) |*worker, i| {
-            worker.* = try Worker.spawn(allocator, config, i);
+            worker.* = try Worker.spawn(allocator, config, i, num_cpus, bpf_ready);
         }
 
         return ThreadPool{
             .allocator = allocator,
             .workers = workers,
+            .bpf_ready = bpf_ready,
         };
     }
 
@@ -127,6 +143,7 @@ pub const ThreadPool = struct {
 
     /// Cleanup thread pool
     pub fn deinit(self: *ThreadPool) void {
+        self.allocator.destroy(self.bpf_ready);
         self.allocator.free(self.workers);
     }
 };
