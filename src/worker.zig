@@ -65,11 +65,8 @@ pub const Worker = struct {
         defer router.deinit();
 
         // Each worker has its own Lua state (one per thread!)
-        var lua_state = try LuaState.init(ctx.allocator);
+        var lua_state = try LuaState.init(ctx.allocator, &router);
         defer lua_state.deinit();
-
-        // Register keystone module (makes keystone.add_route available to Lua)
-        lua_api.registerKeystoneModule(lua_state.lua, &router);
 
         // Load Lua handlers (registers routes in this worker's router)
         try lua_state.loadScript("scripts/handlers.lua");

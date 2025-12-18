@@ -3,6 +3,8 @@ const Lua = @import("luajit").Lua;
 const http = @import("http.zig");
 const lua_request = @import("lua_request.zig");
 const lua_response = @import("lua_response.zig");
+const RadixRouter = @import("radix_router.zig").RadixRouter;
+const lua_api = @import("lua_api.zig");
 
 /// Lua state manager - Deep module with simple interface
 /// Manages a single long-lived Lua state for the server
@@ -11,8 +13,12 @@ pub const LuaState = struct {
     lua: *Lua,
     allocator: std.mem.Allocator,
 
+    // Reusable userdata references
+    req_ref: i32,
+    resp_ref: i32,
+
     /// Initialize Lua state with standard libraries
-    pub fn init(allocator: std.mem.Allocator) !LuaState {
+    pub fn init(allocator: std.mem.Allocator, router: *RadixRouter) !LuaState {
         const lua = try Lua.init(allocator);
         errdefer lua.deinit();
 
@@ -22,11 +28,26 @@ pub const LuaState = struct {
         lua.openTableLib();
         lua.openMathLib();
 
-        // std.log.info("Lua state initialized", .{});
+        // Register keystone module (must be done before creating userdata)
+        lua_api.registerKeystoneModule(lua, router);
+
+        // Create reusable userdata for request and response
+        // This avoids allocating them on every request
+        _ = lua.newUserdata(@sizeOf(lua_request.LuaRequest));
+        _ = lua.getMetatableRegistry("Request");
+        lua.setMetatable(-2);
+        const req_ref = lua.ref(Lua.PseudoIndex.Registry);
+
+        _ = lua.newUserdata(@sizeOf(lua_response.LuaResponse));
+        _ = lua.getMetatableRegistry("Response");
+        lua.setMetatable(-2);
+        const resp_ref = lua.ref(Lua.PseudoIndex.Registry);
 
         return LuaState{
             .lua = lua,
             .allocator = allocator,
+            .req_ref = req_ref,
+            .resp_ref = resp_ref,
         };
     }
 
@@ -71,19 +92,17 @@ pub const LuaState = struct {
             return error.NotAFunction;
         }
 
-        // Push request userdata
-        const req_ud = self.lua.newUserdata(@sizeOf(lua_request.LuaRequest));
+        // Push reusable request userdata
+        _ = self.lua.getTableIndexRaw(Lua.PseudoIndex.Registry, self.req_ref);
+        const req_ud = self.lua.toUserdata(-1);
         const req_ptr = @as(*lua_request.LuaRequest, @ptrCast(@alignCast(req_ud)));
         req_ptr.* = req.*;
-        _ = self.lua.getMetatableRegistry("Request");
-        self.lua.setMetatable(-2);
 
-        // Push response userdata
-        const resp_ud = self.lua.newUserdata(@sizeOf(lua_response.LuaResponse));
+        // Push reusable response userdata
+        _ = self.lua.getTableIndexRaw(Lua.PseudoIndex.Registry, self.resp_ref);
+        const resp_ud = self.lua.toUserdata(-1);
         const resp_ptr = @as(*lua_response.LuaResponse, @ptrCast(@alignCast(resp_ud)));
         resp_ptr.* = resp.*;
-        _ = self.lua.getMetatableRegistry("Response");
-        self.lua.setMetatable(-2);
 
         // Call handler: handler_fn(req, resp)
         try self.lua.callProtected(2, 0, 0);
@@ -91,6 +110,8 @@ pub const LuaState = struct {
 
     /// Clean up Lua state
     pub fn deinit(self: *LuaState) void {
+        self.lua.unref(Lua.PseudoIndex.Registry, self.req_ref);
+        self.lua.unref(Lua.PseudoIndex.Registry, self.resp_ref);
         self.lua.deinit();
     }
 };
@@ -98,7 +119,10 @@ pub const LuaState = struct {
 test "lua state initialization" {
     const allocator = std.testing.allocator;
 
-    var state = try LuaState.init(allocator);
+    var router = try RadixRouter.init(allocator);
+    defer router.deinit();
+
+    var state = try LuaState.init(allocator, &router);
     defer state.deinit();
 
     // Test basic Lua execution
@@ -114,7 +138,10 @@ test "lua state initialization" {
 test "lua function call" {
     const allocator = std.testing.allocator;
 
-    var state = try LuaState.init(allocator);
+    var router = try RadixRouter.init(allocator);
+    defer router.deinit();
+
+    var state = try LuaState.init(allocator, &router);
     defer state.deinit();
 
     // Define a simple function
