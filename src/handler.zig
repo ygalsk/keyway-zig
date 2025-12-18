@@ -8,6 +8,40 @@ const LuaState = @import("lua_state.zig").LuaState;
 const lua_request = @import("lua_request.zig");
 const lua_response = @import("lua_response.zig");
 
+// Buffer size constants
+const READ_BUFFER_SIZE = 8192;
+const WRITE_BUFFER_SIZE = 8192;
+const MAX_ROUTE_PARAMS = 4; // Typical routes have 1-4 params
+
+/// Lightweight param storage - replaces HashMap for route params
+/// O(n) lookup but n ≤ 4, cache-friendly, zero allocations
+pub const ParamArray = struct {
+    items: [MAX_ROUTE_PARAMS]Param = undefined,
+    len: usize = 0,
+
+    const Param = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
+    pub fn put(self: *ParamArray, key: []const u8, value: []const u8) void {
+        if (self.len >= MAX_ROUTE_PARAMS) return; // Silently ignore overflow
+        self.items[self.len] = .{ .key = key, .value = value };
+        self.len += 1;
+    }
+
+    pub fn get(self: *const ParamArray, key: []const u8) ?[]const u8 {
+        for (self.items[0..self.len]) |param| {
+            if (std.mem.eql(u8, param.key, key)) return param.value;
+        }
+        return null;
+    }
+
+    pub fn clear(self: *ParamArray) void {
+        self.len = 0;
+    }
+};
+
 /// Connection handler - manages HTTP request/response lifecycle
 pub const Connection = struct {
     base_allocator: std.mem.Allocator,
@@ -26,8 +60,8 @@ pub const Connection = struct {
     write_buffer: []u8,
     write_pos: usize,
 
-    // Pre-allocated param cache (reused across requests for zero-allocation matching)
-    param_cache: std.StringHashMap([]const u8),
+    // Inline param storage (reused across requests, zero allocations, cache-friendly)
+    param_cache: ParamArray,
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -40,20 +74,15 @@ pub const Connection = struct {
         errdefer allocator.destroy(conn);
 
         // Allocate buffers from base allocator (persist across requests)
-        const write_buf = try allocator.alloc(u8, 8192);
+        const write_buf = try allocator.alloc(u8, WRITE_BUFFER_SIZE);
         errdefer allocator.free(write_buf);
 
-        const read_buf = try RingBuffer.init(allocator, 8192);
+        const read_buf = try RingBuffer.init(allocator, READ_BUFFER_SIZE);
         errdefer allocator.free(read_buf.data);
 
         // Initialize arena for per-request allocations
         var arena = std.heap.ArenaAllocator.init(allocator);
         errdefer arena.deinit();
-
-        // Pre-allocate param cache (reused across requests for zero allocations)
-        var param_cache = std.StringHashMap([]const u8).init(allocator);
-        try param_cache.ensureTotalCapacity(4); // Typical routes have 1-4 params
-        errdefer param_cache.deinit();
 
         // Assign everything at once
         conn.* = Connection{
@@ -68,7 +97,7 @@ pub const Connection = struct {
             .read_buffer = read_buf,
             .write_buffer = write_buf,
             .write_pos = 0,
-            .param_cache = param_cache,
+            .param_cache = ParamArray{},  // Inline struct, zero allocations
         };
 
         return conn;
@@ -77,7 +106,7 @@ pub const Connection = struct {
     pub fn deinit(self: *Connection, allocator: std.mem.Allocator) void {
         std.posix.close(self.socket);
         self.arena.deinit();
-        self.param_cache.deinit();
+        // param_cache is inline struct, no deinit needed
         self.base_allocator.free(self.write_buffer);
         self.base_allocator.free(self.read_buffer.data);
         allocator.destroy(self);
@@ -156,7 +185,7 @@ pub const Connection = struct {
         defer self.arena.allocator().free(request.headers);
 
         // Clear param cache and match route (zero allocations!)
-        self.param_cache.clearRetainingCapacity();
+        self.param_cache.clear();
         const lua_ref = self.router.match(request.method, request.path, &self.param_cache);
 
         // Execute Lua handler with userdata (zero-copy)

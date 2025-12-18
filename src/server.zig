@@ -5,6 +5,9 @@ const Connection = @import("handler.zig").Connection;
 const RadixRouter = @import("radix_router.zig").RadixRouter;
 const LuaState = @import("lua_state.zig").LuaState;
 
+// TCP socket configuration
+const DEFAULT_BACKLOG: u31 = 128;
+
 /// TCP Server - Deep module with simple interface
 /// Handles socket creation, binding, listening, and accepting connections
 pub const Server = struct {
@@ -20,7 +23,6 @@ pub const Server = struct {
     pub const Config = struct {
         host: []const u8 = "127.0.0.1",
         port: u16 = 8080,
-        backlog: u31 = 128,
     };
 
     /// Initialize server
@@ -63,7 +65,7 @@ pub const Server = struct {
         try std.posix.bind(socket, &addr.any, addr.getOsSockLen());
 
         // Listen
-        try std.posix.listen(socket, config.backlog);
+        try std.posix.listen(socket, DEFAULT_BACKLOG);
 
         // std.log.info("Server listening on {s}:{d}", .{ config.host, config.port });
 

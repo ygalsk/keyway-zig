@@ -22,26 +22,30 @@ pub const Request = struct {
 pub const Response = struct {
     allocator: std.mem.Allocator,
     status: u16 = 200,
-    headers: []Header = &[_]Header{},
+    headers: ?std.ArrayList(Header) = null,  // Lazy init - null until first header added
     body: []const u8 = "",
 
     pub fn init(allocator: std.mem.Allocator) Response {
         return Response{
             .allocator = allocator,
+            .headers = null,  // No ArrayList overhead until needed
         };
     }
 
     pub fn deinit(self: *Response) void {
-        if (self.headers.len > 0) {
-            self.allocator.free(self.headers);
+        if (self.headers) |*h| {
+            h.deinit(self.allocator);
         }
     }
 
-    /// Add a header to the response
+    /// Add a header to the response (O(1) amortized)
+    /// Lazily initializes ArrayList on first header addition
     pub fn addHeader(self: *Response, name: []const u8, value: []const u8) !void {
-        const new_headers = try self.allocator.realloc(self.headers, self.headers.len + 1);
-        new_headers[self.headers.len] = Header{ .name = name, .value = value };
-        self.headers = new_headers;
+        if (self.headers == null) {
+            // First header - initialize with capacity for typical case (4 headers)
+            self.headers = try std.ArrayList(Header).initCapacity(self.allocator, 4);
+        }
+        try self.headers.?.append(self.allocator, Header{ .name = name, .value = value });
     }
 
     /// Serialize response to HTTP/1.1 format
@@ -52,9 +56,11 @@ pub const Response = struct {
             self.statusText(),
         });
 
-        // Headers
-        for (self.headers) |header| {
-            try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
+        // Headers (only if ArrayList was initialized)
+        if (self.headers) |h| {
+            for (h.items) |header| {
+                try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
+            }
         }
 
         // Content-Length

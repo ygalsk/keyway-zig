@@ -1,12 +1,13 @@
 const std = @import("std");
 const Lua = @import("luajit").Lua;
 const http = @import("http.zig");
+const handler = @import("handler.zig");
 
 /// LuaRequest - Request userdata exposed to Lua
 /// Lua gets a pointer to this struct (lightuserdata) and calls methods
 pub const LuaRequest = struct {
     request: *const http.Request,
-    params: *const std.StringHashMap([]const u8),
+    params: *const handler.ParamArray,
     allocator: std.mem.Allocator,
 
     // Zig methods - exposed to Lua via accessor functions

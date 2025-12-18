@@ -1,4 +1,5 @@
 const std = @import("std");
+const handler = @import("handler.zig");
 
 /// Radix tree node for efficient route matching
 /// O(path_length) lookup instead of O(n) linear search
@@ -145,13 +146,13 @@ pub const RadixRouter = struct {
 
     /// Match a request against the radix tree
     /// Returns lua_ref if match found, null otherwise
-    /// params_out is a pre-allocated HashMap that will be populated with parameters
-    /// This function does ZERO allocations (except HashMap.put for params)
+    /// params_out is an inline ParamArray that will be populated with parameters
+    /// This function does ZERO allocations
     pub fn match(
         self: *RadixRouter,
         method: []const u8,
         path: []const u8,
-        params_out: *std.StringHashMap([]const u8),
+        params_out: *handler.ParamArray,
     ) ?i32 {
         var node = self.root;
         var start: usize = 1; // Skip leading '/'
@@ -165,8 +166,8 @@ pub const RadixRouter = struct {
             if (node.children.get(segment)) |child| {
                 node = child;
             } else if (node.param_child) |param| {
-                // Parameter match - store in caller's hashmap
-                params_out.put(param.param_name, segment) catch return null;
+                // Parameter match - store in inline array (zero allocations!)
+                params_out.put(param.param_name, segment);
                 node = param.node;
             } else {
                 // No match found
