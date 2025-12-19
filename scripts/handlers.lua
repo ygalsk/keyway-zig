@@ -47,6 +47,38 @@ keystone.add_route("GET", "/users/{id}", function(ctx)
     ctx.body = json
 end)
 
+-- Redis-backed route (using LuaRocks redis client)
+print("[Lua] Registering /users-redis/{id} route...")
+
+-- Create Redis client (reused across requests per worker)
+local redis_client = require('redis')
+local redis_conn = nil
+
+keystone.add_route("GET", "/users-redis/{id}", function(ctx)
+    local user_id = ctx.params.id
+
+    -- Lazy connect to Redis (blocking, but connection pooling would be per-worker)
+    if not redis_conn then
+        redis_conn = redis.connect({
+            host = '127.0.0.1',
+            port = 6379,
+        })
+    end
+
+    -- Blocking Redis GET (this is the bottleneck we'll measure)
+    local user_data = redis_conn:get('user:' .. user_id)
+
+    ctx.status = 200
+    ctx.headers["Content-Type"] = "application/json"
+
+    if user_data then
+        ctx.body = user_data
+    else
+        -- Fallback if key doesn't exist
+        ctx.body = '{"id": ' .. user_id .. ', "error": "not found"}'
+    end
+end)
+
 -- Create a new user
 keystone.add_route("POST", "/users", function(ctx)
     local body = ctx.body

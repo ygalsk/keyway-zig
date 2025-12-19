@@ -35,6 +35,10 @@ pub fn build(b: *std.Build) void {
     exe.addIncludePath(b.path("vendor"));
     exe.linkLibC();
 
+    // Export all symbols so LuaRocks C modules can find Lua API functions
+    // This is required for dynamically loaded .so modules to resolve symbols like lua_getmetatable
+    exe.rdynamic = true;
+
     b.installArtifact(exe);
 
     // Run command

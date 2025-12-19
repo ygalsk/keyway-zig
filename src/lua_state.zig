@@ -32,6 +32,9 @@ pub const LuaState = struct {
         lua.openTableLib();
         lua.openMathLib();
         lua.openPackageLib();
+        lua.openIOLib(); // Required for LuaRocks to load modules from disk
+        lua.openOSLib(); // Required for some LuaRocks modules (time, execute, etc.)
+        lua.openDebugLib(); // Required for some LuaRocks modules (debug introspection)
 
         // Register keystone module (must be done before creating userdata)
         lua_api.registerKeystoneModule(lua, router);
@@ -95,7 +98,17 @@ pub const LuaState = struct {
         // doFile expects sentinel-terminated string, allocate one
         const path_z = try self.allocator.dupeZ(u8, path);
         defer self.allocator.free(path_z);
-        try self.lua.doFile(path_z);
+
+        // Try to load and capture error if it fails
+        self.lua.doFile(path_z) catch |err| {
+            // Get error message from Lua stack
+            if (self.lua.isString(-1)) {
+                const err_msg = self.lua.toString(-1) catch "unknown error";
+                std.log.err("Lua error loading {s}: {s}", .{path, err_msg});
+                self.lua.pop(1); // Pop error message
+            }
+            return err;
+        };
     }
 
     /// Load Lua code from string
