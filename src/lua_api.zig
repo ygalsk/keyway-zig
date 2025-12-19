@@ -62,8 +62,21 @@ fn luaExchangeNewIndex(lua: *Lua) callconv(.c) c_int {
 // === Params Table (read-only) ===
 
 /// Push params as a Lua table: {id = "123", name = "foo"}
+/// Uses cached table from registry to avoid per-request allocation
 fn pushParamsTable(lua: *Lua, params: *const handler.ParamArray) void {
-    lua.createTable(0, @intCast(params.len));
+    // Get cached params table from registry (stored during LuaState.init)
+    _ = lua.getField(Lua.PseudoIndex.Registry, "_PARAMS_TABLE");
+
+    // Clear existing entries (set them to nil)
+    lua.pushNil();
+    while (lua.next(-2)) {
+        lua.pop(1); // Pop value
+        lua.pushValue(-1); // Duplicate key
+        lua.pushNil(); // nil value
+        lua.setTable(-4); // table[key] = nil
+    }
+
+    // Populate table with current params
     for (params.items[0..params.len]) |p| {
         // Push key
         lua.pushLString(p.key);
@@ -72,22 +85,29 @@ fn pushParamsTable(lua: *Lua, params: *const handler.ParamArray) void {
         // Set table[key] = value
         lua.setTable(-3);
     }
+
+    // Table is now on top of stack with current params
 }
 
 // === Headers Proxy (for ctx.headers["Key"] = "value") ===
 
-const HeadersProxy = struct {
+/// Public so LuaState can create cached instance
+pub const HeadersProxy = struct {
     exchange: *HttpExchange,
 };
 
 /// Push HeadersProxy userdata for ctx.headers access
+/// Uses cached proxy from registry to avoid per-request allocation
 fn pushHeadersProxy(lua: *Lua, exchange: *HttpExchange) void {
-    const proxy = lua.newUserdata(@sizeOf(HeadersProxy));
-    const p = @as(*HeadersProxy, @ptrCast(@alignCast(proxy)));
-    p.* = .{ .exchange = exchange };
+    // Get cached proxy from registry (stored during LuaState.init)
+    _ = lua.getField(Lua.PseudoIndex.Registry, "_HEADERS_PROXY");
 
-    _ = lua.getMetatableRegistry("HttpExchange.Headers");
-    lua.setMetatable(-2);
+    // Update the cached proxy's exchange pointer to current exchange
+    const proxy_ud = lua.toUserdata(-1) orelse unreachable;
+    const proxy = @as(*HeadersProxy, @ptrCast(@alignCast(proxy_ud)));
+    proxy.exchange = exchange;
+
+    // Proxy is now on top of stack pointing to current exchange
 }
 
 /// Lua metamethod: HeadersProxy __index for reading ctx.headers["Key"]

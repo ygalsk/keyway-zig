@@ -15,6 +15,12 @@ pub const LuaState = struct {
     // Reusable exchange userdata reference
     exchange_ref: i32,
 
+    // Reusable headers proxy userdata reference (cached to avoid per-request allocation)
+    headers_proxy_ref: i32,
+
+    // Reusable params table reference (cached to avoid per-request table creation)
+    params_table_ref: i32,
+
     /// Initialize Lua state with standard libraries
     pub fn init(allocator: std.mem.Allocator, router: *RadixRouter) !LuaState {
         const lua = try Lua.init(allocator);
@@ -52,10 +58,34 @@ pub const LuaState = struct {
 
         const exchange_ref = lua.ref(Lua.PseudoIndex.Registry);
 
+        // Create reusable HeadersProxy userdata (avoids per-request allocation)
+        // Store it in registry under "_HEADERS_PROXY" key for easy access in metamethods
+        const proxy_ud = lua.newUserdata(@sizeOf(lua_api.HeadersProxy));
+        const proxy_ptr = @as(*lua_api.HeadersProxy, @ptrCast(@alignCast(proxy_ud)));
+        proxy_ptr.* = .{ .exchange = undefined }; // Will be set on each request
+
+        _ = lua.getMetatableRegistry("HttpExchange.Headers");
+        lua.setMetatable(-2);
+
+        // Store in registry with string key (so pushHeadersProxy can find it)
+        lua.pushValue(-1); // Duplicate proxy on stack
+        lua.setField(Lua.PseudoIndex.Registry, "_HEADERS_PROXY");
+
+        const headers_proxy_ref = lua.ref(Lua.PseudoIndex.Registry);
+
+        // Create reusable params table (cached to avoid per-request table creation)
+        lua.createTable(0, 4); // Initial capacity for 4 params
+        lua.pushValue(-1); // Duplicate table on stack
+        lua.setField(Lua.PseudoIndex.Registry, "_PARAMS_TABLE");
+
+        const params_table_ref = lua.ref(Lua.PseudoIndex.Registry);
+
         return LuaState{
             .lua = lua,
             .allocator = allocator,
             .exchange_ref = exchange_ref,
+            .headers_proxy_ref = headers_proxy_ref,
+            .params_table_ref = params_table_ref,
         };
     }
 
@@ -144,6 +174,8 @@ pub const LuaState = struct {
         self.lua.pop(1);
 
         self.lua.unref(Lua.PseudoIndex.Registry, self.exchange_ref);
+        self.lua.unref(Lua.PseudoIndex.Registry, self.headers_proxy_ref);
+        self.lua.unref(Lua.PseudoIndex.Registry, self.params_table_ref);
         self.lua.deinit();
     }
 };

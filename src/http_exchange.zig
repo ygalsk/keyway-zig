@@ -41,7 +41,11 @@ pub const HttpExchange = struct {
 
     /// Add a response header
     pub fn addResponseHeader(self: *HttpExchange, name: []const u8, value: []const u8) !void {
-        try self.response_headers.append(self.allocator, .{ .name = name, .value = value });
+        // Copy strings from Lua memory into arena (Lua strings are temporary)
+        const name_copy = try self.allocator.dupe(u8, name);
+        const value_copy = try self.allocator.dupe(u8, value);
+
+        try self.response_headers.append(self.allocator, .{ .name = name_copy, .value = value_copy });
     }
 
     /// Convert HttpExchange to Response for serialization
