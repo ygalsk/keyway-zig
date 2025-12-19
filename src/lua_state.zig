@@ -27,6 +27,7 @@ pub const LuaState = struct {
         lua.openStringLib();
         lua.openTableLib();
         lua.openMathLib();
+        lua.openPackageLib();
 
         // Register keystone module (must be done before creating userdata)
         lua_api.registerKeystoneModule(lua, router);
@@ -159,4 +160,22 @@ test "lua function call" {
     const msg = state.lua.toString(-1) catch unreachable;
     try std.testing.expectEqualStrings("Hello from Lua", msg);
     state.lua.pop(1);
+}
+
+test "lua package library and require" {
+    const allocator = std.testing.allocator;
+
+    var router = try RadixRouter.init(allocator);
+    defer router.deinit();
+
+    var state = try LuaState.init(allocator, &router);
+    defer state.deinit();
+
+    // Test that package library is loaded
+    try state.loadString("assert(package ~= nil)");
+    try state.loadString("assert(package.path ~= nil)");
+    try state.loadString("assert(package.cpath ~= nil)");
+
+    // Test that require function exists
+    try state.loadString("assert(type(require) == 'function')");
 }
