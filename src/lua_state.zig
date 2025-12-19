@@ -1,8 +1,7 @@
 const std = @import("std");
 const Lua = @import("luajit").Lua;
 const http = @import("http.zig");
-const lua_request = @import("lua_request.zig");
-const lua_response = @import("lua_response.zig");
+const HttpExchange = @import("http_exchange.zig").HttpExchange;
 const RadixRouter = @import("radix_router.zig").RadixRouter;
 const lua_api = @import("lua_api.zig");
 
@@ -13,9 +12,8 @@ pub const LuaState = struct {
     lua: *Lua,
     allocator: std.mem.Allocator,
 
-    // Reusable userdata references
-    req_ref: i32,
-    resp_ref: i32,
+    // Reusable exchange userdata reference
+    exchange_ref: i32,
 
     /// Initialize Lua state with standard libraries
     pub fn init(allocator: std.mem.Allocator, router: *RadixRouter) !LuaState {
@@ -32,23 +30,32 @@ pub const LuaState = struct {
         // Register keystone module (must be done before creating userdata)
         lua_api.registerKeystoneModule(lua, router);
 
-        // Create reusable userdata for request and response
-        // This avoids allocating them on every request
-        _ = lua.newUserdata(@sizeOf(lua_request.LuaRequest));
-        _ = lua.getMetatableRegistry("Request");
+        // Create reusable userdata for HttpExchange
+        // This avoids allocating it on every request
+        const ex_ud = lua.newUserdata(@sizeOf(HttpExchange));
+        _ = lua.getMetatableRegistry("HttpExchange");
         lua.setMetatable(-2);
-        const req_ref = lua.ref(Lua.PseudoIndex.Registry);
 
-        _ = lua.newUserdata(@sizeOf(lua_response.LuaResponse));
-        _ = lua.getMetatableRegistry("Response");
-        lua.setMetatable(-2);
-        const resp_ref = lua.ref(Lua.PseudoIndex.Registry);
+        // Initialize the HttpExchange in the userdata with a proper ArrayList
+        const ex_ptr = @as(*HttpExchange, @ptrCast(@alignCast(ex_ud)));
+        ex_ptr.* = .{
+            .method = "",
+            .path = "",
+            .headers = &[_]http.Header{},
+            .params = undefined,
+            .body = "",
+            .status = 200,
+            .response_headers = try std.ArrayList(http.Header).initCapacity(allocator, 4),
+            .response_body = "",
+            .allocator = allocator,
+        };
+
+        const exchange_ref = lua.ref(Lua.PseudoIndex.Registry);
 
         return LuaState{
             .lua = lua,
             .allocator = allocator,
-            .req_ref = req_ref,
-            .resp_ref = resp_ref,
+            .exchange_ref = exchange_ref,
         };
     }
 
@@ -77,13 +84,12 @@ pub const LuaState = struct {
         try self.lua.callProtected(0, 0, 0); // 0 args, 0 results
     }
 
-    /// Call a Lua handler with userdata (zero-copy)
-    /// Pushes request/response userdata to Lua and calls handler function
+    /// Call a Lua handler with HttpExchange
+    /// Pushes exchange userdata to Lua and calls handler function
     pub fn callLuaHandler(
         self: *LuaState,
         lua_ref: i32,
-        req: *lua_request.LuaRequest,
-        resp: *lua_response.LuaResponse,
+        exchange: *HttpExchange,
     ) !void {
         // Get handler function from registry
         _ = self.lua.getTableIndexRaw(Lua.PseudoIndex.Registry, lua_ref);
@@ -93,26 +99,51 @@ pub const LuaState = struct {
             return error.NotAFunction;
         }
 
-        // Push reusable request userdata
-        _ = self.lua.getTableIndexRaw(Lua.PseudoIndex.Registry, self.req_ref);
-        const req_ud = self.lua.toUserdata(-1);
-        const req_ptr = @as(*lua_request.LuaRequest, @ptrCast(@alignCast(req_ud)));
-        req_ptr.* = req.*;
+        // Push reusable exchange userdata
+        _ = self.lua.getTableIndexRaw(Lua.PseudoIndex.Registry, self.exchange_ref);
+        const ex_ud = self.lua.toUserdata(-1);
+        const ex_ptr = @as(*HttpExchange, @ptrCast(@alignCast(ex_ud)));
 
-        // Push reusable response userdata
-        _ = self.lua.getTableIndexRaw(Lua.PseudoIndex.Registry, self.resp_ref);
-        const resp_ud = self.lua.toUserdata(-1);
-        const resp_ptr = @as(*lua_response.LuaResponse, @ptrCast(@alignCast(resp_ud)));
-        resp_ptr.* = resp.*;
+        // Instead of copying the entire struct (which leaks the ArrayList),
+        // copy fields individually and reuse the existing response_headers ArrayList
+        ex_ptr.method = exchange.method;
+        ex_ptr.path = exchange.path;
+        ex_ptr.headers = exchange.headers;
+        ex_ptr.params = exchange.params;
+        ex_ptr.body = exchange.body;
+        ex_ptr.status = 200; // Reset to default
+        ex_ptr.response_body = "";
+        ex_ptr.allocator = exchange.allocator;
+        // Clear previous response headers (reuse the ArrayList)
+        ex_ptr.response_headers.clearRetainingCapacity();
 
-        // Call handler: handler_fn(req, resp)
-        try self.lua.callProtected(2, 0, 0);
+        // Call handler: handler_fn(ctx)
+        try self.lua.callProtected(1, 0, 0);
+
+        // Copy response body from Lua string (now safe, Lua stack still valid)
+        if (ex_ptr.response_body.len > 0) {
+            const body_copy = try exchange.allocator.dupe(u8, ex_ptr.response_body);
+            exchange.response_body = body_copy;
+        }
+
+        // Copy response data back to caller's exchange
+        exchange.status = ex_ptr.status;
+        // Transfer response headers ownership
+        exchange.response_headers = ex_ptr.response_headers;
     }
 
     /// Clean up Lua state
     pub fn deinit(self: *LuaState) void {
-        self.lua.unref(Lua.PseudoIndex.Registry, self.req_ref);
-        self.lua.unref(Lua.PseudoIndex.Registry, self.resp_ref);
+        // Clean up the ArrayList in the reusable exchange userdata
+        _ = self.lua.getTableIndexRaw(Lua.PseudoIndex.Registry, self.exchange_ref);
+        const ex_ud = self.lua.toUserdata(-1);
+        if (ex_ud) |ud| {
+            const ex_ptr = @as(*HttpExchange, @ptrCast(@alignCast(ud)));
+            ex_ptr.response_headers.deinit(self.allocator);
+        }
+        self.lua.pop(1);
+
+        self.lua.unref(Lua.PseudoIndex.Registry, self.exchange_ref);
         self.lua.deinit();
     }
 };

@@ -3,10 +3,9 @@ const xev = @import("xev");
 const Loop = @import("loop.zig").Loop;
 const RingBuffer = @import("buffer.zig").RingBuffer;
 const http = @import("http.zig");
+const HttpExchange = @import("http_exchange.zig").HttpExchange;
 const RadixRouter = @import("radix_router.zig").RadixRouter;
 const LuaState = @import("lua_state.zig").LuaState;
-const lua_request = @import("lua_request.zig");
-const lua_response = @import("lua_response.zig");
 
 // Buffer size constants
 const READ_BUFFER_SIZE = 8192;
@@ -188,30 +187,22 @@ pub const Connection = struct {
         self.param_cache.clear();
         const lua_ref = self.router.match(request.method, request.path, &self.param_cache);
 
-        // Execute Lua handler with userdata (zero-copy)
+        // Execute Lua handler with HttpExchange (zero-copy)
         var response = if (lua_ref) |ref| blk: {
-            // Create request userdata (params come from pre-allocated cache)
-            var lua_req = lua_request.LuaRequest{
-                .request = &request,
-                .params = &self.param_cache,
-                .allocator = self.arena.allocator(),
-            };
+            // Create HttpExchange (params come from pre-allocated cache)
+            var exchange = try HttpExchange.init(self.arena.allocator(), &request, &self.param_cache);
+            errdefer exchange.deinit();
 
-            // Create response object
-            var resp = http.Response.init(self.arena.allocator());
-            var lua_resp = lua_response.LuaResponse{
-                .response = &resp,
-                .allocator = self.arena.allocator(),
-            };
-
-            // Call Lua handler with userdata (no table marshalling!)
-            self.lua_state.callLuaHandler(ref, &lua_req, &lua_resp) catch |err| {
+            // Call Lua handler (mutates exchange.status, exchange.response_body, etc.)
+            self.lua_state.callLuaHandler(ref, &exchange) catch |err| {
                 std.log.err("Lua handler error: {}", .{err});
                 try self.send500InternalError();
                 return;
             };
 
-            break :blk resp;
+            // Convert exchange to response (transfers ownership of response_headers)
+            // No deinit needed here - toResponse() handles cleanup
+            break :blk exchange.toResponse();
         } else blk: {
             // No route matched - send 404
             var resp = http.Response.init(self.arena.allocator());
