@@ -22,7 +22,7 @@ pub const Server = struct {
 
     /// Server configuration
     pub const Config = struct {
-        host: []const u8 = "127.0.0.1",
+        host: []const u8 = "0.0.0.0",
         port: u16 = 8080,
         enable_bpf_affinity: bool = false, // Enable BPF connection affinity (disabled by default due to race conditions)
     };

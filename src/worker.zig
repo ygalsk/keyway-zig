@@ -5,6 +5,27 @@ const RadixRouter = @import("radix_router.zig").RadixRouter;
 const LuaState = @import("lua_state.zig").LuaState;
 const lua_api = @import("lua_api.zig");
 
+/// Pin calling thread to specified CPU core (Linux-only)
+/// This is architecturally required for proactor systems to ensure:
+/// - Cache locality (L1/L2 stays hot)
+/// - NUMA-local memory allocation
+/// - eBPF routing alignment (connection routed to core N reaches worker on core N)
+/// - Zero thread migrations (validates via perf stat -e migrations)
+inline fn pinThreadToCore(core_id: usize) !void {
+    // Initialize cpu_set_t (array of usize) to zero
+    var cpuset: std.os.linux.cpu_set_t = std.mem.zeroes(std.os.linux.cpu_set_t);
+
+    // Set the bit for the target core
+    // cpu_set_t is [CPU_SETSIZE / @sizeOf(usize)]usize
+    const bits_per_elem = @bitSizeOf(usize);
+    const elem_index = core_id / bits_per_elem;
+    const bit_index = core_id % bits_per_elem;
+    cpuset[elem_index] = @as(usize, 1) << @intCast(bit_index);
+
+    // Set affinity for current thread (pid 0)
+    try std.os.linux.sched_setaffinity(0, &cpuset);
+}
+
 /// Worker thread - owns its own event loop and Lua state
 /// Each worker accepts connections independently using SO_REUSEPORT
 pub const Worker = struct {
@@ -58,8 +79,13 @@ pub const Worker = struct {
 
     /// Worker thread entry point
     fn workerMain(ctx: *Context) !void {
+        // CRITICAL: Pin thread to core BEFORE any allocations
+        // This ensures NUMA-local memory and cache locality
+        try pinThreadToCore(ctx.worker_id);
+
         defer ctx.allocator.destroy(ctx);
 
+        std.log.debug("Worker {d} pinned to core {d}", .{ ctx.worker_id, ctx.worker_id });
         std.log.info("Worker {d} starting...", .{ctx.worker_id});
 
         // Each worker has its own event loop

@@ -11,7 +11,7 @@ pub fn main() !void {
 
     // Server configuration
     const config = Server.Config{
-        .host = "127.0.0.1",
+        .host = "0.0.0.0",
         .port = 8080,
     };
 
