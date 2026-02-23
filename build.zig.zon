@@ -1,13 +1,13 @@
 .{
-    .name = .keystone,
+    .name = .keyway,
     .version = "0.1.0",
     .minimum_zig_version = "0.15.0",
-    .fingerprint = 0xc202aef8eec77191,
+    .fingerprint = 0x9095a4ba39ca44a8,
 
     .dependencies = .{
         .libxev = .{
             .url = "https://github.com/mitchellh/libxev/archive/refs/heads/main.tar.gz",
-            .hash = "libxev-0.0.0-86vtcz8bEwB9PLXxMMckZwulRxoKleuLsrffobuUv993",
+            .hash = "libxev-0.0.0-86vtc3kbEwBykzpSo2s87dYDs1G0fPxn__T4tG5AipAN",
         },
         .luajit = .{
             .url = "https://github.com/sackosoft/zig-luajit/archive/refs/heads/main.tar.gz",

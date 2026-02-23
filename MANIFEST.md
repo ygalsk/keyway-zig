@@ -4,13 +4,13 @@ Every sentence is deliberate. Nothing here is accidental.
 
 ---
 
-# Keystone Architecture Manifesto
+# Keyway Architecture Manifesto
 
 **(One Page · Non-Negotiable Design Contract)**
 
 ## Purpose
 
-Keystone is a **high-performance HTTP engine** built on:
+Keyway is a **high-performance HTTP engine** built on:
 
 **Zig · LuaJIT · io_uring · libxev · picohttpparser · eBPF**
 
@@ -23,7 +23,7 @@ All code, agents, and contributions must align with them.
 
 ## 1. Execution Model: Proactor First
 
-Keystone is a **proactor-based system**.
+Keyway is a **proactor-based system**.
 
 * I/O is **submitted**, not performed inline
 * The kernel completes work asynchronously
@@ -42,7 +42,7 @@ If code violates this, it is architecturally incorrect.
 
 ## 2. One Core, One Thread, One Lua State
 
-Keystone runs:
+Keyway runs:
 
 * **1 worker thread per CPU core**
 * **1 Lua state per worker**
@@ -225,7 +225,7 @@ It observes and routes — nothing more.
 
 ## 12. LuaRocks Policy
 
-Keystone **uses LuaRocks for functionality**, not as a package manager.
+Keyway **uses LuaRocks for functionality**, not as a package manager.
 
 * We do not care how users install LuaRocks
 * We do not manage LuaRocks environments
@@ -234,14 +234,14 @@ Keystone **uses LuaRocks for functionality**, not as a package manager.
 Lua modules must:
 
 * Load via LuaRocks
-* Work without Keystone-specific installers
+* Work without Keyway-specific installers
 * Remain sandboxable
 
 ---
 
 ## 13. What This System Is Not
 
-Keystone is not:
+Keyway is not:
 
 * An event-driven callback soup
 * A framework that hides control flow
@@ -265,7 +265,7 @@ It is a **memory-accurate, proactor-aligned execution engine**.
 > eBPF observes silently
 
 If a contribution does not fit this model,
-it does not belong in Keystone.
+it does not belong in Keyway.
 
 ---
 

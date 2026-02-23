@@ -193,9 +193,9 @@ pub fn registerHttpExchangeMetatable(lua: *Lua) void {
     std.log.info("HttpExchange metatables registered", .{});
 }
 
-// === Keystone Module (add_route) ===
+// === Keyway Module (add_route) ===
 
-/// Lua function: keystone.add_route(method, pattern, handler_fn)
+/// Lua function: keyway.add_route(method, pattern, handler_fn)
 /// Registers a route with a Lua handler function
 fn luaAddRoute(lua: *Lua) callconv(.c) c_int {
     // Get router from upvalue
@@ -253,13 +253,13 @@ fn luaAddRoute(lua: *Lua) callconv(.c) c_int {
     return 0; // No return values
 }
 
-/// Register the keystone module with Lua
-/// Creates global `keystone` table with add_route function
-pub fn registerKeystoneModule(lua: *Lua, router: *RadixRouter) void {
+/// Register the keyway module with Lua
+/// Creates global `keyway` table with add_route function
+pub fn registerKeywayModule(lua: *Lua, router: *RadixRouter) void {
     // Register HttpExchange metatables first
     registerHttpExchangeMetatable(lua);
 
-    // Create keystone table
+    // Create keyway table
     lua.createTable(0, 1);
 
     // Register add_route function with router as upvalue
@@ -268,7 +268,7 @@ pub fn registerKeystoneModule(lua: *Lua, router: *RadixRouter) void {
     lua.setField(-2, "add_route");
 
     // Set as global
-    lua.setGlobal("keystone");
+    lua.setGlobal("keyway");
 
-    std.log.info("Keystone Lua module registered", .{});
+    std.log.info("Keyway Lua module registered", .{});
 }

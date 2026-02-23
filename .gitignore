@@ -17,3 +17,7 @@ deps.zig
 # OS
 .DS_Store
 Thumbs.db
+
+# Profiling
+perf.data*
+*.svg

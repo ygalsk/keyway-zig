@@ -6,7 +6,7 @@ pub fn build(b: *std.Build) void {
 
     // Main executable
     const exe = b.addExecutable(.{
-        .name = "keystone",
+        .name = "keyway",
         .root_module = b.createModule(.{
             .root_source_file = b.path("src/main.zig"),
             .target = target,

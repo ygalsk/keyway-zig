@@ -290,7 +290,6 @@ pub const Connection = struct {
             return .disarm;
         };
         _ = bytes_written;
-        // std.log.info("Wrote {} bytes", .{bytes_written});
 
         // Reset arena and buffer for next request (HTTP/1.1 keep-alive)
         _ = self.arena.reset(.retain_capacity);

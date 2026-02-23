@@ -3,7 +3,7 @@ const Server = @import("server.zig").Server;
 const ThreadPool = @import("worker.zig").ThreadPool;
 
 pub fn main() !void {
-    std.log.info("Keystone Gateway (Zig) - Starting...", .{});
+    std.log.info("Keyway - Starting...", .{});
 
     var gpa = std.heap.GeneralPurposeAllocator(.{}){};
     defer _ = gpa.deinit();
@@ -20,7 +20,7 @@ pub fn main() !void {
     var pool = try ThreadPool.init(allocator, config);
     defer pool.deinit();
 
-    std.log.info("Keystone Gateway - Ready on {s}:{d} (press Ctrl+C to stop)", .{ config.host, config.port });
+    std.log.info("Keyway - Ready on {s}:{d} (press Ctrl+C to stop)", .{ config.host, config.port });
 
     // Wait for all workers (runs until Ctrl+C)
     pool.joinAll();

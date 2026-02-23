@@ -1,4 +1,4 @@
--- Keystone Gateway Handlers
+-- Keyway Handlers
 -- Uses organic HttpExchange API - ctx is a single Zig struct with declarative interface
 if jit then
     jit.opt.start(
@@ -17,13 +17,13 @@ if jit then
 end
 print("[Lua] Registering /users route...")
 -- List all users
-keystone.add_route("GET", "/users", function(ctx)
+keyway.add_route("GET", "/users", function(ctx)
     ctx.status = 200
     ctx.body = "pong"
 end)
 
 print("[Lua] Registering /ping route...")
-keystone.add_route("GET", "/ping", function(ctx)
+keyway.add_route("GET", "/ping", function(ctx)
     ctx.status = 200
     ctx.body = "pong"
 end)
@@ -35,7 +35,7 @@ local user_cache = {}
 
 print("[Lua] Registering /users/{id} route...")
 
-keystone.add_route("GET", "/users/{id}", function(ctx)
+keyway.add_route("GET", "/users/{id}", function(ctx)
     local user_id = ctx.params.id
     local role = (tonumber(user_id) or 0) % 2 == 0 and "admin" or "guest"
 
@@ -54,7 +54,7 @@ print("[Lua] Registering /users-redis/{id} route...")
 local redis_client = require('redis')
 local redis_conn = nil
 
-keystone.add_route("GET", "/users-redis/{id}", function(ctx)
+keyway.add_route("GET", "/users-redis/{id}", function(ctx)
     local user_id = ctx.params.id
 
     -- Lazy connect to Redis (blocking, but connection pooling would be per-worker)
@@ -80,7 +80,7 @@ keystone.add_route("GET", "/users-redis/{id}", function(ctx)
 end)
 
 -- Create a new user
-keystone.add_route("POST", "/users", function(ctx)
+keyway.add_route("POST", "/users", function(ctx)
     local body = ctx.body
     -- Could parse JSON here using Lua libraries
     ctx.status = 201
@@ -88,7 +88,7 @@ keystone.add_route("POST", "/users", function(ctx)
 end)
 
 -- Example handler showing method access
-keystone.add_route("GET", "/debug", function(ctx)
+keyway.add_route("GET", "/debug", function(ctx)
     local method = ctx.method
     local path = ctx.path
     ctx.status = 200

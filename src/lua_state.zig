@@ -36,8 +36,8 @@ pub const LuaState = struct {
         lua.openOSLib(); // Required for some LuaRocks modules (time, execute, etc.)
         lua.openDebugLib(); // Required for some LuaRocks modules (debug introspection)
 
-        // Register keystone module (must be done before creating userdata)
-        lua_api.registerKeystoneModule(lua, router);
+        // Register keyway module (must be done before creating userdata)
+        lua_api.registerKeywayModule(lua, router);
 
         // Create reusable userdata for HttpExchange
         // This avoids allocating it on every request
@@ -94,7 +94,6 @@ pub const LuaState = struct {
 
     /// Load and execute a Lua script file
     pub fn loadScript(self: *LuaState, path: []const u8) !void {
-        // std.log.info("Loading Lua script: {s}", .{path});
         // doFile expects sentinel-terminated string, allocate one
         const path_z = try self.allocator.dupeZ(u8, path);
         defer self.allocator.free(path_z);

@@ -113,8 +113,6 @@ pub const Server = struct {
         // Listen
         try std.posix.listen(socket, DEFAULT_BACKLOG);
 
-        // std.log.info("Server listening on {s}:{d}", .{ config.host, config.port });
-
         return Server{
             .allocator = allocator,
             .loop = loop,
@@ -128,7 +126,6 @@ pub const Server = struct {
 
     /// Start accepting connections
     pub fn start(self: *Server) !void {
-        // std.log.info("Server ready to accept connections", .{});
         self.acceptNext();
     }
 
@@ -160,8 +157,6 @@ pub const Server = struct {
             self.acceptNext();
             return .disarm;
         };
-
-        // std.log.info("Accepted connection: {}", .{client_socket});
 
         // Set TCP_NODELAY to disable Nagle's algorithm (reduce latency)
         std.posix.setsockopt(
@@ -198,7 +193,6 @@ pub const Server = struct {
     /// Stop server
     pub fn stop(self: *Server) void {
         _ = self;
-        // std.log.info("Server stopping...", .{});
     }
 
     /// Clean up server resources

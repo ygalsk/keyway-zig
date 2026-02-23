@@ -1,22 +1,28 @@
-# Key-way (Zig)
+# Keyway
 
-A reimagining of Keystone Gateway in Zig, leveraging libxev's event loop and LuaJIT for high-performance, protocol-agnostic gateway.
+A Zig-powered, Lua-controlled HTTP engine. Part of the [keystone-gateway.dev](https://keystone-gateway.dev) ecosystem.
 
-## Philosophy
+## What is Keyway?
 
-**"Dumb gateway, smart tenants"** - Zero opinions about business logic, all primitives.
+Keyway is a high-performance HTTP server where Zig handles the execution engine and Lua expresses routing policy. The philosophy is **"dumb gateway, smart tenants"** -- Zig owns memory, I/O, and the event loop; Lua declares intent through a simple, organic interface.
 
-- **Deep modules** - Simple interfaces hiding complex implementations
-- **Information hiding** - Users never see implementation details
-- **Pull complexity down** - Zig handles hard stuff, Lua stays simple
-- **General-purpose** - Primitives only, no opinions
+**Tech stack:** Zig, LuaJIT, libxev, picohttpparser, io_uring, eBPF
 
-## Architecture
+## Example
 
-- **Worker threads** (configurable, default 1)
-- **One Lua state per thread** (long-lived, no state pool)
-- **Lua coroutines for async** (one coroutine per request)
-- **Yield/resume bridge** between Lua and libxev
+```lua
+keyway.add_route("GET", "/ping", function(ctx)
+    ctx.status = 200
+    ctx.body = "pong"
+end)
+
+keyway.add_route("GET", "/users/{id}", function(ctx)
+    local user_id = ctx.params.id
+    ctx.status = 200
+    ctx.headers["Content-Type"] = "application/json"
+    ctx.body = '{"id": ' .. user_id .. ', "status": "active"}'
+end)
+```
 
 ## Build
 
@@ -36,15 +42,13 @@ zig build run
 zig build test
 ```
 
-## Status
+## Architecture
 
-🚧 **Work in Progress** - Phase 1: Foundation
-
-See `/home/dkremer/.claude/plans/vast-yawning-church.md` for the full implementation plan.
+See [MANIFEST.md](MANIFEST.md) for the full architecture manifesto.
 
 ## References
 
-- Original Go implementation: `/home/dkremer/Documents/keystone-gateway/`
-- libxev: https://github.com/mitchellh/libxev
-- zig-luajit: https://github.com/sackosoft/zig-luajit
-- picohttpparser: https://github.com/h2o/picohttpparser
+- [keystone-gateway.dev](https://keystone-gateway.dev)
+- [libxev](https://github.com/mitchellh/libxev)
+- [zig-luajit](https://github.com/sackosoft/zig-luajit)
+- [picohttpparser](https://github.com/h2o/picohttpparser)

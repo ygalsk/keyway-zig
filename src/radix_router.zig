@@ -201,13 +201,12 @@ test "radix router: simple static route" {
 
     try router.addRoute("GET", "/users", 1);
 
-    var params = std.StringHashMap([]const u8).init(allocator);
-    defer params.deinit();
+    var params = handler.ParamArray{};
 
     const result = router.match("GET", "/users", &params);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(@as(i32, 1), result.?);
-    try std.testing.expectEqual(@as(usize, 0), params.count());
+    try std.testing.expectEqual(@as(usize, 0), params.len);
 }
 
 test "radix router: parameterized route" {
@@ -218,13 +217,12 @@ test "radix router: parameterized route" {
 
     try router.addRoute("GET", "/users/{id}", 2);
 
-    var params = std.StringHashMap([]const u8).init(allocator);
-    defer params.deinit();
+    var params = handler.ParamArray{};
 
     const result = router.match("GET", "/users/123", &params);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(@as(i32, 2), result.?);
-    try std.testing.expectEqual(@as(usize, 1), params.count());
+    try std.testing.expectEqual(@as(usize, 1), params.len);
 
     const id = params.get("id").?;
     try std.testing.expectEqualStrings("123", id);
@@ -238,13 +236,12 @@ test "radix router: multiple params" {
 
     try router.addRoute("GET", "/posts/{post_id}/comments/{id}", 3);
 
-    var params = std.StringHashMap([]const u8).init(allocator);
-    defer params.deinit();
+    var params = handler.ParamArray{};
 
     const result = router.match("GET", "/posts/42/comments/7", &params);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(@as(i32, 3), result.?);
-    try std.testing.expectEqual(@as(usize, 2), params.count());
+    try std.testing.expectEqual(@as(usize, 2), params.len);
 
     try std.testing.expectEqualStrings("42", params.get("post_id").?);
     try std.testing.expectEqualStrings("7", params.get("id").?);
@@ -258,8 +255,7 @@ test "radix router: method mismatch" {
 
     try router.addRoute("POST", "/users", 4);
 
-    var params = std.StringHashMap([]const u8).init(allocator);
-    defer params.deinit();
+    var params = handler.ParamArray{};
 
     const result = router.match("GET", "/users", &params);
     try std.testing.expect(result == null);
@@ -275,19 +271,18 @@ test "radix router: shared prefix" {
     try router.addRoute("GET", "/users/{id}", 2);
     try router.addRoute("GET", "/users/{id}/posts", 3);
 
-    var params = std.StringHashMap([]const u8).init(allocator);
-    defer params.deinit();
+    var params = handler.ParamArray{};
 
     // Test /users
     const r1 = router.match("GET", "/users", &params);
     try std.testing.expectEqual(@as(i32, 1), r1.?);
-    params.clearRetainingCapacity();
+    params.clear();
 
     // Test /users/123
     const r2 = router.match("GET", "/users/123", &params);
     try std.testing.expectEqual(@as(i32, 2), r2.?);
     try std.testing.expectEqualStrings("123", params.get("id").?);
-    params.clearRetainingCapacity();
+    params.clear();
 
     // Test /users/456/posts
     const r3 = router.match("GET", "/users/456/posts", &params);
@@ -303,8 +298,7 @@ test "radix router: no match" {
 
     try router.addRoute("GET", "/users", 1);
 
-    var params = std.StringHashMap([]const u8).init(allocator);
-    defer params.deinit();
+    var params = handler.ParamArray{};
 
     const result = router.match("GET", "/posts", &params);
     try std.testing.expect(result == null);
