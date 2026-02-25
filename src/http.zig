@@ -76,7 +76,9 @@ pub const Response = struct {
     fn statusText(self: Response) []const u8 {
         return switch (self.status) {
             200 => "OK",
+            201 => "Created",
             400 => "Bad Request",
+            401 => "Unauthorized",
             404 => "Not Found",
             500 => "Internal Server Error",
             else => "Unknown",

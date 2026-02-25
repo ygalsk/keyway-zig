@@ -193,82 +193,220 @@ pub fn registerHttpExchangeMetatable(lua: *Lua) void {
     std.log.info("HttpExchange metatables registered", .{});
 }
 
-// === Keyway Module (add_route) ===
-
-/// Lua function: keyway.add_route(method, pattern, handler_fn)
-/// Registers a route with a Lua handler function
-fn luaAddRoute(lua: *Lua) callconv(.c) c_int {
-    // Get router from upvalue
-    const router_ud = lua.toUserdata(Lua.PseudoIndex.upvalue(1)) orelse {
-        lua.pushString("Internal error: router upvalue missing");
-        lua.raiseError();
-        return 0;
-    };
-    const router = @as(*RadixRouter, @ptrCast(@alignCast(router_ud)));
-
-    // Check argument count
-    if (lua.getTop() != 3) {
-        lua.pushString("add_route requires 3 arguments: method, pattern, handler_fn");
-        lua.raiseError();
-        return 0;
-    }
-
-    // Get method (arg 1)
-    const method_cstr = lua.toString(1) catch {
-        lua.pushString("add_route: method must be a string");
-        lua.raiseError();
-        return 0;
-    };
-    const method = std.mem.span(method_cstr);
-
-    // Get pattern (arg 2)
-    const pattern_cstr = lua.toString(2) catch {
-        lua.pushString("add_route: pattern must be a string");
-        lua.raiseError();
-        return 0;
-    };
-    const pattern = std.mem.span(pattern_cstr);
-
-    // Get handler function (arg 3)
-    if (!lua.isFunction(3)) {
-        lua.pushString("add_route: handler must be a function");
-        lua.raiseError();
-        return 0;
-    }
-
-    // Store handler function in Lua registry
-    lua.pushValue(3); // Push handler function to top
-    const lua_ref = lua.ref(Lua.PseudoIndex.Registry); // Store and get reference
-
-    // Add route to router
-    router.addRoute(method, pattern, lua_ref) catch {
-        lua.unref(Lua.PseudoIndex.Registry, lua_ref);
-        lua.pushString("add_route: failed to register route");
-        lua.raiseError();
-        return 0;
-    };
-
-    std.log.info("Route registered: {s} {s} -> lua_ref:{d}", .{ method, pattern, lua_ref });
-
-    return 0; // No return values
-}
+// === Keyway Module ===
 
 /// Register the keyway module with Lua
-/// Creates global `keyway` table with add_route function
-pub fn registerKeywayModule(lua: *Lua, router: *RadixRouter) void {
+/// Creates global `keyway` table (script assigns keyway.routes = {...})
+pub fn registerKeywayModule(lua: *Lua) void {
     // Register HttpExchange metatables first
     registerHttpExchangeMetatable(lua);
 
-    // Create keyway table
+    // Create empty keyway table (script populates keyway.routes)
     lua.createTable(0, 1);
-
-    // Register add_route function with router as upvalue
-    lua.pushLightUserdata(router);
-    lua.pushCClosure(luaAddRoute, 1);
-    lua.setField(-2, "add_route");
-
-    // Set as global
     lua.setGlobal("keyway");
 
+    // Register middleware chain builder as a global helper
+    lua.doString(
+        \\__keyway_wrap_chain = function(handler, middleware_list)
+        \\    local chain = handler
+        \\    for i = #middleware_list, 1, -1 do
+        \\        local mw = middleware_list[i]
+        \\        local next_fn = chain
+        \\        chain = function(ctx)
+        \\            mw(ctx, function() next_fn(ctx) end)
+        \\        end
+        \\    end
+        \\    return chain
+        \\end
+    ) catch unreachable;
+
     std.log.info("Keyway Lua module registered", .{});
+}
+
+// === Declarative Route Table Processing ===
+
+const http_methods = [_][]const u8{ "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS" };
+
+fn isHttpMethod(key: []const u8) bool {
+    for (http_methods) |m| {
+        if (std.mem.eql(u8, key, m)) return true;
+    }
+    return false;
+}
+
+/// Process keyway.routes table after script load.
+/// Walks the declarative route table and registers routes with the radix router.
+pub fn processRouteTable(lua: *Lua, router: *RadixRouter, allocator: std.mem.Allocator) !void {
+    const keyway_type = lua.getGlobal("keyway");
+    if (keyway_type != .table) {
+        lua.pop(1);
+        std.log.err("keyway global is not a table", .{});
+        return error.Runtime;
+    }
+
+    const routes_type = lua.getField(-1, "routes");
+    if (routes_type != .table) {
+        lua.pop(2);
+        std.log.err("keyway.routes is not a table", .{});
+        return error.Runtime;
+    }
+
+    const empty_mw: []const i32 = &.{};
+    try walkTable(lua, router, -1, "", empty_mw, allocator);
+
+    lua.pop(2); // pop routes + keyway
+}
+
+fn walkTable(
+    lua: *Lua,
+    router: *RadixRouter,
+    table_idx: i32,
+    path_prefix: []const u8,
+    parent_middleware: []const i32,
+    allocator: std.mem.Allocator,
+) !void {
+    // Convert to absolute index so stack pushes don't invalidate it
+    const abs_idx = if (table_idx > 0) table_idx else lua.getTop() + table_idx + 1;
+
+    // Check for middleware key at this level
+    var middleware: []const i32 = parent_middleware;
+    var owns_middleware = false;
+
+    const mw_type = lua.getField(abs_idx, "middleware");
+    if (mw_type == .table) {
+        middleware = try collectMiddleware(lua, -1, parent_middleware, allocator);
+        owns_middleware = middleware.len > parent_middleware.len;
+    }
+    lua.pop(1); // pop middleware value
+
+    defer if (owns_middleware) {
+        // Unref only the middleware refs collected at THIS level (not parent's)
+        for (middleware[parent_middleware.len..]) |mw_ref| {
+            lua.unref(Lua.PseudoIndex.Registry, mw_ref);
+        }
+        allocator.free(@constCast(middleware));
+    };
+
+    // Iterate table entries
+    lua.pushNil();
+    while (lua.next(abs_idx)) {
+        // Key at -2, value at -1
+        const key_cstr = lua.toString(-2) catch {
+            lua.pop(1); // pop value, keep key for next
+            continue;
+        };
+        const key = std.mem.span(key_cstr);
+
+        // Skip middleware key (already handled above)
+        if (std.mem.eql(u8, key, "middleware")) {
+            lua.pop(1);
+            continue;
+        }
+
+        if (lua.isFunction(-1) and isHttpMethod(key)) {
+            // HTTP method -> handler function
+            try registerRoute(lua, router, key, path_prefix, -1, middleware);
+        } else if (lua.isTable(-1) and key.len > 0 and key[0] == '/') {
+            // Nested path segment -> recurse
+            const full_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ path_prefix, key });
+            defer allocator.free(full_path);
+            try walkTable(lua, router, -1, full_path, middleware, allocator);
+        } else {
+            std.log.warn("Ignoring unknown route table key: {s}", .{key});
+        }
+
+        lua.pop(1); // pop value, keep key for next iteration
+    }
+}
+
+fn collectMiddleware(
+    lua: *Lua,
+    array_idx: i32,
+    parent_refs: []const i32,
+    allocator: std.mem.Allocator,
+) ![]const i32 {
+    const abs_idx = if (array_idx > 0) array_idx else lua.getTop() + array_idx + 1;
+
+    // Count array elements
+    var count: usize = 0;
+    while (true) : (count += 1) {
+        const t = lua.getTableIndexRaw(abs_idx, @intCast(count + 1));
+        if (t == .nil) {
+            lua.pop(1);
+            break;
+        }
+        lua.pop(1);
+    }
+
+    if (count == 0) return parent_refs;
+
+    // Allocate combined slice: parent refs + new refs
+    const combined = try allocator.alloc(i32, parent_refs.len + count);
+    @memcpy(combined[0..parent_refs.len], parent_refs);
+
+    // Ref each middleware function
+    for (0..count) |i| {
+        _ = lua.getTableIndexRaw(abs_idx, @intCast(i + 1));
+        if (!lua.isFunction(-1)) {
+            // Clean up already-refed entries
+            for (0..i) |j| {
+                lua.unref(Lua.PseudoIndex.Registry, combined[parent_refs.len + j]);
+            }
+            lua.pop(1);
+            allocator.free(combined);
+            std.log.err("middleware[{d}] is not a function", .{i + 1});
+            return error.Runtime;
+        }
+        combined[parent_refs.len + i] = lua.ref(Lua.PseudoIndex.Registry);
+    }
+
+    return combined;
+}
+
+fn registerRoute(
+    lua: *Lua,
+    router: *RadixRouter,
+    method: []const u8,
+    path: []const u8,
+    handler_idx: i32,
+    middleware: []const i32,
+) !void {
+    // Convert handler index to absolute (stack will grow when we push things)
+    const abs_handler = if (handler_idx > 0) handler_idx else lua.getTop() + handler_idx + 1;
+
+    if (middleware.len == 0) {
+        // No middleware — ref the handler directly
+        lua.pushValue(abs_handler);
+        const lua_ref = lua.ref(Lua.PseudoIndex.Registry);
+        router.addRoute(method, path, lua_ref) catch {
+            lua.unref(Lua.PseudoIndex.Registry, lua_ref);
+            return error.Runtime;
+        };
+        std.log.info("Route registered: {s} {s} -> lua_ref:{d}", .{ method, path, lua_ref });
+    } else {
+        // Build middleware chain via __keyway_wrap_chain(handler, middleware_table)
+        _ = lua.getGlobal("__keyway_wrap_chain");
+        lua.pushValue(abs_handler);
+
+        // Build middleware array table
+        lua.createTable(@intCast(middleware.len), 0);
+        for (middleware, 0..) |mw_ref, i| {
+            _ = lua.getTableIndexRaw(Lua.PseudoIndex.Registry, mw_ref);
+            lua.setTableIndexRaw(-2, @intCast(i + 1));
+        }
+
+        // Call __keyway_wrap_chain(handler, mw_table) -> wrapped_fn
+        lua.callProtected(2, 1, 0) catch {
+            std.log.err("Failed to build middleware chain for {s} {s}", .{ method, path });
+            return error.Runtime;
+        };
+
+        // Wrapped function is on top of stack
+        const lua_ref = lua.ref(Lua.PseudoIndex.Registry);
+        router.addRoute(method, path, lua_ref) catch {
+            lua.unref(Lua.PseudoIndex.Registry, lua_ref);
+            return error.Runtime;
+        };
+        std.log.info("Route registered: {s} {s} -> lua_ref:{d} (with {d} middleware)", .{ method, path, lua_ref, middleware.len });
+    }
 }

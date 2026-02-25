@@ -210,7 +210,7 @@ test "server init and deinit" {
     var router = try RadixRouter.init(allocator);
     defer router.deinit();
 
-    var lua_state = try LuaState.init(allocator, &router);
+    var lua_state = try LuaState.init(allocator);
     defer lua_state.deinit();
 
     const config = Server.Config{

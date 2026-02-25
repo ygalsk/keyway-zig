@@ -61,6 +61,16 @@ pub fn build(b: *std.Build) void {
         }),
     });
 
+    // Tests need the same dependencies as the main executable
+    exe_unit_tests.root_module.addImport("xev", libxev_dep.module("xev"));
+    exe_unit_tests.root_module.addImport("luajit", luajit_dep.module("luajit"));
+    exe_unit_tests.addCSourceFile(.{
+        .file = b.path("vendor/picohttpparser.c"),
+        .flags = &.{"-std=c99"},
+    });
+    exe_unit_tests.addIncludePath(b.path("vendor"));
+    exe_unit_tests.linkLibC();
+
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
     const test_step = b.step("test", "Run unit tests");
     test_step.dependOn(&run_exe_unit_tests.step);

@@ -97,11 +97,15 @@ pub const Worker = struct {
         defer router.deinit();
 
         // Each worker has its own Lua state (one per thread!)
-        var lua_state = try LuaState.init(ctx.allocator, &router);
+        var lua_state = try LuaState.init(ctx.allocator);
         defer lua_state.deinit();
 
-        // Load Lua handlers (registers routes in this worker's router)
+        // Register cosocket API (needs stable *LuaState pointer)
+        lua_state.registerCosocketApi();
+
+        // Load Lua handlers and process declarative route table
         try lua_state.loadScript("scripts/handlers.lua");
+        try lua_state.processRouteTable(&router);
 
         // Create server (shares socket via SO_REUSEPORT)
         var server = try Server.init(
