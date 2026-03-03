@@ -12,10 +12,6 @@ pub const Request = struct {
     version: u8,
     headers: []Header,
     body: []const u8,
-
-    // Populated by router
-    params: ?std.StringHashMap([]const u8) = null,
-    query: ?std.StringHashMap([]const u8) = null,
 };
 
 /// HTTP response

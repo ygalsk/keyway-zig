@@ -1,7 +1,7 @@
 const std = @import("std");
-const Loop = @import("loop.zig").Loop;
+const xev = @import("xev");
 const Server = @import("server.zig").Server;
-const RadixRouter = @import("radix_router.zig").RadixRouter;
+const Router = @import("router.zig").Router;
 const LuaState = @import("lua_state.zig").LuaState;
 const lua_api = @import("lua_api.zig");
 
@@ -32,7 +32,7 @@ pub const Worker = struct {
     allocator: std.mem.Allocator,
     thread: std.Thread,
     config: Server.Config,
-    router: *RadixRouter,
+    router: *Router,
     worker_id: usize,
 
     /// Worker context passed to thread
@@ -89,11 +89,11 @@ pub const Worker = struct {
         std.log.info("Worker {d} starting...", .{ctx.worker_id});
 
         // Each worker has its own event loop
-        var loop = try Loop.init(ctx.allocator);
+        var loop = try xev.Loop.init(.{});
         defer loop.deinit();
 
         // Each worker creates its own router (lua_ref values are Lua-state-specific)
-        var router = try RadixRouter.init(ctx.allocator);
+        var router = try Router.init(ctx.allocator);
         defer router.deinit();
 
         // Each worker has its own Lua state (one per thread!)
@@ -106,6 +106,10 @@ pub const Worker = struct {
         // Load Lua handlers and process declarative route table
         try lua_state.loadScript("scripts/handlers.lua");
         try lua_state.processRouteTable(&router);
+
+        if (router.isEmpty()) {
+            std.log.warn("Worker {d}: no routes registered — all requests will 404", .{ctx.worker_id});
+        }
 
         // Create server (shares socket via SO_REUSEPORT)
         var server = try Server.init(
@@ -126,7 +130,7 @@ pub const Worker = struct {
         try server.start();
 
         // Run event loop
-        try loop.run();
+        try loop.run(.until_done);
     }
 };
 

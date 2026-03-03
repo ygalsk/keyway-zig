@@ -55,7 +55,7 @@ pub const ConnectionPool = struct {
             const len = pool.entries.items.len;
             const entry = pool.entries.items[len - 1];
             pool.entries.items.len = len - 1;
-            if (now - entry.inserted_at_ms > @as(i64, pool.max_idle_ms)) {
+            if (@max(0, now - entry.inserted_at_ms) > @as(i64, pool.max_idle_ms)) {
                 // Expired — close and continue
                 std.posix.close(entry.fd);
                 continue;

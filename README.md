@@ -11,36 +11,52 @@ Keyway is a high-performance HTTP server where Zig handles the execution engine 
 ## Example
 
 ```lua
-keyway.add_route("GET", "/ping", function(ctx)
-    ctx.status = 200
-    ctx.body = "pong"
-end)
+keyway.routes = {
+    -- Middleware runs on every request
+    middleware = {
+        function(ctx, next)
+            request_count = request_count + 1
+            next()
+        end,
+    },
 
-keyway.add_route("GET", "/users/{id}", function(ctx)
-    local user_id = ctx.params.id
-    ctx.status = 200
-    ctx.headers["Content-Type"] = "application/json"
-    ctx.body = '{"id": ' .. user_id .. ', "status": "active"}'
-end)
+    ["/ping"] = {
+        GET = function(ctx)
+            ctx.status = 200
+            ctx.body = "pong"
+        end,
+    },
+
+    ["/users/{id}"] = {
+        GET = function(ctx)
+            local user_id = ctx.params.id
+            ctx.status = 200
+            ctx.headers["Content-Type"] = "application/json"
+            ctx.body = '{"id": ' .. user_id .. ', "status": "active"}'
+        end,
+    },
+}
 ```
+
+No `send()`, no `write()`, no lifecycle calls — only state assignment. Zig commits all I/O via io_uring.
+
+## Features
+
+- **Per-core isolation**: one worker thread, one Lua state, one event loop per CPU core — no locks
+- **Cosockets**: non-blocking outbound TCP (e.g. Redis, PostgreSQL) via coroutine yield/resume with connection pooling
+- **Middleware**: global and per-route middleware chains with short-circuit support
+- **Zero-copy parsing**: picohttpparser FFI produces slices into the read buffer
+- **Radix router**: O(path-length) route matching with `{param}` support, zero allocations
 
 ## Build
 
 ```bash
-zig build
+zig build          # Build the keyway binary
+zig build run      # Build and run the server (listens on 0.0.0.0:8080)
+zig build test     # Run all unit tests
 ```
 
-## Run
-
-```bash
-zig build run
-```
-
-## Test
-
-```bash
-zig build test
-```
+Requires Zig 0.15.0+. Dependencies (libxev, zig-luajit) are fetched automatically via `build.zig.zon`.
 
 ## Architecture
 

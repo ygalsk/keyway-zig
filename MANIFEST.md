@@ -69,7 +69,7 @@ This guarantees:
 
 ### Zig Owns All Memory
 
-* Request bytes live in a **RingBuffer**
+* Request bytes live in a **LinearBuffer**
 * Headers, params, body slices are **offsets**
 * Lua receives **views**, never ownership
 
@@ -92,7 +92,7 @@ Each layer has **one job**:
 
 | Layer            | Responsibility       |
 | ---------------- | -------------------- |
-| RingBuffer       | Own bytes            |
+| LinearBuffer       | Own bytes            |
 | picohttpparser   | Mark structure       |
 | Radix router     | Assign meaning       |
 | HttpExchange     | Bind memory contract |
@@ -254,7 +254,7 @@ It is a **memory-accurate, proactor-aligned execution engine**.
 
 ## 14. Canonical Mental Model (Final)
 
-> RingBuffer holds reality
+> LinearBuffer holds reality
 > picohttpparser marks structure
 > Radix assigns meaning
 > HttpExchange binds memory

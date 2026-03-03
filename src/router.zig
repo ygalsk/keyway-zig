@@ -15,17 +15,12 @@ const Node = struct {
     // Parameter child (e.g., {id} parameter)
     param_child: ?*ParamChild,
 
-    // Handler at this leaf node (if any)
-    handler: ?Handler,
+    // HTTP method -> Lua registry reference map at this leaf node (if any)
+    methods: ?std.StringHashMap(i32),
 
     const ParamChild = struct {
         param_name: []const u8,
         node: *Node,
-    };
-
-    const Handler = struct {
-        // Map HTTP method -> Lua registry reference
-        methods: std.StringHashMap(i32),
     };
 
     fn init(allocator: std.mem.Allocator, prefix: []const u8) !*Node {
@@ -35,7 +30,7 @@ const Node = struct {
             .prefix = prefix,
             .children = std.StringHashMap(*Node).init(allocator),
             .param_child = null,
-            .handler = null,
+            .methods = null,
         };
         return node;
     }
@@ -62,27 +57,27 @@ const Node = struct {
         }
 
         // Free handler methods map
-        if (self.handler) |*h| {
-            var mit = h.methods.iterator();
+        if (self.methods) |*m| {
+            var mit = m.iterator();
             while (mit.next()) |entry| {
                 self.allocator.free(entry.key_ptr.*);
             }
-            h.methods.deinit();
+            m.deinit();
         }
 
         self.allocator.destroy(self);
     }
 };
 
-/// Radix tree router - O(path_length) route matching
-pub const RadixRouter = struct {
+/// Segment-level trie router — O(path_length) route matching
+pub const Router = struct {
     allocator: std.mem.Allocator,
     root: *Node,
 
     /// Initialize radix router
-    pub fn init(allocator: std.mem.Allocator) !RadixRouter {
+    pub fn init(allocator: std.mem.Allocator) !Router {
         const root = try Node.init(allocator, "");
-        return RadixRouter{
+        return Router{
             .allocator = allocator,
             .root = root,
         };
@@ -92,7 +87,7 @@ pub const RadixRouter = struct {
     /// Pattern format: /users/{id} or /posts/{post_id}/comments
     /// lua_ref is the Lua registry reference to the handler function
     pub fn addRoute(
-        self: *RadixRouter,
+        self: *Router,
         method: []const u8,
         pattern: []const u8,
         lua_ref: i32,
@@ -135,14 +130,12 @@ pub const RadixRouter = struct {
         }
 
         // At leaf node - add handler for this method
-        if (node.handler == null) {
-            node.handler = .{
-                .methods = std.StringHashMap(i32).init(self.allocator),
-            };
+        if (node.methods == null) {
+            node.methods = std.StringHashMap(i32).init(self.allocator);
         }
 
         const method_copy = try self.allocator.dupe(u8, method);
-        try node.handler.?.methods.put(method_copy, lua_ref);
+        try node.methods.?.put(method_copy, lua_ref);
     }
 
     /// Match a request against the radix tree
@@ -150,11 +143,11 @@ pub const RadixRouter = struct {
     /// params_out is an inline ParamArray that will be populated with parameters
     /// This function does ZERO allocations
     pub fn match(
-        self: *RadixRouter,
+        self: *Router,
         method: []const u8,
         path: []const u8,
         params_out: *handler.ParamArray,
-    ) ?i32 {
+    ) error{TooManyParams}!?i32 {
         var node = self.root;
         var start: usize = 1; // Skip leading '/'
 
@@ -168,7 +161,7 @@ pub const RadixRouter = struct {
                 node = child;
             } else if (node.param_child) |param| {
                 // Parameter match - store in inline array (zero allocations!)
-                params_out.put(param.param_name, segment);
+                try params_out.put(param.param_name, segment);
                 node = param.node;
             } else {
                 // No match found
@@ -179,15 +172,22 @@ pub const RadixRouter = struct {
         }
 
         // Check if we have a handler for this method at this node
-        if (node.handler) |h| {
-            return h.methods.get(method);
+        if (node.methods) |m| {
+            return m.get(method);
         }
 
         return null;
     }
 
+    /// Returns true if no routes have been registered
+    pub fn isEmpty(self: *const Router) bool {
+        return self.root.children.count() == 0 and
+            self.root.param_child == null and
+            self.root.methods == null;
+    }
+
     /// Clean up router resources
-    pub fn deinit(self: *RadixRouter) void {
+    pub fn deinit(self: *Router) void {
         self.root.deinit();
     }
 };
@@ -196,14 +196,14 @@ pub const RadixRouter = struct {
 test "radix router: simple static route" {
     const allocator = std.testing.allocator;
 
-    var router = try RadixRouter.init(allocator);
+    var router = try Router.init(allocator);
     defer router.deinit();
 
     try router.addRoute("GET", "/users", 1);
 
     var params = handler.ParamArray{};
 
-    const result = router.match("GET", "/users", &params);
+    const result = try router.match("GET", "/users", &params);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(@as(i32, 1), result.?);
     try std.testing.expectEqual(@as(usize, 0), params.len);
@@ -212,14 +212,14 @@ test "radix router: simple static route" {
 test "radix router: parameterized route" {
     const allocator = std.testing.allocator;
 
-    var router = try RadixRouter.init(allocator);
+    var router = try Router.init(allocator);
     defer router.deinit();
 
     try router.addRoute("GET", "/users/{id}", 2);
 
     var params = handler.ParamArray{};
 
-    const result = router.match("GET", "/users/123", &params);
+    const result = try router.match("GET", "/users/123", &params);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(@as(i32, 2), result.?);
     try std.testing.expectEqual(@as(usize, 1), params.len);
@@ -231,14 +231,14 @@ test "radix router: parameterized route" {
 test "radix router: multiple params" {
     const allocator = std.testing.allocator;
 
-    var router = try RadixRouter.init(allocator);
+    var router = try Router.init(allocator);
     defer router.deinit();
 
     try router.addRoute("GET", "/posts/{post_id}/comments/{id}", 3);
 
     var params = handler.ParamArray{};
 
-    const result = router.match("GET", "/posts/42/comments/7", &params);
+    const result = try router.match("GET", "/posts/42/comments/7", &params);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(@as(i32, 3), result.?);
     try std.testing.expectEqual(@as(usize, 2), params.len);
@@ -250,21 +250,21 @@ test "radix router: multiple params" {
 test "radix router: method mismatch" {
     const allocator = std.testing.allocator;
 
-    var router = try RadixRouter.init(allocator);
+    var router = try Router.init(allocator);
     defer router.deinit();
 
     try router.addRoute("POST", "/users", 4);
 
     var params = handler.ParamArray{};
 
-    const result = router.match("GET", "/users", &params);
+    const result = try router.match("GET", "/users", &params);
     try std.testing.expect(result == null);
 }
 
 test "radix router: shared prefix" {
     const allocator = std.testing.allocator;
 
-    var router = try RadixRouter.init(allocator);
+    var router = try Router.init(allocator);
     defer router.deinit();
 
     try router.addRoute("GET", "/users", 1);
@@ -274,18 +274,18 @@ test "radix router: shared prefix" {
     var params = handler.ParamArray{};
 
     // Test /users
-    const r1 = router.match("GET", "/users", &params);
+    const r1 = try router.match("GET", "/users", &params);
     try std.testing.expectEqual(@as(i32, 1), r1.?);
     params.clear();
 
     // Test /users/123
-    const r2 = router.match("GET", "/users/123", &params);
+    const r2 = try router.match("GET", "/users/123", &params);
     try std.testing.expectEqual(@as(i32, 2), r2.?);
     try std.testing.expectEqualStrings("123", params.get("id").?);
     params.clear();
 
     // Test /users/456/posts
-    const r3 = router.match("GET", "/users/456/posts", &params);
+    const r3 = try router.match("GET", "/users/456/posts", &params);
     try std.testing.expectEqual(@as(i32, 3), r3.?);
     try std.testing.expectEqualStrings("456", params.get("id").?);
 }
@@ -293,13 +293,13 @@ test "radix router: shared prefix" {
 test "radix router: no match" {
     const allocator = std.testing.allocator;
 
-    var router = try RadixRouter.init(allocator);
+    var router = try Router.init(allocator);
     defer router.deinit();
 
     try router.addRoute("GET", "/users", 1);
 
     var params = handler.ParamArray{};
 
-    const result = router.match("GET", "/posts", &params);
+    const result = try router.match("GET", "/posts", &params);
     try std.testing.expect(result == null);
 }

@@ -1,16 +1,17 @@
 const std = @import("std");
 
-/// Ring buffer for streaming I/O
-/// Provides efficient buffering for HTTP parsing
-pub const RingBuffer = struct {
+/// Linear buffer for single-request-at-a-time HTTP I/O.
+/// Read/write positions advance forward; reset to zero between requests.
+/// Not a true linear buffer — no wrap-around.
+pub const LinearBuffer = struct {
     data: []u8,
     read_pos: usize,
     write_pos: usize,
     allocator: std.mem.Allocator,
 
-    pub fn init(allocator: std.mem.Allocator, size: usize) !RingBuffer {
+    pub fn init(allocator: std.mem.Allocator, size: usize) !LinearBuffer {
         const data = try allocator.alloc(u8, size);
-        return RingBuffer{
+        return LinearBuffer{
             .data = data,
             .read_pos = 0,
             .write_pos = 0,
@@ -18,27 +19,27 @@ pub const RingBuffer = struct {
         };
     }
 
-    pub fn deinit(self: *RingBuffer) void {
+    pub fn deinit(self: *LinearBuffer) void {
         self.allocator.free(self.data);
     }
 
     /// Get slice available for writing
-    pub fn writeSlice(self: *RingBuffer) []u8 {
+    pub fn writeSlice(self: *LinearBuffer) []u8 {
         return self.data[self.write_pos..];
     }
 
     /// Mark bytes as written (advance write position)
-    pub fn commitWrite(self: *RingBuffer, n: usize) void {
+    pub fn commitWrite(self: *LinearBuffer, n: usize) void {
         self.write_pos += n;
     }
 
     /// Get slice available for reading
-    pub fn readSlice(self: *RingBuffer) []const u8 {
+    pub fn readSlice(self: *LinearBuffer) []const u8 {
         return self.data[self.read_pos..self.write_pos];
     }
 
     /// Mark bytes as consumed (advance read position)
-    pub fn consume(self: *RingBuffer, n: usize) void {
+    pub fn consume(self: *LinearBuffer, n: usize) void {
         self.read_pos += n;
 
         // Reset positions when buffer is empty
@@ -49,26 +50,26 @@ pub const RingBuffer = struct {
     }
 
     /// Get available space for writing
-    pub fn availableWrite(self: *RingBuffer) usize {
+    pub fn availableWrite(self: *LinearBuffer) usize {
         return self.data.len - self.write_pos;
     }
 
     /// Get available data for reading
-    pub fn availableRead(self: *RingBuffer) usize {
+    pub fn availableRead(self: *LinearBuffer) usize {
         return self.write_pos - self.read_pos;
     }
 
     /// Reset buffer to empty state
-    pub fn reset(self: *RingBuffer) void {
+    pub fn reset(self: *LinearBuffer) void {
         self.read_pos = 0;
         self.write_pos = 0;
     }
 };
 
-test "ring buffer basic operations" {
+test "linear buffer basic operations" {
     const allocator = std.testing.allocator;
 
-    var buf = try RingBuffer.init(allocator, 1024);
+    var buf = try LinearBuffer.init(allocator, 1024);
     defer buf.deinit();
 
     // Initially empty
@@ -92,10 +93,10 @@ test "ring buffer basic operations" {
     try std.testing.expectEqual(@as(usize, 0), buf.write_pos);
 }
 
-test "ring buffer partial consume" {
+test "linear buffer partial consume" {
     const allocator = std.testing.allocator;
 
-    var buf = try RingBuffer.init(allocator, 1024);
+    var buf = try LinearBuffer.init(allocator, 1024);
     defer buf.deinit();
 
     // Write "Hello World"

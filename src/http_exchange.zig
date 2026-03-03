@@ -22,7 +22,7 @@ pub const HttpExchange = struct {
     allocator: std.mem.Allocator,
 
     /// Initialize HttpExchange from Request and ParamArray
-    /// Request fields are zero-copy slices into RingBuffer
+    /// Request fields are zero-copy slices into LinearBuffer
     pub fn init(
         allocator: std.mem.Allocator,
         request: *const http.Request,

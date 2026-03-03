@@ -1,15 +1,22 @@
 const std = @import("std");
 const Lua = @import("luajit").Lua;
 const HttpExchange = @import("http_exchange.zig").HttpExchange;
-const RadixRouter = @import("radix_router.zig").RadixRouter;
+const Router = @import("router.zig").Router;
 const handler = @import("handler.zig");
 
 // === HttpExchange Metatable ===
 
-/// Helper: Get HttpExchange userdata from Lua stack
+/// Helper: Get HttpExchange from pointer-in-userdata on Lua stack.
+/// Userdata contains *HttpExchange (a pointer to the arena-allocated exchange).
 fn getExchange(lua: *Lua, index: i32) *HttpExchange {
     const ud = lua.toUserdata(index) orelse unreachable;
-    return @as(*HttpExchange, @ptrCast(@alignCast(ud)));
+    return @as(**HttpExchange, @ptrCast(@alignCast(ud))).*;
+}
+
+/// Helper: Get HeadersProxy from userdata at given stack index.
+inline fn getProxy(lua: *Lua, index: i32) ?*HeadersProxy {
+    const ud = lua.toUserdata(index) orelse return null;
+    return @as(*HeadersProxy, @ptrCast(@alignCast(ud)));
 }
 
 /// Lua metamethod: __index for reading ctx.field
@@ -51,8 +58,9 @@ fn luaExchangeNewIndex(lua: *Lua) callconv(.c) c_int {
     } else if (std.mem.eql(u8, key_str, "body")) {
         const body = lua.toString(3) catch return 0;
         ex.response_body = std.mem.span(body);
-        // Note: Lua string lives on stack, Zig must copy before popping
-        // Copy happens in lua_state.zig after Lua call returns
+        // Note: Lua string lives on the coroutine stack. Safe for the duration of
+        // lua_resume (non-yielding) or across yields (coroutine is pinned in registry).
+        // Arena-dupe happens in callLuaHandler/resumeHandler on LUA_OK.
     }
     // Ignore writes to read-only fields (method, path, params)
     // Headers assignment handled by HeadersProxy
@@ -61,32 +69,16 @@ fn luaExchangeNewIndex(lua: *Lua) callconv(.c) c_int {
 
 // === Params Table (read-only) ===
 
-/// Push params as a Lua table: {id = "123", name = "foo"}
-/// Uses cached table from registry to avoid per-request allocation
+/// Push params as a fresh Lua table: {id = "123", name = "foo"}
+/// Creates a new table per request (max 4 entries — negligible cost).
 fn pushParamsTable(lua: *Lua, params: *const handler.ParamArray) void {
-    // Get cached params table from registry (stored during LuaState.init)
-    _ = lua.getField(Lua.PseudoIndex.Registry, "_PARAMS_TABLE");
+    lua.createTable(0, @intCast(params.len));
 
-    // Clear existing entries (set them to nil)
-    lua.pushNil();
-    while (lua.next(-2)) {
-        lua.pop(1); // Pop value
-        lua.pushValue(-1); // Duplicate key
-        lua.pushNil(); // nil value
-        lua.setTable(-4); // table[key] = nil
-    }
-
-    // Populate table with current params
     for (params.items[0..params.len]) |p| {
-        // Push key
         lua.pushLString(p.key);
-        // Push value
         lua.pushLString(p.value);
-        // Set table[key] = value
         lua.setTable(-3);
     }
-
-    // Table is now on top of stack with current params
 }
 
 // === Headers Proxy (for ctx.headers["Key"] = "value") ===
@@ -96,27 +88,23 @@ pub const HeadersProxy = struct {
     exchange: *HttpExchange,
 };
 
-/// Push HeadersProxy userdata for ctx.headers access
-/// Uses cached proxy from registry to avoid per-request allocation
+/// Push a fresh HeadersProxy userdata for ctx.headers access.
+/// Creates a new proxy per request — no singleton sharing across connections.
 fn pushHeadersProxy(lua: *Lua, exchange: *HttpExchange) void {
-    // Get cached proxy from registry (stored during LuaState.init)
-    _ = lua.getField(Lua.PseudoIndex.Registry, "_HEADERS_PROXY");
-
-    // Update the cached proxy's exchange pointer to current exchange
-    const proxy_ud = lua.toUserdata(-1) orelse unreachable;
+    const proxy_ud = lua.newUserdata(@sizeOf(HeadersProxy));
     const proxy = @as(*HeadersProxy, @ptrCast(@alignCast(proxy_ud)));
-    proxy.exchange = exchange;
+    proxy.* = .{ .exchange = exchange };
 
-    // Proxy is now on top of stack pointing to current exchange
+    _ = lua.getMetatableRegistry("HttpExchange.Headers");
+    lua.setMetatable(-2);
 }
 
 /// Lua metamethod: HeadersProxy __index for reading ctx.headers["Key"]
 fn luaHeadersIndex(lua: *Lua) callconv(.c) c_int {
-    const proxy_ud = lua.toUserdata(1) orelse {
+    const proxy = getProxy(lua, 1) orelse {
         lua.pushNil();
         return 1;
     };
-    const proxy = @as(*HeadersProxy, @ptrCast(@alignCast(proxy_ud)));
 
     const key = lua.toString(2) catch {
         lua.pushNil();
@@ -146,8 +134,7 @@ fn luaHeadersIndex(lua: *Lua) callconv(.c) c_int {
 
 /// Lua metamethod: HeadersProxy __newindex for writing ctx.headers["Key"] = "value"
 fn luaHeadersNewIndex(lua: *Lua) callconv(.c) c_int {
-    const proxy_ud = lua.toUserdata(1) orelse return 0;
-    const proxy = @as(*HeadersProxy, @ptrCast(@alignCast(proxy_ud)));
+    const proxy = getProxy(lua, 1) orelse return 0;
 
     const key = lua.toString(2) catch return 0;
     const value = lua.toString(3) catch return 0;
@@ -236,7 +223,7 @@ fn isHttpMethod(key: []const u8) bool {
 
 /// Process keyway.routes table after script load.
 /// Walks the declarative route table and registers routes with the radix router.
-pub fn processRouteTable(lua: *Lua, router: *RadixRouter, allocator: std.mem.Allocator) !void {
+pub fn processRouteTable(lua: *Lua, router: *Router, allocator: std.mem.Allocator) !void {
     const keyway_type = lua.getGlobal("keyway");
     if (keyway_type != .table) {
         lua.pop(1);
@@ -259,7 +246,7 @@ pub fn processRouteTable(lua: *Lua, router: *RadixRouter, allocator: std.mem.All
 
 fn walkTable(
     lua: *Lua,
-    router: *RadixRouter,
+    router: *Router,
     table_idx: i32,
     path_prefix: []const u8,
     parent_middleware: []const i32,
@@ -365,7 +352,7 @@ fn collectMiddleware(
 
 fn registerRoute(
     lua: *Lua,
-    router: *RadixRouter,
+    router: *Router,
     method: []const u8,
     path: []const u8,
     handler_idx: i32,

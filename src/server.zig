@@ -1,8 +1,7 @@
 const std = @import("std");
 const xev = @import("xev");
-const Loop = @import("loop.zig").Loop;
 const Connection = @import("handler.zig").Connection;
-const RadixRouter = @import("radix_router.zig").RadixRouter;
+const Router = @import("router.zig").Router;
 const LuaState = @import("lua_state.zig").LuaState;
 const bpf_reuseport = @import("bpf_reuseport.zig");
 
@@ -13,11 +12,11 @@ const DEFAULT_BACKLOG: u31 = 128;
 /// Handles socket creation, binding, listening, and accepting connections
 pub const Server = struct {
     allocator: std.mem.Allocator,
-    loop: *Loop,
+    loop: *xev.Loop,
     socket: std.posix.socket_t,
     address: std.net.Address,
     accept_completion: xev.Completion,
-    router: *RadixRouter,
+    router: *Router,
     lua_state: *LuaState,
 
     /// Server configuration
@@ -30,9 +29,9 @@ pub const Server = struct {
     /// Initialize server
     pub fn init(
         allocator: std.mem.Allocator,
-        loop: *Loop,
+        loop: *xev.Loop,
         config: Config,
-        router: *RadixRouter,
+        router: *Router,
         lua_state: *LuaState,
         num_workers: u32,
         worker_id: u32,
@@ -139,7 +138,7 @@ pub const Server = struct {
             .userdata = self,
             .callback = onAccept,
         };
-        self.loop.xev_loop.add(&self.accept_completion);
+        self.loop.add(&self.accept_completion);
     }
 
     fn onAccept(
@@ -190,11 +189,6 @@ pub const Server = struct {
         return .disarm;
     }
 
-    /// Stop server
-    pub fn stop(self: *Server) void {
-        _ = self;
-    }
-
     /// Clean up server resources
     pub fn deinit(self: *Server) void {
         std.posix.close(self.socket);
@@ -204,10 +198,10 @@ pub const Server = struct {
 test "server init and deinit" {
     const allocator = std.testing.allocator;
 
-    var loop = try Loop.init(allocator);
+    var loop = try xev.Loop.init(.{});
     defer loop.deinit();
 
-    var router = try RadixRouter.init(allocator);
+    var router = try Router.init(allocator);
     defer router.deinit();
 
     var lua_state = try LuaState.init(allocator);

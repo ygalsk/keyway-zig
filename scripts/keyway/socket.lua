@@ -35,22 +35,19 @@ function tcp_mt:receive(pattern)
     pattern = pattern or "*l"
 
     if pattern == "*l" then
-        while true do
-            local buf = self.read_buf
-            local pos = buf:find("\n")
-            if pos then
-                local line = buf:sub(1, pos - 1)
-                self.read_buf = buf:sub(pos + 1)
-                if line:sub(-1) == "\r" then
-                    line = line:sub(1, -2)
-                end
-                return line
-            end
+        local buf = self.read_buf
+        local pos = buf:find("\n")
+        while not pos do
             local chunk, err = __keyway_io_recv(self.fd, 4096)
             if not chunk then return nil, err or "recv failed" end
             if #chunk == 0 then return nil, "closed" end
-            self.read_buf = buf .. chunk
+            buf = buf .. chunk
+            pos = buf:find("\n")
         end
+        local line = buf:sub(1, pos - 1)
+        self.read_buf = buf:sub(pos + 1)
+        if line:sub(-1) == "\r" then line = line:sub(1, -2) end
+        return line
 
     elseif pattern == "*a" then
         if #self.read_buf > 0 then
@@ -63,14 +60,19 @@ function tcp_mt:receive(pattern)
         return chunk
 
     elseif type(pattern) == "number" then
-        while #self.read_buf < pattern do
+        -- Collect chunks in a table, concat once (O(n) total vs O(n²) repeated ..)
+        local parts = { self.read_buf }
+        local total = #self.read_buf
+        while total < pattern do
             local chunk, err = __keyway_io_recv(self.fd, 4096)
             if not chunk then return nil, err or "recv failed" end
             if #chunk == 0 then return nil, "closed" end
-            self.read_buf = self.read_buf .. chunk
+            parts[#parts + 1] = chunk
+            total = total + #chunk
         end
-        local data = self.read_buf:sub(1, pattern)
-        self.read_buf = self.read_buf:sub(pattern + 1)
+        local buf = table.concat(parts)
+        local data = buf:sub(1, pattern)
+        self.read_buf = buf:sub(pattern + 1)
         return data
     end
 

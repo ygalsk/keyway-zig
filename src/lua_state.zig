@@ -2,7 +2,7 @@ const std = @import("std");
 const Lua = @import("luajit").Lua;
 const http = @import("http.zig");
 const HttpExchange = @import("http_exchange.zig").HttpExchange;
-const RadixRouter = @import("radix_router.zig").RadixRouter;
+const Router = @import("router.zig").Router;
 const lua_api = @import("lua_api.zig");
 const IoRequest = @import("io_request.zig").IoRequest;
 const io_request = @import("io_request.zig");
@@ -22,20 +22,13 @@ pub const LuaState = struct {
     lua: *Lua,
     allocator: std.mem.Allocator,
 
-    // Reusable exchange userdata reference
-    exchange_ref: i32,
-
-    // Reusable headers proxy userdata reference (cached to avoid per-request allocation)
-    headers_proxy_ref: i32,
-
-    // Reusable params table reference (cached to avoid per-request table creation)
-    params_table_ref: i32,
-
     // Cached reusable coroutine thread (avoids lua_newThread per request)
     cached_thread: *Lua = undefined,
     cached_thread_ref: i32 = 0,
 
-    // Cosocket: pending I/O intent written by C yield functions, read by Zig after LUA_YIELD
+    // Cosocket: pending I/O intent written by C yield functions, read by Zig after LUA_YIELD.
+    // Safe because: written by C yield functions during lua_resume, read by submitOutboundIO
+    // in the same stack frame. libxev is single-threaded per worker — no concurrent access.
     pending_io: IoRequest = .{},
 
     // Cosocket: temporary coroutine state (copied to Connection after yield)
@@ -64,50 +57,6 @@ pub const LuaState = struct {
         // Register keyway module (must be done before creating userdata)
         lua_api.registerKeywayModule(lua);
 
-        // Create reusable userdata for HttpExchange
-        // This avoids allocating it on every request
-        const ex_ud = lua.newUserdata(@sizeOf(HttpExchange));
-        _ = lua.getMetatableRegistry("HttpExchange");
-        lua.setMetatable(-2);
-
-        // Initialize the HttpExchange in the userdata with a proper ArrayList
-        const ex_ptr = @as(*HttpExchange, @ptrCast(@alignCast(ex_ud)));
-        ex_ptr.* = .{
-            .method = "",
-            .path = "",
-            .headers = &[_]http.Header{},
-            .params = undefined,
-            .body = "",
-            .status = 200,
-            .response_headers = try std.ArrayList(http.Header).initCapacity(allocator, 4),
-            .response_body = "",
-            .allocator = allocator,
-        };
-
-        const exchange_ref = lua.ref(Lua.PseudoIndex.Registry);
-
-        // Create reusable HeadersProxy userdata (avoids per-request allocation)
-        // Store it in registry under "_HEADERS_PROXY" key for easy access in metamethods
-        const proxy_ud = lua.newUserdata(@sizeOf(lua_api.HeadersProxy));
-        const proxy_ptr = @as(*lua_api.HeadersProxy, @ptrCast(@alignCast(proxy_ud)));
-        proxy_ptr.* = .{ .exchange = undefined }; // Will be set on each request
-
-        _ = lua.getMetatableRegistry("HttpExchange.Headers");
-        lua.setMetatable(-2);
-
-        // Store in registry with string key (so pushHeadersProxy can find it)
-        lua.pushValue(-1); // Duplicate proxy on stack
-        lua.setField(Lua.PseudoIndex.Registry, "_HEADERS_PROXY");
-
-        const headers_proxy_ref = lua.ref(Lua.PseudoIndex.Registry);
-
-        // Create reusable params table (cached to avoid per-request table creation)
-        lua.createTable(0, 4); // Initial capacity for 4 params
-        lua.pushValue(-1); // Duplicate table on stack
-        lua.setField(Lua.PseudoIndex.Registry, "_PARAMS_TABLE");
-
-        const params_table_ref = lua.ref(Lua.PseudoIndex.Registry);
-
         // Create reusable coroutine thread (avoids lua_newThread per request)
         const cached_thread = lua.newThread();
         const cached_thread_ref = lua.ref(Lua.PseudoIndex.Registry);
@@ -128,9 +77,6 @@ pub const LuaState = struct {
         return LuaState{
             .lua = lua,
             .allocator = allocator,
-            .exchange_ref = exchange_ref,
-            .headers_proxy_ref = headers_proxy_ref,
-            .params_table_ref = params_table_ref,
             .cached_thread = cached_thread,
             .cached_thread_ref = cached_thread_ref,
             .pool = ConnectionPool.init(allocator),
@@ -162,7 +108,7 @@ pub const LuaState = struct {
 
     /// Process keyway.routes declarative table after script load.
     /// Walks the nested table and registers routes with the radix router.
-    pub fn processRouteTable(self: *LuaState, router: *RadixRouter) !void {
+    pub fn processRouteTable(self: *LuaState, router: *Router) !void {
         try lua_api.processRouteTable(self.lua, router, self.allocator);
     }
 
@@ -178,10 +124,9 @@ pub const LuaState = struct {
     }
 
     /// Call a Lua handler with HttpExchange using coroutine dispatch.
-    /// Creates a new Lua thread (coroutine), pushes handler+exchange onto it,
-    /// and resumes. Non-yielding handlers complete identically to the old pcall path.
-    /// When Phase 2 adds cosockets, yielding handlers will suspend here and be
-    /// resumed by io_uring completion callbacks.
+    /// Creates a new Lua thread (coroutine), pushes handler + per-request exchange
+    /// userdata onto it, and resumes. Each coroutine gets its own userdata pointing
+    /// to the arena-allocated exchange — no shared singletons.
     pub fn callLuaHandler(
         self: *LuaState,
         lua_ref: i32,
@@ -203,21 +148,13 @@ pub const LuaState = struct {
             return error.NotAFunction;
         }
 
-        // Push reusable exchange userdata onto thread's stack and update fields
-        _ = thread.getTableIndexRaw(Lua.PseudoIndex.Registry, self.exchange_ref);
-        const ex_ud = thread.toUserdata(-1);
-        const ex_ptr = @as(*HttpExchange, @ptrCast(@alignCast(ex_ud)));
-
-        // Copy request fields into reusable userdata (reuse the ArrayList)
-        ex_ptr.method = exchange.method;
-        ex_ptr.path = exchange.path;
-        ex_ptr.headers = exchange.headers;
-        ex_ptr.params = exchange.params;
-        ex_ptr.body = exchange.body;
-        ex_ptr.status = 200;
-        ex_ptr.response_body = "";
-        ex_ptr.allocator = exchange.allocator;
-        ex_ptr.response_headers.clearRetainingCapacity();
+        // Create per-request exchange userdata (pointer-in-userdata pattern)
+        // Each coroutine gets its own userdata — no singleton sharing across connections
+        const ud = thread.newUserdata(@sizeOf(*HttpExchange));
+        const ud_ptr = @as(**HttpExchange, @ptrCast(@alignCast(ud)));
+        ud_ptr.* = exchange;
+        _ = thread.getMetatableRegistry("HttpExchange");
+        thread.setMetatable(-2);
 
         // Resume the coroutine: thread stack has [handler_fn, exchange_ud]
         const status = lua_resume(@ptrCast(thread), 1);
@@ -225,17 +162,10 @@ pub const LuaState = struct {
         switch (status) {
             0 => {
                 // LUA_OK — handler completed normally
-                if (ex_ptr.response_body.len > 0) {
-                    const body_copy = try exchange.allocator.dupe(u8, ex_ptr.response_body);
-                    exchange.response_body = body_copy;
+                // Arena-dupe response body (Lua string on coroutine stack, about to be reset)
+                if (exchange.response_body.len > 0) {
+                    exchange.response_body = try exchange.allocator.dupe(u8, exchange.response_body);
                 }
-                exchange.status = ex_ptr.status;
-                exchange.response_headers = ex_ptr.response_headers;
-
-                // Re-init cached ArrayList so it doesn't retain arena-allocated buffer
-                // (the arena resets after each response, which would leave a dangling pointer)
-                ex_ptr.response_headers = std.ArrayList(http.Header).initCapacity(self.allocator, 4) catch
-                    return error.OutOfMemory;
 
                 // If we used a fresh thread (cached was pinned), pop it and let GC collect
                 if (self.cached_thread_ref == 0) self.lua.pop(1);
@@ -268,33 +198,23 @@ pub const LuaState = struct {
     /// Resume a yielded handler coroutine after outbound I/O completes.
     /// Caller has already pushed result values onto the thread stack.
     /// Does NOT unref the coroutine — Connection.completeHandler handles that.
+    /// The exchange pointer comes from Connection.exchange (set during yield).
     pub fn resumeHandler(
         self: *LuaState,
         thread: *anyopaque,
         nresults: c_int,
         exchange: *HttpExchange,
     ) !HandlerResult {
+        _ = self;
         const status = lua_resume(thread, nresults);
-
-        // Get cached exchange userdata to read response
-        _ = self.lua.getTableIndexRaw(Lua.PseudoIndex.Registry, self.exchange_ref);
-        const ex_ud = self.lua.toUserdata(-1);
-        const ex_ptr = @as(*HttpExchange, @ptrCast(@alignCast(ex_ud)));
-        self.lua.pop(1);
 
         switch (status) {
             0 => {
                 // LUA_OK — handler completed
-                if (ex_ptr.response_body.len > 0) {
-                    const body_copy = try exchange.allocator.dupe(u8, ex_ptr.response_body);
-                    exchange.response_body = body_copy;
+                // Arena-dupe response body (Lua string on coroutine stack)
+                if (exchange.response_body.len > 0) {
+                    exchange.response_body = try exchange.allocator.dupe(u8, exchange.response_body);
                 }
-                exchange.status = ex_ptr.status;
-                exchange.response_headers = ex_ptr.response_headers;
-
-                // Re-init cached ArrayList so it doesn't retain arena-allocated buffer
-                ex_ptr.response_headers = std.ArrayList(http.Header).initCapacity(self.allocator, 4) catch
-                    return error.OutOfMemory;
                 return .completed;
             },
             1 => {
@@ -334,18 +254,6 @@ pub const LuaState = struct {
     /// Clean up Lua state
     pub fn deinit(self: *LuaState) void {
         self.pool.deinit();
-        // Clean up the ArrayList in the reusable exchange userdata
-        _ = self.lua.getTableIndexRaw(Lua.PseudoIndex.Registry, self.exchange_ref);
-        const ex_ud = self.lua.toUserdata(-1);
-        if (ex_ud) |ud| {
-            const ex_ptr = @as(*HttpExchange, @ptrCast(@alignCast(ud)));
-            ex_ptr.response_headers.deinit(self.allocator);
-        }
-        self.lua.pop(1);
-
-        self.lua.unref(Lua.PseudoIndex.Registry, self.exchange_ref);
-        self.lua.unref(Lua.PseudoIndex.Registry, self.headers_proxy_ref);
-        self.lua.unref(Lua.PseudoIndex.Registry, self.params_table_ref);
         if (self.cached_thread_ref != 0) {
             self.lua.unref(Lua.PseudoIndex.Registry, self.cached_thread_ref);
         }
@@ -356,7 +264,7 @@ pub const LuaState = struct {
 test "lua state initialization" {
     const allocator = std.testing.allocator;
 
-    var router = try RadixRouter.init(allocator);
+    var router = try Router.init(allocator);
     defer router.deinit();
 
     var state = try LuaState.init(allocator);
@@ -375,7 +283,7 @@ test "lua state initialization" {
 test "lua function call" {
     const allocator = std.testing.allocator;
 
-    var router = try RadixRouter.init(allocator);
+    var router = try Router.init(allocator);
     defer router.deinit();
 
     var state = try LuaState.init(allocator);
@@ -402,7 +310,7 @@ test "coroutine dispatch - non-yielding handler" {
     const allocator = std.testing.allocator;
     const handler = @import("handler.zig");
 
-    var router = try RadixRouter.init(allocator);
+    var router = try Router.init(allocator);
     defer router.deinit();
 
     var state = try LuaState.init(allocator);
@@ -457,7 +365,7 @@ test "coroutine dispatch - non-yielding handler" {
 test "lua package library and require" {
     const allocator = std.testing.allocator;
 
-    var router = try RadixRouter.init(allocator);
+    var router = try Router.init(allocator);
     defer router.deinit();
 
     var state = try LuaState.init(allocator);
@@ -476,7 +384,7 @@ test "middleware execution order" {
     const allocator = std.testing.allocator;
     const handler_mod = @import("handler.zig");
 
-    var router = try RadixRouter.init(allocator);
+    var router = try Router.init(allocator);
     defer router.deinit();
 
     var state = try LuaState.init(allocator);
@@ -543,7 +451,7 @@ test "middleware short-circuit" {
     const allocator = std.testing.allocator;
     const handler_mod = @import("handler.zig");
 
-    var router = try RadixRouter.init(allocator);
+    var router = try Router.init(allocator);
     defer router.deinit();
 
     var state = try LuaState.init(allocator);

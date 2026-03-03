@@ -1,10 +1,9 @@
 const std = @import("std");
 const xev = @import("xev");
-const Loop = @import("loop.zig").Loop;
-const RingBuffer = @import("buffer.zig").RingBuffer;
+const LinearBuffer = @import("buffer.zig").LinearBuffer;
 const http = @import("http.zig");
 const HttpExchange = @import("http_exchange.zig").HttpExchange;
-const RadixRouter = @import("radix_router.zig").RadixRouter;
+const Router = @import("router.zig").Router;
 const LuaState = @import("lua_state.zig").LuaState;
 const IoRequest = @import("io_request.zig").IoRequest;
 const Lua = @import("luajit").Lua;
@@ -25,8 +24,8 @@ pub const ParamArray = struct {
         value: []const u8,
     };
 
-    pub fn put(self: *ParamArray, key: []const u8, value: []const u8) void {
-        if (self.len >= MAX_ROUTE_PARAMS) return; // Silently ignore overflow
+    pub fn put(self: *ParamArray, key: []const u8, value: []const u8) error{TooManyParams}!void {
+        if (self.len >= MAX_ROUTE_PARAMS) return error.TooManyParams;
         self.items[self.len] = .{ .key = key, .value = value };
         self.len += 1;
     }
@@ -43,12 +42,16 @@ pub const ParamArray = struct {
     }
 };
 
-/// Connection lifecycle state — preparation for Phase 2 cosocket suspend/resume
-pub const ConnectionState = enum {
-    reading,
-    executing,
-    suspended,
-    writing_response,
+/// Cosocket suspend state — bundled so one `= null` replaces seven resets.
+/// Non-null means a handler is yielded waiting on outbound I/O.
+pub const SuspendedState = struct {
+    completion: xev.Completion,
+    exchange: *HttpExchange,
+    recv_buf: ?[]u8,
+    coroutine_ref: i32,
+    coroutine_thread: *anyopaque,
+    outbound_fd: std.posix.socket_t,
+    pending_op: IoRequest.Op,
 };
 
 /// Connection handler - manages HTTP request/response lifecycle
@@ -57,7 +60,7 @@ pub const Connection = struct {
     arena: std.heap.ArenaAllocator,
     loop: *xev.Loop,
     socket: std.posix.socket_t,
-    router: *RadixRouter,
+    router: *Router,
     lua_state: *LuaState,
 
     // Completions (must have stable address!)
@@ -65,30 +68,21 @@ pub const Connection = struct {
     write_completion: xev.Completion,
 
     // Buffers (allocated from base_allocator, persist across requests)
-    read_buffer: RingBuffer,
+    read_buffer: LinearBuffer,
     write_buffer: []u8,
     write_pos: usize,
 
     // Inline param storage (reused across requests, zero allocations, cache-friendly)
     param_cache: ParamArray,
 
-    // Connection lifecycle state
-    state: ConnectionState,
-
-    // Cosocket: outbound I/O fields (persist across yields)
-    outbound_completion: xev.Completion = undefined,
-    exchange: ?*HttpExchange = null,
-    outbound_recv_buf: ?[]u8 = null,
-    coroutine_ref: i32 = 0,
-    coroutine_thread: ?*anyopaque = null,
-    outbound_fd: std.posix.socket_t = 0,
-    pending_op: IoRequest.Op = .none,
+    // Cosocket: non-null when handler is suspended on outbound I/O
+    suspended: ?SuspendedState = null,
 
     pub fn init(
         allocator: std.mem.Allocator,
         loop: *xev.Loop,
         socket: std.posix.socket_t,
-        router: *RadixRouter,
+        router: *Router,
         lua_state: *LuaState,
     ) !*Connection {
         const conn = try allocator.create(Connection);
@@ -98,7 +92,7 @@ pub const Connection = struct {
         const write_buf = try allocator.alloc(u8, WRITE_BUFFER_SIZE);
         errdefer allocator.free(write_buf);
 
-        const read_buf = try RingBuffer.init(allocator, READ_BUFFER_SIZE);
+        const read_buf = try LinearBuffer.init(allocator, READ_BUFFER_SIZE);
         errdefer allocator.free(read_buf.data);
 
         // Initialize arena for per-request allocations
@@ -119,7 +113,6 @@ pub const Connection = struct {
             .write_buffer = write_buf,
             .write_pos = 0,
             .param_cache = ParamArray{},  // Inline struct, zero allocations
-            .state = .reading,
         };
 
         return conn;
@@ -136,6 +129,10 @@ pub const Connection = struct {
 
     /// Start reading from connection
     pub fn startRead(self: *Connection) void {
+        if (self.read_buffer.availableWrite() == 0) {
+            self.send400BadRequest();
+            return;
+        }
         const buf = self.read_buffer.writeSlice();
         self.read_completion = .{
             .op = .{
@@ -178,7 +175,6 @@ pub const Connection = struct {
 
         self.read_buffer.commitWrite(bytes_read);
 
-        // For now, just send a simple HTTP response
         self.sendResponse() catch |err| {
             std.log.err("Send response failed: {}", .{err});
             self.close();
@@ -200,16 +196,17 @@ pub const Connection = struct {
                 return;
             }
             std.log.err("Failed to parse request: {}", .{err});
-            try self.send400BadRequest();
+            self.send400BadRequest();
             return;
         };
         // headers are arena-allocated, freed on arena reset in onWrite
 
         // Clear param cache and match route
         self.param_cache.clear();
-        const lua_ref = self.router.match(request.method, request.path, &self.param_cache);
-
-        self.state = .executing;
+        const lua_ref = self.router.match(request.method, request.path, &self.param_cache) catch {
+            self.send400BadRequest();
+            return;
+        };
 
         if (lua_ref) |ref| {
             // Arena-allocate exchange (must persist across yields)
@@ -218,7 +215,7 @@ pub const Connection = struct {
 
             const handler_result = self.lua_state.callLuaHandler(ref, exchange_ptr) catch |err| {
                 std.log.err("Lua handler error: {}", .{err});
-                try self.send500InternalError();
+                self.send500InternalError();
                 return;
             };
 
@@ -227,11 +224,16 @@ pub const Connection = struct {
                     try self.writeResponse(exchange_ptr);
                 },
                 .yielded => {
-                    // Handler wants outbound I/O — save coroutine state on Connection
-                    self.coroutine_ref = self.lua_state.coroutine_ref;
-                    self.coroutine_thread = @ptrCast(self.lua_state.coroutine_thread);
-                    self.exchange = exchange_ptr;
-                    self.state = .suspended;
+                    // Handler wants outbound I/O — bundle coroutine state
+                    self.suspended = .{
+                        .completion = undefined,
+                        .exchange = exchange_ptr,
+                        .recv_buf = null,
+                        .coroutine_ref = self.lua_state.coroutine_ref,
+                        .coroutine_thread = @ptrCast(self.lua_state.coroutine_thread.?),
+                        .outbound_fd = 0,
+                        .pending_op = .none,
+                    };
                     self.lua_state.coroutine_ref = 0;
                     self.lua_state.coroutine_thread = null;
                     self.submitOutboundIO();
@@ -263,7 +265,6 @@ pub const Connection = struct {
         var response_buf = std.ArrayList(u8).initCapacity(alloc, estimated) catch unreachable;
         try response.serialize(response_buf.writer(alloc));
 
-        self.state = .writing_response;
         self.write_completion = .{
             .op = .{
                 .send = .{
@@ -279,12 +280,13 @@ pub const Connection = struct {
 
     /// Read pending_io from LuaState, create socket / submit xev operation
     fn submitOutboundIO(self: *Connection) void {
+        const s = &self.suspended.?;
         const pending = self.lua_state.pending_io;
         self.lua_state.pending_io = .{};
 
         switch (pending.op) {
             .connect, .pool_connect => {
-                self.pending_op = pending.op;
+                s.pending_op = pending.op;
                 const sock = std.posix.socket(
                     std.posix.AF.INET,
                     std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
@@ -293,58 +295,60 @@ pub const Connection = struct {
                     self.resumeWithError("socket creation failed");
                     return;
                 };
-                self.outbound_fd = sock;
+                s.outbound_fd = sock;
 
                 const host = pending.host orelse {
                     std.posix.close(sock);
+                    s.outbound_fd = 0;
                     self.resumeWithError("connect: missing host");
                     return;
                 };
                 const addr = std.net.Address.parseIp4(host, pending.port) catch {
                     std.posix.close(sock);
+                    s.outbound_fd = 0;
                     self.resumeWithError("connect: invalid address");
                     return;
                 };
 
-                self.outbound_completion = .{
+                s.completion = .{
                     .op = .{ .connect = .{ .socket = sock, .addr = addr } },
                     .userdata = self,
                     .callback = onOutboundComplete,
                 };
-                self.loop.add(&self.outbound_completion);
+                self.loop.add(&s.completion);
             },
             .send => {
                 const data = pending.send_data orelse {
                     self.resumeWithError("send: missing data");
                     return;
                 };
-                self.outbound_completion = .{
+                s.completion = .{
                     .op = .{ .send = .{ .fd = pending.fd, .buffer = .{ .slice = data } } },
                     .userdata = self,
                     .callback = onOutboundComplete,
                 };
-                self.loop.add(&self.outbound_completion);
+                self.loop.add(&s.completion);
             },
             .recv => {
                 const buf = self.arena.allocator().alloc(u8, pending.max_len) catch {
                     self.resumeWithError("recv: alloc failed");
                     return;
                 };
-                self.outbound_recv_buf = buf;
-                self.outbound_completion = .{
+                s.recv_buf = buf;
+                s.completion = .{
                     .op = .{ .recv = .{ .fd = pending.fd, .buffer = .{ .slice = buf } } },
                     .userdata = self,
                     .callback = onOutboundComplete,
                 };
-                self.loop.add(&self.outbound_completion);
+                self.loop.add(&s.completion);
             },
             .close => {
-                self.outbound_completion = .{
+                s.completion = .{
                     .op = .{ .close = .{ .fd = pending.fd } },
                     .userdata = self,
                     .callback = onOutboundComplete,
                 };
-                self.loop.add(&self.outbound_completion);
+                self.loop.add(&s.completion);
             },
             .none => {
                 self.resumeWithError("no pending I/O operation");
@@ -362,8 +366,9 @@ pub const Connection = struct {
         _ = loop;
 
         const self: *Connection = @ptrCast(@alignCast(userdata.?));
-        const thread: *Lua = @ptrCast(@alignCast(self.coroutine_thread.?));
-        const exchange_ptr = self.exchange.?;
+        const s = &self.suspended.?;
+        const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
+        const exchange_ptr = s.exchange;
 
         // Determine what completed based on the op that was submitted
         const op = completion.op;
@@ -371,23 +376,25 @@ pub const Connection = struct {
 
         if (op == .connect) {
             _ = result.connect catch {
-                std.posix.close(self.outbound_fd);
+                std.posix.close(s.outbound_fd);
+                s.outbound_fd = 0;
                 thread.pushNil();
                 thread.pushString("connection refused");
                 nresults = 2;
-                self.pending_op = .none;
+                s.pending_op = .none;
                 self.dispatchResume(thread, nresults, exchange_ptr);
                 return .disarm;
             };
-            if (self.pending_op == .pool_connect) {
+            if (s.pending_op == .pool_connect) {
                 // pool_connect returns (fd, reuse_count=0)
-                thread.pushInteger(@intCast(self.outbound_fd));
+                thread.pushInteger(@intCast(s.outbound_fd));
                 thread.pushInteger(0);
                 nresults = 2;
             } else {
-                thread.pushInteger(@intCast(self.outbound_fd));
+                thread.pushInteger(@intCast(s.outbound_fd));
             }
-            self.pending_op = .none;
+            s.outbound_fd = 0; // ownership transferred to Lua; completeHandler must not close it
+            s.pending_op = .none;
         } else if (op == .send) {
             const bytes_sent = result.send catch {
                 thread.pushNil();
@@ -402,16 +409,16 @@ pub const Connection = struct {
                 thread.pushNil();
                 thread.pushString("recv failed");
                 nresults = 2;
-                self.outbound_recv_buf = null;
+                s.recv_buf = null;
                 self.dispatchResume(thread, nresults, exchange_ptr);
                 return .disarm;
             };
-            if (self.outbound_recv_buf) |buf| {
+            if (s.recv_buf) |buf| {
                 thread.pushLString(buf[0..bytes_read]);
             } else {
                 thread.pushNil();
             }
-            self.outbound_recv_buf = null;
+            s.recv_buf = null;
         } else if (op == .close) {
             _ = result.close catch {
                 thread.pushNil();
@@ -420,6 +427,7 @@ pub const Connection = struct {
                 self.dispatchResume(thread, nresults, exchange_ptr);
                 return .disarm;
             };
+            s.outbound_fd = 0; // fd is now closed; prevent completeHandler double-close
             thread.pushInteger(1);
         } else {
             thread.pushNil();
@@ -434,7 +442,7 @@ pub const Connection = struct {
     /// Resume coroutine and dispatch based on result
     fn dispatchResume(self: *Connection, thread: *Lua, nresults: c_int, exchange_ptr: *HttpExchange) void {
         const resume_result = self.lua_state.resumeHandler(@ptrCast(thread), nresults, exchange_ptr) catch {
-            self.send500InternalError() catch {};
+            self.send500InternalError();
             return;
         };
 
@@ -447,69 +455,55 @@ pub const Connection = struct {
     /// Handler finished after one or more yield/resume cycles.
     /// Return coroutine to cache, serialize response, submit write.
     fn completeHandler(self: *Connection) void {
-        if (self.coroutine_ref != 0) {
-            if (self.lua_state.cached_thread_ref == 0) {
-                // Return thread to cache for reuse
-                self.lua_state.cached_thread_ref = self.coroutine_ref;
-                self.lua_state.cached_thread = @ptrCast(@alignCast(self.coroutine_thread.?));
-            } else {
-                self.lua_state.lua.unref(Lua.PseudoIndex.Registry, self.coroutine_ref);
-            }
-            self.coroutine_ref = 0;
-        }
-        self.coroutine_thread = null;
+        const s = self.suspended orelse return;
 
-        const exchange_ptr = self.exchange orelse return;
-        self.exchange = null;
+        // Return coroutine thread to cache for reuse
+        if (s.coroutine_ref != 0) {
+            if (self.lua_state.cached_thread_ref == 0) {
+                self.lua_state.cached_thread_ref = s.coroutine_ref;
+                self.lua_state.cached_thread = @ptrCast(@alignCast(s.coroutine_thread));
+            } else {
+                self.lua_state.lua.unref(Lua.PseudoIndex.Registry, s.coroutine_ref);
+            }
+        }
+
+        // Safety net: close leaked outbound fd
+        if (s.outbound_fd != 0) std.posix.close(s.outbound_fd);
+
+        const exchange_ptr = s.exchange;
+        self.suspended = null;
 
         self.writeResponse(exchange_ptr) catch {
-            self.send500InternalError() catch {};
+            self.send500InternalError();
         };
     }
 
     /// Resume coroutine with nil, error_message for pre-submission failures
     fn resumeWithError(self: *Connection, msg: [:0]const u8) void {
-        const thread: *Lua = @ptrCast(@alignCast(self.coroutine_thread.?));
-        const exchange_ptr = self.exchange.?;
+        const s = &self.suspended.?;
+        const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
         thread.pushNil();
         thread.pushString(msg);
-        self.dispatchResume(thread, 2, exchange_ptr);
+        self.dispatchResume(thread, 2, s.exchange);
     }
 
-    fn send400BadRequest(self: *Connection) !void {
-        const response_text = "HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\nBad Request";
-        @memcpy(self.write_buffer[0..response_text.len], response_text);
-        self.write_pos = response_text.len;
-
+    fn sendRawResponse(self: *Connection, text: []const u8) void {
+        @memcpy(self.write_buffer[0..text.len], text);
+        self.write_pos = text.len;
         self.write_completion = .{
-            .op = .{
-                .send = .{
-                    .fd = self.socket,
-                    .buffer = .{ .slice = self.write_buffer[0..self.write_pos] },
-                },
-            },
+            .op = .{ .send = .{ .fd = self.socket, .buffer = .{ .slice = self.write_buffer[0..self.write_pos] } } },
             .userdata = self,
             .callback = onWrite,
         };
         self.loop.add(&self.write_completion);
     }
 
-    fn send500InternalError(self: *Connection) !void {
-        const response_text = "HTTP/1.1 500 Internal Server Error\r\nContent-Length: 21\r\n\r\nInternal Server Error";
-        @memcpy(self.write_buffer[0..response_text.len], response_text);
-        self.write_pos = response_text.len;
+    fn send400BadRequest(self: *Connection) void {
+        self.sendRawResponse("HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\nBad Request");
+    }
 
-        self.write_completion = .{
-            .op = .{
-                .send = .{
-                    .fd = self.socket,
-                    .buffer = .{ .slice = self.write_buffer[0..self.write_pos] },
-                },
-            },
-            .userdata = self,
-            .callback = onWrite,
-        };
-        self.loop.add(&self.write_completion);
+    fn send500InternalError(self: *Connection) void {
+        self.sendRawResponse("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 21\r\n\r\nInternal Server Error");
     }
 
     fn onWrite(
@@ -530,15 +524,10 @@ pub const Connection = struct {
         };
         _ = bytes_written;
 
-        // Reset cosocket fields and arena for next request (HTTP/1.1 keep-alive)
-        self.exchange = null;
-        self.outbound_recv_buf = null;
-        self.coroutine_ref = 0;
-        self.coroutine_thread = null;
-        self.pending_op = .none;
+        // Reset for next request (HTTP/1.1 keep-alive)
+        self.suspended = null;
         _ = self.arena.reset(.retain_capacity);
         self.read_buffer.reset();
-        self.state = .reading;
 
         // Continue reading for next request on same connection
         self.startRead();
@@ -546,7 +535,6 @@ pub const Connection = struct {
     }
 
     fn close(self: *Connection) void {
-        const allocator = self.arena.child_allocator;
-        self.deinit(allocator);
+        self.deinit(self.base_allocator);
     }
 };
