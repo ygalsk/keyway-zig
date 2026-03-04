@@ -10,13 +10,53 @@ ffi.cdef[[
     typedef long time_t;
     struct timespec { time_t tv_sec; long tv_nsec; };
     int clock_gettime(int clockid, struct timespec *tp);
+
+    struct addrinfo_hint {
+        int ai_flags;
+        int ai_family;
+        int ai_socktype;
+        int ai_protocol;
+        unsigned int ai_addrlen;
+        void *ai_addr;
+        char *ai_canonname;
+        void *ai_next;
+    };
+    struct sockaddr_in {
+        unsigned short sin_family;
+        unsigned short sin_port;
+        unsigned char sin_addr[4];
+        char sin_zero[8];
+    };
+    int getaddrinfo(const char *node, const char *service,
+        const struct addrinfo_hint *hints, struct addrinfo_hint **res);
+    void freeaddrinfo(struct addrinfo_hint *res);
+    const char* inet_ntop(int af, const void* src, char* dst, unsigned int size);
 ]]
 local CLOCK_MONOTONIC = 1
+local AF_INET = 2
 
 local function now_ms()
     local ts = ffi.new("struct timespec")
     ffi.C.clock_gettime(CLOCK_MONOTONIC, ts)
     return tonumber(ts.tv_sec) * 1000 + tonumber(ts.tv_nsec) / 1e6
+end
+
+-- Resolve hostname to IPv4 address string. Returns ip or nil + error.
+local function resolve_host(hostname)
+    local res = ffi.new("struct addrinfo_hint*[1]")
+    local hints = ffi.new("struct addrinfo_hint")
+    hints.ai_family = AF_INET
+    hints.ai_socktype = 1 -- SOCK_STREAM
+    local err = ffi.C.getaddrinfo(hostname, nil, hints, res)
+    if err ~= 0 then
+        return nil, "DNS resolution failed for: " .. hostname
+    end
+    local sa = ffi.cast("struct sockaddr_in*", res[0].ai_addr)
+    local buf = ffi.new("char[16]")
+    ffi.C.inet_ntop(AF_INET, sa.sin_addr, buf, 16)
+    local ip = ffi.string(buf)
+    ffi.C.freeaddrinfo(res[0])
+    return ip
 end
 
 local M = {}
@@ -72,8 +112,19 @@ function M.probe(raw_url)
         return nil, parse_err
     end
 
-    -- SSRF protection
+    -- SSRF protection: check hostname first
     if is_private(parsed.host) then
+        return nil, "Private IP ranges and localhost are not allowed"
+    end
+
+    -- Resolve hostname to IP (cosocket connect requires an IP literal)
+    local ip, dns_err = resolve_host(parsed.host)
+    if not ip then
+        return nil, dns_err
+    end
+
+    -- SSRF protection: also check the resolved IP (prevents DNS rebinding to a degree)
+    if is_private(ip) then
         return nil, "Private IP ranges and localhost are not allowed"
     end
 
@@ -87,11 +138,11 @@ function M.probe(raw_url)
         host_header
     )
 
-    -- Connect
+    -- Connect (use resolved IP, not hostname)
     local tcp = socket.tcp()
     tcp:settimeout(10000)
     local t0 = now_ms()
-    local ok, conn_err = tcp:connect(parsed.host, parsed.port)
+    local ok, conn_err = tcp:connect(ip, parsed.port)
     if not ok then
         return nil, "Could not connect to host: " .. (conn_err or "connection failed")
     end

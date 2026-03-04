@@ -1,0 +1,90 @@
+<h1>KV Store</h1>
+<p>Store and retrieve key-value pairs backed by Redis</p>
+
+<% if result then %>
+<div class="card" style="margin-bottom: var(--space-4);">
+  <h2 style="margin-bottom: var(--space-2); font-size: var(--text-base);">Result</h2>
+  <% if result.action == "get" then %>
+    <% if result.value then %>
+    <table style="width: 100%; border-collapse: collapse;">
+      <tr>
+        <th style="text-align: left; padding: var(--space-1) var(--space-2); border-bottom: 2px solid var(--kiwi-green); font-size: var(--text-sm); color: var(--kiwi-seed-light);">Key</th>
+        <th style="text-align: left; padding: var(--space-1) var(--space-2); border-bottom: 2px solid var(--kiwi-green); font-size: var(--text-sm); color: var(--kiwi-seed-light);">Value</th>
+      </tr>
+      <tr>
+        <td style="padding: var(--space-1) var(--space-2); font-family: var(--font-code); font-size: var(--text-sm);"><%= result.key %></td>
+        <td style="padding: var(--space-1) var(--space-2);"><%= result.value %></td>
+      </tr>
+    </table>
+    <% else %>
+    <p style="color: var(--kiwi-seed-light); font-family: var(--font-code); font-size: var(--text-sm);">Key "<%= result.key %>" not found</p>
+    <% end %>
+  <% elseif result.action == "set" then %>
+    <p style="font-family: var(--font-code); font-size: var(--text-sm);">SET <span style="color: var(--kiwi-green);"><%= result.key %></span> = <span style="color: var(--kiwi-seed-light);"><%= result.display_value %></span></p>
+  <% elseif result.action == "del" then %>
+    <p style="font-family: var(--font-code); font-size: var(--text-sm);">DEL <span style="color: var(--kiwi-green);"><%= result.key %></span> — <% if result.count and result.count > 0 then %>removed<% else %>key did not exist<% end %></p>
+  <% end %>
+</div>
+<% end %>
+
+<div class="card" style="margin-bottom: var(--space-3);">
+  <h2 style="margin-bottom: var(--space-3); font-size: var(--text-base);">Set a Key</h2>
+  <form method="POST" action="/kv">
+    <input type="hidden" name="action" value="set">
+    <div class="form-group">
+      <label for="set-key">Key:</label>
+      <input type="text" id="set-key" name="key" placeholder="my-key" required>
+    </div>
+    <div class="form-group">
+      <label for="set-value">Value:</label>
+      <input type="text" id="set-value" name="value" placeholder="my-value" required>
+    </div>
+    <button type="submit" class="btn-primary">SET</button>
+  </form>
+</div>
+
+<div style="display: flex; gap: var(--space-3); flex-wrap: wrap; margin-bottom: var(--space-3);">
+  <div class="card" style="flex: 1; min-width: 200px;">
+    <h2 style="margin-bottom: var(--space-3); font-size: var(--text-base);">Get a Key</h2>
+    <form method="POST" action="/kv">
+      <input type="hidden" name="action" value="get">
+      <div class="form-group">
+        <label for="get-key">Key:</label>
+        <input type="text" id="get-key" name="key" placeholder="my-key" required>
+      </div>
+      <button type="submit" class="btn-primary">GET</button>
+    </form>
+  </div>
+
+  <div class="card" style="flex: 1; min-width: 200px;">
+    <h2 style="margin-bottom: var(--space-3); font-size: var(--text-base);">Delete a Key</h2>
+    <form method="POST" action="/kv">
+      <input type="hidden" name="action" value="del">
+      <div class="form-group">
+        <label for="del-key">Key:</label>
+        <input type="text" id="del-key" name="key" placeholder="my-key" required>
+      </div>
+      <button type="submit" class="btn-primary" style="background: var(--kiwi-seed-dark);">DEL</button>
+    </form>
+  </div>
+</div>
+
+<div class="card">
+  <h2 style="margin-bottom: var(--space-2); font-size: var(--text-base);">All Keys</h2>
+  <% if keys and #keys > 0 then %>
+  <table style="width: 100%; border-collapse: collapse;">
+    <tr>
+      <th style="text-align: left; padding: var(--space-1) var(--space-2); border-bottom: 2px solid var(--kiwi-green); font-size: var(--text-sm); color: var(--kiwi-seed-light);">#</th>
+      <th style="text-align: left; padding: var(--space-1) var(--space-2); border-bottom: 2px solid var(--kiwi-green); font-size: var(--text-sm); color: var(--kiwi-seed-light);">Key</th>
+    </tr>
+    <% for i, k in ipairs(keys) do %>
+    <tr>
+      <td style="padding: var(--space-1) var(--space-2); border-bottom: 1px solid var(--kiwi-border); font-size: var(--text-sm); color: var(--kiwi-seed-light);"><%= i %></td>
+      <td style="padding: var(--space-1) var(--space-2); border-bottom: 1px solid var(--kiwi-border); font-family: var(--font-code); font-size: var(--text-sm);"><%= k %></td>
+    </tr>
+    <% end %>
+  </table>
+  <% else %>
+  <p style="color: var(--kiwi-seed-light); font-size: var(--text-sm);">No keys stored yet</p>
+  <% end %>
+</div>
