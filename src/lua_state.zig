@@ -53,6 +53,8 @@ pub const LuaState = struct {
         lua.openOSLib(); // Required for some LuaRocks modules (time, execute, etc.)
         lua.openDebugLib(); // Required for some LuaRocks modules (debug introspection)
         lua.openBitLib(); // Required for pgmoon and other LuaJIT modules (bit operations)
+        lua.openJITLib(); // Required for JIT control (jit.on/off, jit.opt, etc.)
+        lua.openFFILib(); // Required for FFI (ffi.cdef, ffi.C, ffi.new, etc.)
 
         // Register keyway module (must be done before creating userdata)
         lua_api.registerKeywayModule(lua);
@@ -75,6 +77,8 @@ pub const LuaState = struct {
             \\    package.path = "scripts/?.lua;scripts/?/init.lua;"
             \\        .. home .. "/.luarocks/share/lua/5.1/?.lua;"
             \\        .. home .. "/.luarocks/share/lua/5.1/?/init.lua;"
+            \\        .. "/usr/share/lua/5.1/?.lua;"
+            \\        .. "/usr/share/lua/5.1/?/init.lua;"
             \\        .. package.path
             \\end
             \\if custom_cpath then
@@ -83,6 +87,7 @@ pub const LuaState = struct {
             \\    local home = os.getenv("HOME") or ""
             \\    package.cpath = home .. "/.luarocks/lib/lua/5.1/?.so;"
             \\        .. "/usr/lib/lua/5.1/?.so;"
+            \\        .. "/usr/share/lua/5.1/?.so;"
             \\        .. "/usr/local/lib/lua/5.1/?.so;"
             \\        .. package.cpath
             \\end
