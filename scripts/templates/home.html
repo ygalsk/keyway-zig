@@ -1,20 +1,32 @@
 <h1>Keyway</h1>
 <p>A highly opinionated engine with no opinions</p>
-<p>HTTP engine powered by Zig, controlled by Lua.</p>
+<p style="margin-bottom: var(--space-6);">HTTP engine powered by Zig, controlled by Lua.</p>
 
-<h2>Test Form</h2>
-<form method="POST" action="/echo">
-  <label for="message">Message:</label>
-  <input type="text" id="message" name="message" placeholder="Try &lt;script&gt;alert(1)&lt;/script&gt;">
-  <button type="submit" class="btn-primary">Submit</button>
-</form>
+<div class="card">
+  <h2 style="margin-bottom: var(--space-3);">Test Form</h2>
+  <form method="POST" action="/echo">
+    <div class="form-group">
+      <label for="message">Message:</label>
+      <input type="text" id="message" name="message" placeholder="Try &lt;script&gt;alert(1)&lt;/script&gt;">
+    </div>
+    <button type="submit" class="btn-primary">Submit</button>
+  </form>
+</div>
 
 <% if echo_fields then %>
-<h2>Parsed Fields</h2>
-<table>
-  <tr><th>Field</th><th>Value</th></tr>
-  <% for k, v in pairs(echo_fields) do %>
-  <tr><td><%= k %></td><td><%= v %></td></tr>
-  <% end %>
-</table>
+<div class="card" style="margin-top: var(--space-3);">
+  <h2 style="margin-bottom: var(--space-2);">Parsed Fields</h2>
+  <table style="width: 100%; border-collapse: collapse;">
+    <tr>
+      <th style="text-align: left; padding: var(--space-1) var(--space-2); border-bottom: 2px solid var(--kiwi-green); font-size: var(--text-sm); color: var(--kiwi-seed-light);">Field</th>
+      <th style="text-align: left; padding: var(--space-1) var(--space-2); border-bottom: 2px solid var(--kiwi-green); font-size: var(--text-sm); color: var(--kiwi-seed-light);">Value</th>
+    </tr>
+    <% for k, v in pairs(echo_fields) do %>
+    <tr>
+      <td style="padding: var(--space-1) var(--space-2); border-bottom: 1px solid var(--kiwi-border); font-family: var(--font-code); font-size: var(--text-sm);"><%= k %></td>
+      <td style="padding: var(--space-1) var(--space-2); border-bottom: 1px solid var(--kiwi-border);"><%= v %></td>
+    </tr>
+    <% end %>
+  </table>
+</div>
 <% end %>

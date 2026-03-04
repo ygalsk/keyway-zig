@@ -103,6 +103,16 @@ h1, h2, h3, h4, h5, h6 {
   line-height: var(--leading-tight);
 }
 
+h1 {
+  font-size: var(--text-3xl);
+  margin-bottom: var(--space-1);
+}
+
+h1 + p {
+  font-size: var(--text-lg);
+  color: var(--kiwi-seed-light);
+}
+
 a {
   color: var(--kiwi-green);
   text-decoration: none;
