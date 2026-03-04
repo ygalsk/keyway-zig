@@ -6,7 +6,7 @@ local socket  = require("keyway.socket")
 local url_lib = require("net.url")
 
 local ffi = require("ffi")
-ffi.cdef[[
+pcall(ffi.cdef, [[
     typedef long time_t;
     struct timespec { time_t tv_sec; long tv_nsec; };
     int clock_gettime(int clockid, struct timespec *tp);
@@ -31,14 +31,17 @@ ffi.cdef[[
         const struct addrinfo_hint *hints, struct addrinfo_hint **res);
     void freeaddrinfo(struct addrinfo_hint *res);
     const char* inet_ntop(int af, const void* src, char* dst, unsigned int size);
-]]
+]])
 local CLOCK_MONOTONIC = 1
 local AF_INET = 2
+local SOCK_STREAM = 1
+
+-- Reusable timespec for now_ms() (avoids per-call allocation)
+local ts_buf = ffi.new("struct timespec")
 
 local function now_ms()
-    local ts = ffi.new("struct timespec")
-    ffi.C.clock_gettime(CLOCK_MONOTONIC, ts)
-    return tonumber(ts.tv_sec) * 1000 + tonumber(ts.tv_nsec) / 1e6
+    ffi.C.clock_gettime(CLOCK_MONOTONIC, ts_buf)
+    return tonumber(ts_buf.tv_sec) * 1000 + tonumber(ts_buf.tv_nsec) / 1e6
 end
 
 -- Resolve hostname to IPv4 address string. Returns ip or nil + error.
@@ -46,7 +49,7 @@ local function resolve_host(hostname)
     local res = ffi.new("struct addrinfo_hint*[1]")
     local hints = ffi.new("struct addrinfo_hint")
     hints.ai_family = AF_INET
-    hints.ai_socktype = 1 -- SOCK_STREAM
+    hints.ai_socktype = SOCK_STREAM
     local err = ffi.C.getaddrinfo(hostname, nil, hints, res)
     if err ~= 0 then
         return nil, "DNS resolution failed for: " .. hostname
@@ -89,8 +92,12 @@ local function parse_url(raw)
     if u.scheme ~= "http" then
         return nil, "Only HTTP URLs are supported (not HTTPS or other schemes)"
     end
-    -- Extract raw path+query from original string to avoid re-encoding issues
-    local path_and_query = raw:match("^https?://[^/]+(/.*)$") or "/"
+    -- Use parsed path from url library, fall back to "/"
+    local path_and_query = tostring(u.path) or "/"
+    if path_and_query == "" then path_and_query = "/" end
+    if u.query and tostring(u.query) ~= "" then
+        path_and_query = path_and_query .. "?" .. tostring(u.query)
+    end
     return {
         host           = u.host,
         port           = tonumber(u.port) or 80,
@@ -125,7 +132,7 @@ function M.probe(raw_url)
 
     -- SSRF protection: also check the resolved IP (prevents DNS rebinding to a degree)
     if is_private(ip) then
-        return nil, "Private IP ranges and localhost are not allowed"
+        return nil, "Hostname resolves to a private address"
     end
 
     -- Build request

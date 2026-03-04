@@ -29,8 +29,7 @@ function M.parse(body)
         return result
     end
 
-    for pair in (body .. "&"):gmatch("([^&]*)&") do
-        if pair ~= "" then
+    for pair in body:gmatch("([^&]+)") do
             local eq = pair:find("=")
             local key, value
             if eq then
@@ -43,7 +42,6 @@ function M.parse(body)
             if key ~= "" then
                 result[key] = value
             end
-        end
     end
 
     return result

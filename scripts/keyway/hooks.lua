@@ -18,20 +18,21 @@ local M = {}
 
 local urandom_fd = ffi.C.open("/dev/urandom", O_RDONLY)
 
+-- Seed fallback RNG once at module load (not per-call)
+if urandom_fd < 0 then
+    math.randomseed(os.time())
+end
+
 --- Generate a 16-char lowercase hex ID from /dev/urandom.
 -- @return string  e.g. "a3f9c1d2b4e5f607"
 function M.generate_id()
     if urandom_fd < 0 then
-        math.randomseed(os.time())
         return string.format("%08x%08x", os.time(), math.random(0, 0xffffffff))
     end
     local buf = ffi.new("unsigned char[8]")
     ffi.C.read(urandom_fd, buf, 8)
-    local parts = {}
-    for i = 0, 7 do
-        parts[i + 1] = string.format("%02x", buf[i])
-    end
-    return table.concat(parts)
+    return string.format("%02x%02x%02x%02x%02x%02x%02x%02x",
+        buf[0], buf[1], buf[2], buf[3], buf[4], buf[5], buf[6], buf[7])
 end
 
 --- Mark a webhook as existing in Redis.
@@ -46,9 +47,7 @@ end
 -- @param id      string hook ID
 -- @return bool
 function M.exists(client, id)
-    -- redis-lua returns boolean true/false for EXISTS, not 1/0
-    local val = client:get("hook:" .. id)
-    return val ~= nil and val ~= false
+    return client:exists("hook:" .. id)
 end
 
 --- Capture an incoming request into the hook's Redis list.

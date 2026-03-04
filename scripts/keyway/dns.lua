@@ -7,13 +7,23 @@ local RESOLVER     = "8.8.8.8"
 local RESOLVER_PORT = 53
 local TIMEOUT_MS   = 3000
 local QUERY_ID     = 0x1234
+local QUERY_ID_HI  = math.floor(QUERY_ID / 256)
+local QUERY_ID_LO  = QUERY_ID % 256
+
+-- RCODE error messages (hoisted to module scope)
+local RCODE_MSGS = { [1]="format error", [2]="server failure", [3]="name not found", [5]="refused" }
+
+-- Read a big-endian uint16 from `data` at position `pos`.
+local function read_u16(data, pos)
+    return string.byte(data, pos) * 256 + string.byte(data, pos + 1)
+end
 
 -- Encode a domain as a DNS query packet for A records.
 -- Returns a binary string in DNS wire format.
 local function build_query(domain)
     -- Header: ID, Flags (RD=1), QDCOUNT=1, all others 0
     local header = string.char(
-        math.floor(QUERY_ID / 256), QUERY_ID % 256,  -- ID from constant
+        QUERY_ID_HI, QUERY_ID_LO,  -- ID from pre-computed constants
         0x01, 0x00,  -- Flags: recursion desired
         0x00, 0x01,  -- QDCOUNT = 1
         0x00, 0x00,  -- ANCOUNT = 0
@@ -59,18 +69,16 @@ local function parse_response(data)
     if #data < 12 then return nil, "response too short" end
 
     -- Verify ID
-    local resp_id = string.byte(data, 1) * 256 + string.byte(data, 2)
-    if resp_id ~= QUERY_ID then return nil, "response ID mismatch" end
+    if read_u16(data, 1) ~= QUERY_ID then return nil, "response ID mismatch" end
 
     -- Check RCODE (lower 4 bits of byte 4)
     local rcode = string.byte(data, 4) % 16
     if rcode ~= 0 then
-        local msgs = { [1]="format error", [2]="server failure", [3]="name not found", [5]="refused" }
-        return nil, msgs[rcode] or ("DNS error " .. rcode)
+        return nil, RCODE_MSGS[rcode] or ("DNS error " .. rcode)
     end
 
-    local qdcount = string.byte(data, 5) * 256 + string.byte(data, 6)
-    local ancount = string.byte(data, 7) * 256 + string.byte(data, 8)
+    local qdcount = read_u16(data, 5)
+    local ancount = read_u16(data, 7)
 
     -- Skip header (12 bytes) + question section
     local pos = 13
@@ -86,15 +94,14 @@ local function parse_response(data)
         pos = skip_name(data, pos)
 
         if pos + 10 > #data then break end
-        local rtype = string.byte(data, pos) * 256 + string.byte(data, pos + 1)
-        local rdlen = string.byte(data, pos + 8) * 256 + string.byte(data, pos + 9)
+        local rtype = read_u16(data, pos)
+        local rdlen = read_u16(data, pos + 8)
         pos = pos + 10
 
         if rtype == 1 and rdlen == 4 and pos + 3 <= #data then
-            records[#records + 1] = string.byte(data, pos)     .. "."
-                                 .. string.byte(data, pos + 1) .. "."
-                                 .. string.byte(data, pos + 2) .. "."
-                                 .. string.byte(data, pos + 3)
+            records[#records + 1] = string.format("%d.%d.%d.%d",
+                string.byte(data, pos), string.byte(data, pos + 1),
+                string.byte(data, pos + 2), string.byte(data, pos + 3))
         end
         pos = pos + rdlen
     end
@@ -122,8 +129,8 @@ function M.lookup(domain)
     end
 
     -- Send DNS query
-    local _, serr = __keyway_io_send(fd, query)
-    if not _ then
+    local sent, serr = __keyway_io_send(fd, query)
+    if not sent then
         __keyway_io_close(fd)
         return nil, "send failed: " .. (serr or "unknown")
     end

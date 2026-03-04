@@ -35,21 +35,30 @@ function tcp_mt:receive(pattern)
     pattern = pattern or "*l"
 
     if pattern == "*l" then
-        local buf = self.read_buf
-        local pos = buf:find("\n")
+        local parts = { self.read_buf }
+        local total = #self.read_buf
+        local pos = self.read_buf:find("\n")
         while not pos do
             local chunk, err = __keyway_io_recv(self.fd, 4096)
             if not chunk then return nil, err or "recv failed" end
             if #chunk == 0 then return nil, "closed" end
-            buf = buf .. chunk
-            pos = buf:find("\n")
+            parts[#parts + 1] = chunk
+            total = total + #chunk
+            -- Check for newline in the new chunk
+            local buf_so_far = table.concat(parts)
+            pos = buf_so_far:find("\n")
+            if pos then
+                parts = { buf_so_far }
+            end
         end
+        local buf = type(parts[1]) == "string" and #parts == 1 and parts[1] or table.concat(parts)
         local line = buf:sub(1, pos - 1)
         self.read_buf = buf:sub(pos + 1)
         if line:sub(-1) == "\r" then line = line:sub(1, -2) end
         return line
 
     elseif pattern == "*a" then
+        -- Reads one chunk only (not full stream) — caller must loop for complete reads
         if #self.read_buf > 0 then
             local data = self.read_buf
             self.read_buf = ""
@@ -83,9 +92,6 @@ function tcp_mt:close()
     if not self.fd then return nil, "not connected" end
     local ok, err = __keyway_io_close(self.fd)
     self.fd = nil
-    self.reuse_count = 0
-    self.read_buf = ""
-    self.pool_name = nil
     return ok, err
 end
 
@@ -110,6 +116,7 @@ function tcp_mt:getreusedtimes()
     return self.reuse_count
 end
 
+-- No-op stub: timeouts are managed at the Zig io_uring level
 function tcp_mt:settimeout(ms)
     self._timeout = ms
 end

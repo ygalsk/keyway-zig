@@ -2,13 +2,17 @@
 -- Loaded independently by each worker thread at startup.
 
 -- Module imports (top of file, before any route registration)
-local styles        = require("keyway.styles")
 local template      = require("keyway.template")
 local form          = require("keyway.form")
 local redis_client  = require("keyway.redis")
 local http_client   = require("keyway.http_client")
 local hooks         = require("keyway.hooks")
 local dns           = require("keyway.dns")
+
+-- Load static CSS once at startup (each worker independently)
+local css_file = assert(io.open("scripts/static/style.css", "r"))
+local css_content = css_file:read("*a")
+css_file:close()
 
 -- Load templates once at startup (each worker independently)
 template.load("layout")
@@ -26,6 +30,13 @@ local function render_page(page_name, vars)
     vars.page = page_name
     vars.content = template.render(page_name, vars)
     return template.render("layout", vars)
+end
+
+-- Helper: set ctx for an HTML page response
+local function html_response(ctx, page, vars)
+    ctx.status = 200
+    ctx.headers["Content-Type"] = "text/html; charset=utf-8"
+    ctx.body = render_page(page, vars)
 end
 
 -- Helper: fetch all keys from Redis, returns sorted table or nil + error
@@ -56,38 +67,33 @@ keyway.routes = {
             ctx.status = 200
             ctx.headers["Content-Type"] = "text/css; charset=utf-8"
             ctx.headers["Cache-Control"] = "public, max-age=86400"
-            ctx.body = styles.css
+            ctx.body = css_content
         end,
     },
 
     ["/"] = {
         GET = function(ctx)
-            ctx.status = 200
-            ctx.headers["Content-Type"] = "text/html; charset=utf-8"
-            ctx.body = render_page("home", {})
+            html_response(ctx, "home", {})
         end,
     },
-
 
     ["/kv"] = {
         GET = function(ctx)
             local keys, err = redis_keys()
-            ctx.status = 200
-            ctx.headers["Content-Type"] = "text/html; charset=utf-8"
-            ctx.body = render_page("kv", {
+            html_response(ctx, "kv", {
                 keys = keys,
                 error_msg = err,
             })
         end,
 
         POST = function(ctx)
-            local fields = form.parse(ctx.body or "")
+            local fields = form.parse(ctx.body)
             local action = fields.action or ""
             local key    = fields.key or ""
             local value  = fields.value or ""
 
-            local result = nil
-            local err_msg = nil
+            local result
+            local err_msg
 
             if key == "" then
                 err_msg = "Key cannot be empty"
@@ -126,41 +132,33 @@ keyway.routes = {
                 err_msg = keys_err
             end
 
-            ctx.status = 200
-            ctx.headers["Content-Type"] = "text/html; charset=utf-8"
-            ctx.body = render_page("kv", {
+            html_response(ctx, "kv", {
                 keys = keys,
                 result = result,
                 error_msg = err_msg,
-                success_msg = (result and not err_msg) and "Operation completed" or nil,
+                success_msg = (result and not err_msg) and "Operation completed",
             })
         end,
     },
 
     ["/probe"] = {
         GET = function(ctx)
-            ctx.status = 200
-            ctx.headers["Content-Type"] = "text/html; charset=utf-8"
-            ctx.body = render_page("probe", {})
+            html_response(ctx, "probe", {})
         end,
 
         POST = function(ctx)
-            local fields = form.parse(ctx.body or "")
+            local fields = form.parse(ctx.body)
             local url    = fields.url or ""
 
             if url == "" then
-                ctx.status = 200
-                ctx.headers["Content-Type"] = "text/html; charset=utf-8"
-                ctx.body = render_page("probe", { error_msg = "URL is required" })
+                html_response(ctx, "probe", { error_msg = "URL is required" })
                 return
             end
 
             local result, err = http_client.probe(url)
 
             if not result then
-                ctx.status = 200
-                ctx.headers["Content-Type"] = "text/html; charset=utf-8"
-                ctx.body = render_page("probe", { url = url, error_msg = err })
+                html_response(ctx, "probe", { url = url, error_msg = err })
                 return
             end
 
@@ -170,9 +168,7 @@ keyway.routes = {
                                or (s >= 300 and s < 400) and "3xx"
                                or "4xx5xx"
 
-            ctx.status = 200
-            ctx.headers["Content-Type"] = "text/html; charset=utf-8"
-            ctx.body = render_page("probe", { url = url, result = result })
+            html_response(ctx, "probe", { url = url, result = result })
         end,
     },
 
@@ -208,9 +204,7 @@ keyway.routes = {
 
     ["/hooks"] = {
         GET = function(ctx)
-            ctx.status = 200
-            ctx.headers["Content-Type"] = "text/html; charset=utf-8"
-            ctx.body = render_page("hooks", {})
+            html_response(ctx, "hooks", {})
         end,
 
         POST = function(ctx)
@@ -222,11 +216,9 @@ keyway.routes = {
                 redis_client.keepalive(client)
                 created = true
             end
-            ctx.status = 200
-            ctx.headers["Content-Type"] = "text/html; charset=utf-8"
-            ctx.body = render_page("hooks", {
-                new_id    = created and id or nil,
-                error_msg = not created and ("Redis error: " .. (err or "unknown")) or nil,
+            html_response(ctx, "hooks", {
+                new_id    = created and id,
+                error_msg = not created and ("Redis error: " .. (err or "unknown")),
             })
         end,
     },
@@ -236,9 +228,7 @@ keyway.routes = {
             local id = ctx.params.id or ""
             local client, err = redis_client.connect()
             if not client then
-                ctx.status = 200
-                ctx.headers["Content-Type"] = "text/html; charset=utf-8"
-                ctx.body = render_page("hook_detail", {
+                html_response(ctx, "hook_detail", {
                     hook_id   = id,
                     requests  = {},
                     error_msg = "Redis error: " .. (err or "unknown"),
@@ -253,43 +243,35 @@ keyway.routes = {
                 r.timestamp_str = os.date("!%Y-%m-%dT%H:%M:%SZ", r.timestamp)
             end
 
-            ctx.status = 200
-            ctx.headers["Content-Type"] = "text/html; charset=utf-8"
-            ctx.body = render_page("hook_detail", {
+            html_response(ctx, "hook_detail", {
                 hook_id   = id,
                 requests  = requests,
-                error_msg = not exists and "Webhook not found" or nil,
+                error_msg = not exists and "Webhook not found",
             })
         end,
     },
 
     ["/dns"] = {
         GET = function(ctx)
-            ctx.status = 200
-            ctx.headers["Content-Type"] = "text/html; charset=utf-8"
-            ctx.body = render_page("dns", {})
+            html_response(ctx, "dns", {})
         end,
 
         POST = function(ctx)
-            local fields = form.parse(ctx.body or "")
+            local fields = form.parse(ctx.body)
             local domain = fields.domain or ""
             domain = domain:match("^%s*(.-)%s*$")
 
             if domain == "" then
-                ctx.status = 200
-                ctx.headers["Content-Type"] = "text/html; charset=utf-8"
-                ctx.body = render_page("dns", { error_msg = "Domain is required" })
+                html_response(ctx, "dns", { error_msg = "Domain is required" })
                 return
             end
 
             local records, err = dns.lookup(domain)
 
-            ctx.status = 200
-            ctx.headers["Content-Type"] = "text/html; charset=utf-8"
             if records then
-                ctx.body = render_page("dns", { domain = domain, records = records })
+                html_response(ctx, "dns", { domain = domain, records = records })
             else
-                ctx.body = render_page("dns", { domain = domain, error_msg = err })
+                html_response(ctx, "dns", { domain = domain, error_msg = err })
             end
         end,
     },
