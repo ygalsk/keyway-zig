@@ -1,0 +1,35 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title><%= title or "Keyway" %></title>
+  <link rel="stylesheet" href="/style.css">
+</head>
+<body>
+  <nav>
+    <a href="/" class="brand<% if page == 'home' then %> active<% end %>">Keyway</a>
+    <!-- Tool links added in later phases -->
+  </nav>
+
+  <% if error_msg then %>
+  <div class="container">
+    <div class="banner-error"><%= error_msg %></div>
+  </div>
+  <% end %>
+
+  <% if success_msg then %>
+  <div class="container">
+    <div class="banner-success"><%= success_msg %></div>
+  </div>
+  <% end %>
+
+  <main class="container">
+    <%- content %>
+  </main>
+
+  <footer class="worker-badge">
+    Worker <%= worker_id %>
+  </footer>
+</body>
+</html>

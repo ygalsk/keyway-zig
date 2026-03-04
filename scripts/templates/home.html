@@ -1,0 +1,20 @@
+<h1>Keyway</h1>
+<p>A highly opinionated engine with no opinions</p>
+<p>HTTP engine powered by Zig, controlled by Lua.</p>
+
+<h2>Test Form</h2>
+<form method="POST" action="/echo">
+  <label for="message">Message:</label>
+  <input type="text" id="message" name="message" placeholder="Try &lt;script&gt;alert(1)&lt;/script&gt;">
+  <button type="submit" class="btn-primary">Submit</button>
+</form>
+
+<% if echo_fields then %>
+<h2>Parsed Fields</h2>
+<table>
+  <tr><th>Field</th><th>Value</th></tr>
+  <% for k, v in pairs(echo_fields) do %>
+  <tr><td><%= k %></td><td><%= v %></td></tr>
+  <% end %>
+</table>
+<% end %>
