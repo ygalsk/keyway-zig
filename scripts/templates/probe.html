@@ -1,0 +1,41 @@
+<h1>HTTP Probe</h1>
+<p>Inspect HTTP response headers from any public URL</p>
+
+<div class="card" style="margin-bottom: var(--space-4);">
+  <h2 style="margin-bottom: var(--space-3); font-size: var(--text-base);">Probe a URL</h2>
+  <form method="POST" action="/probe">
+    <div class="form-group">
+      <label for="url">URL:</label>
+      <input type="text" id="url" name="url" placeholder="http://example.com"
+             value="<%= url or '' %>" required>
+    </div>
+    <button type="submit" class="btn-primary">Probe</button>
+  </form>
+</div>
+
+<% if result then %>
+<div class="card">
+  <div style="display: flex; align-items: baseline; gap: var(--space-3); margin-bottom: var(--space-3);">
+    <code style="font-size: var(--text-2xl); font-family: var(--font-code);<% if result.status_class == '2xx' then %> color: var(--kiwi-green);<% elseif result.status_class == '3xx' then %> color: var(--kiwi-lime);<% else %> color: var(--error);<% end %>"><%= result.status %> <%= result.status_text %></code>
+    <span style="font-size: var(--text-sm); color: var(--kiwi-seed-light);">Round-trip: <%= result.timing_ms %> ms</span>
+  </div>
+
+  <h2 style="margin-bottom: var(--space-2); font-size: var(--text-base);">Response Headers</h2>
+  <% if result.headers and #result.headers > 0 then %>
+  <table style="width: 100%; border-collapse: collapse;">
+    <tr>
+      <th style="text-align: left; padding: var(--space-1) var(--space-2); border-bottom: 2px solid var(--kiwi-green); font-size: var(--text-sm); color: var(--kiwi-seed-light); width: 35%;">Header</th>
+      <th style="text-align: left; padding: var(--space-1) var(--space-2); border-bottom: 2px solid var(--kiwi-green); font-size: var(--text-sm); color: var(--kiwi-seed-light);">Value</th>
+    </tr>
+    <% for _, h in ipairs(result.headers) do %>
+    <tr>
+      <td style="padding: var(--space-1) var(--space-2); border-bottom: 1px solid var(--kiwi-border); font-family: var(--font-code); font-size: var(--text-sm);"><%= h[1] %></td>
+      <td style="padding: var(--space-1) var(--space-2); border-bottom: 1px solid var(--kiwi-border); font-family: var(--font-code); font-size: var(--text-sm);"><%= h[2] %></td>
+    </tr>
+    <% end %>
+  </table>
+  <% else %>
+  <p style="color: var(--kiwi-seed-light); font-size: var(--text-sm);">No response headers received</p>
+  <% end %>
+</div>
+<% end %>
