@@ -103,6 +103,9 @@ pub const Worker = struct {
         // Register cosocket API (needs stable *LuaState pointer)
         lua_state.registerCosocketApi();
 
+        // Expose per-worker globals to Lua (must be before loadScript)
+        lua_state.setWorkerGlobals(ctx.worker_id);
+
         // Load Lua handlers and process declarative route table
         try lua_state.loadScript("scripts/handlers.lua");
         try lua_state.processRouteTable(&router);

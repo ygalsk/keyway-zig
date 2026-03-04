@@ -240,6 +240,15 @@ pub const LuaState = struct {
         }
     }
 
+    /// Set per-worker Lua globals (called once after init, before loadScript).
+    /// Exposes keyway.worker_id so handlers can include it in page output.
+    pub fn setWorkerGlobals(self: *LuaState, worker_id: usize) void {
+        _ = self.lua.getGlobal("keyway");          // push keyway table
+        self.lua.pushInteger(@intCast(worker_id)); // push value
+        self.lua.setField(-2, "worker_id");        // keyway.worker_id = N
+        self.lua.pop(1);                           // pop keyway table
+    }
+
     /// Register cosocket C functions as Lua globals with *LuaState as upvalue.
     /// Must be called after init (needs stable *LuaState pointer).
     pub fn registerCosocketApi(self: *LuaState) void {
