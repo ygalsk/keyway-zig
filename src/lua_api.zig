@@ -1,5 +1,6 @@
 const std = @import("std");
 const Lua = @import("luajit").Lua;
+const http = @import("http.zig");
 const HttpExchange = @import("http_exchange.zig").HttpExchange;
 const Router = @import("router.zig").Router;
 const handler = @import("handler.zig");
@@ -42,6 +43,8 @@ fn luaExchangeIndex(lua: *Lua) callconv(.c) c_int {
         pushQueryTable(lua, ex.query);
     } else if (std.mem.eql(u8, key_str, "headers")) {
         pushHeadersProxy(lua, ex);
+    } else if (std.mem.eql(u8, key_str, "request_headers")) {
+        pushRequestHeadersTable(lua, ex.headers);
     } else {
         lua.pushNil();
     }
@@ -102,6 +105,22 @@ fn pushQueryTable(lua: *Lua, query: *const handler.QueryArray) void {
         lua.pushLString(p.key);
         lua.pushLString(p.value);
         lua.setTable(-3);
+    }
+}
+
+// === Request Headers Table (read-only array) ===
+
+/// Push all request headers as a Lua array of {name, value} pairs.
+/// Returns: { {"Content-Type", "application/json"}, {"Host", "localhost"}, ... }
+fn pushRequestHeadersTable(lua: *Lua, headers: []const http.Header) void {
+    lua.createTable(@intCast(headers.len), 0);
+    for (headers, 0..) |h, i| {
+        lua.createTable(2, 0);
+        lua.pushLString(h.name);
+        lua.setTableIndexRaw(-2, 1);
+        lua.pushLString(h.value);
+        lua.setTableIndexRaw(-2, 2);
+        lua.setTableIndexRaw(-2, @intCast(i + 1));
     }
 }
 

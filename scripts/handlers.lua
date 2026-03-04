@@ -7,12 +7,17 @@ local template      = require("keyway.template")
 local form          = require("keyway.form")
 local redis_client  = require("keyway.redis")
 local http_client   = require("keyway.http_client")
+local hooks         = require("keyway.hooks")
+local dns           = require("keyway.dns")
 
 -- Load templates once at startup (each worker independently)
 template.load("layout")
 template.load("home")
 template.load("kv")
 template.load("probe")
+template.load("hooks")
+template.load("hook_detail")
+template.load("dns")
 
 -- Helper: render a full page through the layout
 local function render_page(page_name, vars)
@@ -63,17 +68,6 @@ keyway.routes = {
         end,
     },
 
-    ["/echo"] = {
-        POST = function(ctx)
-            local fields = form.parse(ctx.body or "")
-            ctx.status = 200
-            ctx.headers["Content-Type"] = "text/html; charset=utf-8"
-            ctx.body = render_page("home", {
-                echo_fields = fields,
-                success_msg = "Form parsed successfully",
-            })
-        end,
-    },
 
     ["/kv"] = {
         GET = function(ctx)
@@ -179,6 +173,124 @@ keyway.routes = {
             ctx.status = 200
             ctx.headers["Content-Type"] = "text/html; charset=utf-8"
             ctx.body = render_page("probe", { url = url, result = result })
+        end,
+    },
+
+    -- Webhook catch endpoint — accepts any HTTP method, stores request in Redis
+    ["/h/{id}"] = (function()
+        local function capture(ctx)
+            local id   = ctx.params.id or ""
+            local data = {
+                method    = ctx.method or "",
+                path      = ctx.path or "",
+                headers   = ctx.request_headers,
+                body      = ctx.body or "",
+                timestamp = os.time(),
+            }
+            local client = redis_client.connect()
+            if client then
+                hooks.capture(client, id, data)
+                redis_client.keepalive(client)
+            end
+            ctx.status = 200
+            ctx.headers["Content-Type"] = "text/plain; charset=utf-8"
+            ctx.body = "OK"
+        end
+        return {
+            GET    = capture,
+            POST   = capture,
+            PUT    = capture,
+            DELETE = capture,
+            PATCH  = capture,
+            HEAD   = capture,
+        }
+    end)(),
+
+    ["/hooks"] = {
+        GET = function(ctx)
+            ctx.status = 200
+            ctx.headers["Content-Type"] = "text/html; charset=utf-8"
+            ctx.body = render_page("hooks", {})
+        end,
+
+        POST = function(ctx)
+            local id = hooks.generate_id()
+            local client, err = redis_client.connect()
+            local created = false
+            if client then
+                hooks.create(client, id)
+                redis_client.keepalive(client)
+                created = true
+            end
+            ctx.status = 200
+            ctx.headers["Content-Type"] = "text/html; charset=utf-8"
+            ctx.body = render_page("hooks", {
+                new_id    = created and id or nil,
+                error_msg = not created and ("Redis error: " .. (err or "unknown")) or nil,
+            })
+        end,
+    },
+
+    ["/hooks/{id}"] = {
+        GET = function(ctx)
+            local id = ctx.params.id or ""
+            local client, err = redis_client.connect()
+            if not client then
+                ctx.status = 200
+                ctx.headers["Content-Type"] = "text/html; charset=utf-8"
+                ctx.body = render_page("hook_detail", {
+                    hook_id   = id,
+                    requests  = {},
+                    error_msg = "Redis error: " .. (err or "unknown"),
+                })
+                return
+            end
+            local exists   = hooks.exists(client, id)
+            local requests = hooks.list_requests(client, id)
+            redis_client.keepalive(client)
+
+            for _, r in ipairs(requests) do
+                r.timestamp_str = os.date("!%Y-%m-%dT%H:%M:%SZ", r.timestamp)
+            end
+
+            ctx.status = 200
+            ctx.headers["Content-Type"] = "text/html; charset=utf-8"
+            ctx.body = render_page("hook_detail", {
+                hook_id   = id,
+                requests  = requests,
+                error_msg = not exists and "Webhook not found" or nil,
+            })
+        end,
+    },
+
+    ["/dns"] = {
+        GET = function(ctx)
+            ctx.status = 200
+            ctx.headers["Content-Type"] = "text/html; charset=utf-8"
+            ctx.body = render_page("dns", {})
+        end,
+
+        POST = function(ctx)
+            local fields = form.parse(ctx.body or "")
+            local domain = fields.domain or ""
+            domain = domain:match("^%s*(.-)%s*$")
+
+            if domain == "" then
+                ctx.status = 200
+                ctx.headers["Content-Type"] = "text/html; charset=utf-8"
+                ctx.body = render_page("dns", { error_msg = "Domain is required" })
+                return
+            end
+
+            local records, err = dns.lookup(domain)
+
+            ctx.status = 200
+            ctx.headers["Content-Type"] = "text/html; charset=utf-8"
+            if records then
+                ctx.body = render_page("dns", { domain = domain, records = records })
+            else
+                ctx.body = render_page("dns", { domain = domain, error_msg = err })
+            end
         end,
     },
 }

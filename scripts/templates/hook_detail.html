@@ -1,0 +1,51 @@
+<h1>Webhook: <code style="font-size: var(--text-xl); font-family: var(--font-code);"><%= hook_id %></code></h1>
+
+<div style="margin-bottom: var(--space-4);">
+  <p style="font-size: var(--text-sm); color: var(--kiwi-seed-light); margin-bottom: var(--space-1);">Catch URL:</p>
+  <code style="display: block; padding: var(--space-2) var(--space-3); background: var(--kiwi-dark); border: 1px solid var(--kiwi-border); border-radius: 4px; font-family: var(--font-code); font-size: var(--text-sm); word-break: break-all;">http://localhost:8080/h/<%= hook_id %></code>
+</div>
+
+<% if error_msg then %>
+<div class="banner-error" style="margin-bottom: var(--space-4);"><%= error_msg %></div>
+<% end %>
+
+<% if requests and #requests > 0 then %>
+<p style="font-size: var(--text-sm); color: var(--kiwi-seed-light); margin-bottom: var(--space-3);"><%= #requests %> request<%= #requests ~= 1 and "s" or "" %> captured</p>
+<% for _, req in ipairs(requests) do %>
+<div class="card" style="margin-bottom: var(--space-3);">
+  <div style="display: flex; align-items: baseline; gap: var(--space-3); margin-bottom: var(--space-3); flex-wrap: wrap;">
+    <code style="font-family: var(--font-code); font-size: var(--text-sm); font-weight: bold;<% if req.method == "GET" then %> color: var(--kiwi-green);<% elseif req.method == "POST" then %> color: var(--kiwi-lime);<% elseif req.method == "DELETE" then %> color: var(--error);<% else %> color: var(--kiwi-seed-light);<% end %>"><%= req.method %></code>
+    <code style="font-family: var(--font-code); font-size: var(--text-sm);"><%= req.path %></code>
+    <span style="font-size: var(--text-sm); color: var(--kiwi-seed-light); margin-left: auto;"><%= req.timestamp_str or "" %></span>
+  </div>
+
+  <% if req.headers and #req.headers > 0 then %>
+  <h3 style="font-size: var(--text-sm); color: var(--kiwi-seed-light); margin-bottom: var(--space-2);">Headers</h3>
+  <table style="width: 100%; border-collapse: collapse; margin-bottom: var(--space-3);">
+    <tr>
+      <th style="text-align: left; padding: var(--space-1) var(--space-2); border-bottom: 2px solid var(--kiwi-green); font-size: var(--text-sm); color: var(--kiwi-seed-light); width: 35%;">Name</th>
+      <th style="text-align: left; padding: var(--space-1) var(--space-2); border-bottom: 2px solid var(--kiwi-green); font-size: var(--text-sm); color: var(--kiwi-seed-light);">Value</th>
+    </tr>
+    <% for _, h in ipairs(req.headers) do %>
+    <tr>
+      <td style="padding: var(--space-1) var(--space-2); border-bottom: 1px solid var(--kiwi-border); font-family: var(--font-code); font-size: var(--text-sm);"><%= h[1] %></td>
+      <td style="padding: var(--space-1) var(--space-2); border-bottom: 1px solid var(--kiwi-border); font-family: var(--font-code); font-size: var(--text-sm);"><%= h[2] %></td>
+    </tr>
+    <% end %>
+  </table>
+  <% end %>
+
+  <h3 style="font-size: var(--text-sm); color: var(--kiwi-seed-light); margin-bottom: var(--space-2);">Body</h3>
+  <% if req.body and req.body ~= "" then %>
+  <% local display_body = #req.body > 500 and (req.body:sub(1, 500) .. "\n... (truncated)") or req.body %>
+  <pre style="margin: 0; padding: var(--space-2) var(--space-3); background: var(--kiwi-dark); border: 1px solid var(--kiwi-border); border-radius: 4px; font-family: var(--font-code); font-size: var(--text-sm); overflow-x: auto; white-space: pre-wrap; word-break: break-all;"><code><%= display_body %></code></pre>
+  <% else %>
+  <p style="font-size: var(--text-sm); color: var(--kiwi-seed-light); font-style: italic;">(no body)</p>
+  <% end %>
+</div>
+<% end %>
+<% else %>
+<div class="card">
+  <p style="color: var(--kiwi-seed-light); font-size: var(--text-sm);">No requests captured yet. Send an HTTP request to the catch URL above.</p>
+</div>
+<% end %>

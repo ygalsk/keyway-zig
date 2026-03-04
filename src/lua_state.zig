@@ -264,6 +264,7 @@ pub const LuaState = struct {
             .{ "__keyway_io_close", io_request.keyway_io_close },
             .{ "__keyway_pool_connect", io_request.keyway_pool_connect },
             .{ "__keyway_pool_setkeepalive", io_request.keyway_pool_setkeepalive },
+            .{ "__keyway_io_udp_connect", io_request.keyway_io_udp_connect },
         };
 
         inline for (funcs) |entry| {

@@ -386,6 +386,47 @@ pub const Connection = struct {
                 };
                 self.loop.add(&s.completion);
             },
+            .udp_connect => {
+                s.pending_op = .udp_connect;
+                const sock = std.posix.socket(
+                    std.posix.AF.INET,
+                    std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC,
+                    0,
+                ) catch {
+                    self.resumeWithError("udp_connect: socket creation failed");
+                    return;
+                };
+                // Set receive timeout once on the socket
+                if (pending.timeout_ms > 0) {
+                    const tv = std.posix.timeval{
+                        .sec = @intCast(pending.timeout_ms / 1000),
+                        .usec = @intCast((pending.timeout_ms % 1000) * 1000),
+                    };
+                    _ = std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+                }
+
+                s.outbound_fd = sock;
+
+                const host = pending.host orelse {
+                    std.posix.close(sock);
+                    s.outbound_fd = 0;
+                    self.resumeWithError("udp_connect: missing host");
+                    return;
+                };
+                const addr = std.net.Address.parseIp4(host, pending.port) catch {
+                    std.posix.close(sock);
+                    s.outbound_fd = 0;
+                    self.resumeWithError("udp_connect: invalid address");
+                    return;
+                };
+
+                s.completion = .{
+                    .op = .{ .connect = .{ .socket = sock, .addr = addr } },
+                    .userdata = self,
+                    .callback = onOutboundComplete,
+                };
+                self.loop.add(&s.completion);
+            },
             .send => {
                 const data = pending.send_data orelse {
                     self.resumeWithError("send: missing data");
@@ -404,6 +445,7 @@ pub const Connection = struct {
                     return;
                 };
                 s.recv_buf = buf;
+
                 s.completion = .{
                     .op = .{ .recv = .{ .fd = pending.fd, .buffer = .{ .slice = buf } } },
                     .userdata = self,
@@ -460,6 +502,7 @@ pub const Connection = struct {
                 thread.pushInteger(0);
                 nresults = 2;
             } else {
+                // connect and udp_connect both return fd only
                 thread.pushInteger(@intCast(s.outbound_fd));
             }
             s.outbound_fd = 0; // ownership transferred to Lua; completeHandler must not close it

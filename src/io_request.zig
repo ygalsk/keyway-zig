@@ -15,8 +15,9 @@ pub const IoRequest = struct {
     max_len: usize = 0,
 
     pool_name: ?[]const u8 = null,
+    timeout_ms: u32 = 0,
 
-    pub const Op = enum { connect, send, recv, close, pool_connect, none };
+    pub const Op = enum { connect, send, recv, close, pool_connect, udp_connect, none };
 };
 
 /// Helper: extract *LuaState from closure upvalue(1)
@@ -163,4 +164,29 @@ pub fn keyway_pool_setkeepalive(lua: *Lua) callconv(.c) c_int {
 
     lua.pushInteger(1);
     return 1;
+}
+
+/// __keyway_io_udp_connect(host, port, timeout_ms) → yields, resumes with fd or nil,err
+/// Creates a SOCK_DGRAM socket and connects it to the given address.
+/// After this, __keyway_io_send and __keyway_io_recv work normally.
+/// timeout_ms is stored in SuspendedState and applied to subsequent recv operations.
+pub fn keyway_io_udp_connect(lua: *Lua) callconv(.c) c_int {
+    const state = getState(lua);
+
+    const host_cstr = lua.toString(1) catch {
+        lua.pushString("udp_connect: host must be a string");
+        lua.raiseError();
+        return 0;
+    };
+    const port_raw = lua.toInteger(2);
+    const timeout_raw = lua.toInteger(3);
+
+    state.pending_io = .{
+        .op = .udp_connect,
+        .host = std.mem.span(host_cstr),
+        .port = @intCast(port_raw),
+        .timeout_ms = @intCast(timeout_raw),
+    };
+
+    return lua_yield(@ptrCast(lua), 0);
 }

@@ -15,6 +15,8 @@
     <a href="/" class="brand<% if page == 'home' then %> active<% end %>">Keyway</a>
     <a href="/kv" <% if page=='kv' then %> class="active"<% end %>>KV Store</a>
     <a href="/probe"<% if page == 'probe' then %> class="active"<% end %>>Probe</a>
+    <a href="/hooks"<% if page == 'hooks' or page == 'hook_detail' then %> class="active"<% end %>>Hooks</a>
+    <a href="/dns"<% if page == 'dns' then %> class="active"<% end %>>DNS</a>
   </nav>
 
   <% if error_msg then %>
