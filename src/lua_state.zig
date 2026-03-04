@@ -64,14 +64,28 @@ pub const LuaState = struct {
         // Add scripts/?.lua, scripts/?/init.lua, and LuaRocks paths to package.path
         // so require("keyway.socket") resolves to scripts/keyway/socket.lua
         // and require("pgmoon") finds ~/.luarocks/share/lua/5.1/pgmoon/init.lua
+        // KEYWAY_LUA_PATH / KEYWAY_LUA_CPATH override defaults if set.
         lua.doString(
-            \\local home = os.getenv("HOME") or ""
-            \\package.path = "scripts/?.lua;scripts/?/init.lua;"
-            \\    .. home .. "/.luarocks/share/lua/5.1/?.lua;"
-            \\    .. home .. "/.luarocks/share/lua/5.1/?/init.lua;"
-            \\    .. package.path
-            \\package.cpath = home .. "/.luarocks/lib/lua/5.1/?.so;"
-            \\    .. package.cpath
+            \\local custom_path = os.getenv("KEYWAY_LUA_PATH")
+            \\local custom_cpath = os.getenv("KEYWAY_LUA_CPATH")
+            \\if custom_path then
+            \\    package.path = custom_path .. ";" .. package.path
+            \\else
+            \\    local home = os.getenv("HOME") or ""
+            \\    package.path = "scripts/?.lua;scripts/?/init.lua;"
+            \\        .. home .. "/.luarocks/share/lua/5.1/?.lua;"
+            \\        .. home .. "/.luarocks/share/lua/5.1/?/init.lua;"
+            \\        .. package.path
+            \\end
+            \\if custom_cpath then
+            \\    package.cpath = custom_cpath .. ";" .. package.cpath
+            \\else
+            \\    local home = os.getenv("HOME") or ""
+            \\    package.cpath = home .. "/.luarocks/lib/lua/5.1/?.so;"
+            \\        .. "/usr/lib/lua/5.1/?.so;"
+            \\        .. "/usr/local/lib/lua/5.1/?.so;"
+            \\        .. package.cpath
+            \\end
         ) catch {};
 
         return LuaState{
@@ -162,10 +176,7 @@ pub const LuaState = struct {
         switch (status) {
             0 => {
                 // LUA_OK — handler completed normally
-                // Arena-dupe response body (Lua string on coroutine stack, about to be reset)
-                if (exchange.response_body.len > 0) {
-                    exchange.response_body = try exchange.allocator.dupe(u8, exchange.response_body);
-                }
+                // Response body already arena-duped on ctx.body assignment (lua_api.zig newindex)
 
                 // If we used a fresh thread (cached was pinned), pop it and let GC collect
                 if (self.cached_thread_ref == 0) self.lua.pop(1);
@@ -203,7 +214,7 @@ pub const LuaState = struct {
         self: *LuaState,
         thread: *anyopaque,
         nresults: c_int,
-        exchange: *HttpExchange,
+        _: *HttpExchange,
     ) !HandlerResult {
         _ = self;
         const status = lua_resume(thread, nresults);
@@ -211,10 +222,7 @@ pub const LuaState = struct {
         switch (status) {
             0 => {
                 // LUA_OK — handler completed
-                // Arena-dupe response body (Lua string on coroutine stack)
-                if (exchange.response_body.len > 0) {
-                    exchange.response_body = try exchange.allocator.dupe(u8, exchange.response_body);
-                }
+                // Response body already arena-duped on ctx.body assignment (lua_api.zig newindex)
                 return .completed;
             },
             1 => {
@@ -331,6 +339,7 @@ test "coroutine dispatch - non-yielding handler" {
 
     // Look up the route to get the lua_ref
     var params = handler.ParamArray{};
+    var query = handler.QueryArray{};
     const lua_ref = router.match("GET", "/test", &params);
     try std.testing.expect(lua_ref != null);
 
@@ -343,6 +352,7 @@ test "coroutine dispatch - non-yielding handler" {
         .path = "/test",
         .headers = &[_]http.Header{},
         .params = &params,
+        .query = &query,
         .body = "",
         .status = 200,
         .response_headers = response_headers,
@@ -421,6 +431,7 @@ test "middleware execution order" {
     try state.processRouteTable(&router);
 
     var params = handler_mod.ParamArray{};
+    var query = handler_mod.QueryArray{};
     const lua_ref = router.match("GET", "/test", &params);
     try std.testing.expect(lua_ref != null);
 
@@ -432,6 +443,7 @@ test "middleware execution order" {
         .path = "/test",
         .headers = &[_]http.Header{},
         .params = &params,
+        .query = &query,
         .body = "",
         .status = 200,
         .response_headers = response_headers,
@@ -477,6 +489,7 @@ test "middleware short-circuit" {
     try state.processRouteTable(&router);
 
     var params = handler_mod.ParamArray{};
+    var query = handler_mod.QueryArray{};
     const lua_ref = router.match("GET", "/secret", &params);
     try std.testing.expect(lua_ref != null);
 
@@ -488,6 +501,7 @@ test "middleware short-circuit" {
         .path = "/secret",
         .headers = &[_]http.Header{},
         .params = &params,
+        .query = &query,
         .body = "",
         .status = 200,
         .response_headers = response_headers,

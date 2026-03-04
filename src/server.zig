@@ -23,7 +23,7 @@ pub const Server = struct {
     pub const Config = struct {
         host: []const u8 = "0.0.0.0",
         port: u16 = 8080,
-        enable_bpf_affinity: bool = false, // Enable BPF connection affinity (disabled by default due to race conditions)
+        enable_bpf_affinity: bool = false, // Enable BPF connection affinity (disabled by default)
     };
 
     /// Initialize server
@@ -65,52 +65,39 @@ pub const Server = struct {
             &std.mem.toBytes(@as(c_int, 1)),
         );
 
-        // Bind
-        try std.posix.bind(socket, &addr.any, addr.getOsSockLen());
-
-        // Synchronization: All workers must reach this point before Worker 0 attaches BPF
-        // This ensures Worker 0 calls listen() FIRST
+        // BPF affinity requires ordered startup:
+        // Worker 0 must attach BPF → bind → listen BEFORE other workers bind.
+        // The kernel requires BPF to be attached before bind() on the first socket
+        // (see kernel selftest tools/testing/selftests/net/reuseport_bpf.c).
         if (config.enable_bpf_affinity and num_workers > 1) {
-            if (bpf_ready) |ready| {
-                if (worker_id != 0) {
-                    // Other workers: Wait for Worker 0 to attach BPF
+            if (worker_id == 0) {
+                // Worker 0: attach BPF, then bind, then listen, then signal others
+                bpf_reuseport.attachAffinity(socket, num_workers) catch |err| {
+                    std.log.warn("BPF affinity unavailable: {} (connections may hit different Lua states)", .{err});
+                };
+                std.log.info("BPF connection affinity enabled for {} workers", .{num_workers});
+
+                try std.posix.bind(socket, &addr.any, addr.getOsSockLen());
+                try std.posix.listen(socket, DEFAULT_BACKLOG);
+
+                if (bpf_ready) |ready| {
+                    ready.store(true, .release);
+                }
+            } else {
+                // Non-zero workers: wait for Worker 0 to fully establish the group
+                if (bpf_ready) |ready| {
                     while (!ready.load(.acquire)) {
                         std.atomic.spinLoopHint();
                     }
                 }
-                // Worker 0 continues immediately to attach BPF
+                try std.posix.bind(socket, &addr.any, addr.getOsSockLen());
+                try std.posix.listen(socket, DEFAULT_BACKLOG);
             }
+        } else {
+            // No BPF: all workers bind+listen independently (SO_REUSEPORT handles distribution)
+            try std.posix.bind(socket, &addr.any, addr.getOsSockLen());
+            try std.posix.listen(socket, DEFAULT_BACKLOG);
         }
-
-        // Attach BPF filter for connection affinity (only first worker)
-        // BPF filter applies to all sockets in SO_REUSEPORT group
-        // CRITICAL: Must attach BPF BEFORE any worker calls listen()
-        blk: {
-            if (!config.enable_bpf_affinity or worker_id != 0 or num_workers <= 1) break :blk;
-
-            const bpf_prog = bpf_reuseport.generateBpfProgram(allocator, num_workers) catch |err| {
-                std.log.warn("BPF affinity unavailable: {} (connections may hit different Lua states)", .{err});
-                break :blk;
-            };
-            defer allocator.free(bpf_prog);
-
-            bpf_reuseport.attachToSocket(socket, bpf_prog) catch |err| {
-                std.log.warn("BPF attachment failed: {} (connections may hit different Lua states)", .{err});
-                break :blk;
-            };
-
-            std.log.info("BPF connection affinity enabled for {} workers", .{num_workers});
-        }
-
-        // Worker 0 signals completion, allowing other workers to proceed to listen()
-        if (config.enable_bpf_affinity and num_workers > 1 and worker_id == 0) {
-            if (bpf_ready) |ready| {
-                ready.store(true, .release);
-            }
-        }
-
-        // Listen
-        try std.posix.listen(socket, DEFAULT_BACKLOG);
 
         return Server{
             .allocator = allocator,

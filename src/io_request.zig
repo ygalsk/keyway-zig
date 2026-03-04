@@ -21,7 +21,7 @@ pub const IoRequest = struct {
 
 /// Helper: extract *LuaState from closure upvalue(1)
 inline fn getState(lua: *Lua) *LuaState {
-    const ptr = lua.toUserdata(Lua.PseudoIndex.upvalue(1)) orelse unreachable;
+    const ptr = lua.toUserdata(Lua.PseudoIndex.upvalue(1)) orelse @panic("cosocket: expected LuaState upvalue");
     return @as(*LuaState, @ptrCast(@alignCast(ptr)));
 }
 

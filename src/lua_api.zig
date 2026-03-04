@@ -9,7 +9,7 @@ const handler = @import("handler.zig");
 /// Helper: Get HttpExchange from pointer-in-userdata on Lua stack.
 /// Userdata contains *HttpExchange (a pointer to the arena-allocated exchange).
 fn getExchange(lua: *Lua, index: i32) *HttpExchange {
-    const ud = lua.toUserdata(index) orelse unreachable;
+    const ud = lua.toUserdata(index) orelse @panic("metatable dispatch: expected HttpExchange userdata");
     return @as(**HttpExchange, @ptrCast(@alignCast(ud))).*;
 }
 
@@ -38,6 +38,8 @@ fn luaExchangeIndex(lua: *Lua) callconv(.c) c_int {
         lua.pushInteger(@intCast(ex.status));
     } else if (std.mem.eql(u8, key_str, "params")) {
         pushParamsTable(lua, ex.params);
+    } else if (std.mem.eql(u8, key_str, "query")) {
+        pushQueryTable(lua, ex.query);
     } else if (std.mem.eql(u8, key_str, "headers")) {
         pushHeadersProxy(lua, ex);
     } else {
@@ -57,10 +59,18 @@ fn luaExchangeNewIndex(lua: *Lua) callconv(.c) c_int {
         ex.status = @intCast(status);
     } else if (std.mem.eql(u8, key_str, "body")) {
         const body = lua.toString(3) catch return 0;
-        ex.response_body = std.mem.span(body);
-        // Note: Lua string lives on the coroutine stack. Safe for the duration of
-        // lua_resume (non-yielding) or across yields (coroutine is pinned in registry).
-        // Arena-dupe happens in callLuaHandler/resumeHandler on LUA_OK.
+        const body_span = std.mem.span(body);
+        // Arena-dupe immediately — Lua string lifetime is unpredictable across yields.
+        // This eliminates the use-after-free class entirely.
+        // Free previous body if any (no-op on arena allocator, needed for test allocator)
+        if (ex.response_body.len > 0) {
+            ex.allocator.free(ex.response_body);
+        }
+        ex.response_body = ex.allocator.dupe(u8, body_span) catch {
+            lua.pushString("body assignment: arena alloc failed");
+            lua.raiseError();
+            return 0;
+        };
     }
     // Ignore writes to read-only fields (method, path, params)
     // Headers assignment handled by HeadersProxy
@@ -75,6 +85,20 @@ fn pushParamsTable(lua: *Lua, params: *const handler.ParamArray) void {
     lua.createTable(0, @intCast(params.len));
 
     for (params.items[0..params.len]) |p| {
+        lua.pushLString(p.key);
+        lua.pushLString(p.value);
+        lua.setTable(-3);
+    }
+}
+
+// === Query Table (read-only) ===
+
+/// Push query params as a fresh Lua table: {foo = "bar", page = "2"}
+/// Creates a new table per request (max 4 entries — negligible cost).
+fn pushQueryTable(lua: *Lua, query: *const handler.QueryArray) void {
+    lua.createTable(0, @intCast(query.len));
+
+    for (query.items[0..query.len]) |p| {
         lua.pushLString(p.key);
         lua.pushLString(p.value);
         lua.setTable(-3);
@@ -200,7 +224,12 @@ pub fn registerKeywayModule(lua: *Lua) void {
         \\        local mw = middleware_list[i]
         \\        local next_fn = chain
         \\        chain = function(ctx)
-        \\            mw(ctx, function() next_fn(ctx) end)
+        \\            local ok, err = pcall(mw, ctx, function() next_fn(ctx) end)
+        \\            if not ok then
+        \\                io.stderr:write("middleware error: " .. tostring(err) .. "\n")
+        \\                ctx.status = 500
+        \\                ctx.body = "Internal Server Error"
+        \\            end
         \\        end
         \\    end
         \\    return chain

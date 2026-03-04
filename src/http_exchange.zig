@@ -11,6 +11,7 @@ pub const HttpExchange = struct {
     path: []const u8,
     headers: []http.Header,
     params: *const handler.ParamArray,
+    query: *const handler.QueryArray,
     body: []const u8,
 
     // === RESPONSE (write-only from Lua) ===
@@ -27,12 +28,15 @@ pub const HttpExchange = struct {
         allocator: std.mem.Allocator,
         request: *const http.Request,
         params: *const handler.ParamArray,
+        query: *const handler.QueryArray,
+        clean_path: []const u8,
     ) !HttpExchange {
         return .{
             .method = request.method,
-            .path = request.path,
+            .path = clean_path,
             .headers = request.headers,
             .params = params,
+            .query = query,
             .body = request.body,
             .response_headers = try std.ArrayList(http.Header).initCapacity(allocator, 4),
             .allocator = allocator,

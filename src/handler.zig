@@ -11,7 +11,8 @@ const Lua = @import("luajit").Lua;
 // Buffer size constants
 const READ_BUFFER_SIZE = 8192;
 const WRITE_BUFFER_SIZE = 8192;
-const MAX_ROUTE_PARAMS = 4; // Typical routes have 1-4 params
+pub const MAX_ROUTE_PARAMS = 4; // Typical routes have 1-4 params
+const MAX_QUERY_PARAMS = 4; // Typical query strings have 1-4 params
 
 /// Lightweight param storage - replaces HashMap for route params
 /// O(n) lookup but n ≤ 4, cache-friendly, zero allocations
@@ -41,6 +42,54 @@ pub const ParamArray = struct {
         self.len = 0;
     }
 };
+
+/// Lightweight query param storage - same pattern as ParamArray
+pub const QueryArray = struct {
+    items: [MAX_QUERY_PARAMS]Entry = undefined,
+    len: usize = 0,
+
+    const Entry = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
+    pub fn put(self: *QueryArray, key: []const u8, value: []const u8) error{TooManyParams}!void {
+        if (self.len >= MAX_QUERY_PARAMS) return error.TooManyParams;
+        self.items[self.len] = .{ .key = key, .value = value };
+        self.len += 1;
+    }
+
+    pub fn get(self: *const QueryArray, key: []const u8) ?[]const u8 {
+        for (self.items[0..self.len]) |entry| {
+            if (std.mem.eql(u8, entry.key, key)) return entry.value;
+        }
+        return null;
+    }
+
+    pub fn clear(self: *QueryArray) void {
+        self.len = 0;
+    }
+};
+
+/// Parse a query string (everything after '?') into a QueryArray.
+/// Splits on '&', then each pair on '='. Values are zero-copy slices.
+fn parseQueryString(raw: []const u8, out: *QueryArray) void {
+    var pairs = std.mem.splitScalar(u8, raw, '&');
+    while (pairs.next()) |pair| {
+        if (pair.len == 0) continue;
+        if (std.mem.indexOfScalar(u8, pair, '=')) |eq| {
+            out.put(pair[0..eq], pair[eq + 1 ..]) catch {
+                std.log.warn("query string exceeds {d} params, truncating", .{MAX_QUERY_PARAMS});
+                return;
+            };
+        } else {
+            out.put(pair, "") catch {
+                std.log.warn("query string exceeds {d} params, truncating", .{MAX_QUERY_PARAMS});
+                return;
+            };
+        }
+    }
+}
 
 /// Cosocket suspend state — bundled so one `= null` replaces seven resets.
 /// Non-null means a handler is yielded waiting on outbound I/O.
@@ -72,8 +121,9 @@ pub const Connection = struct {
     write_buffer: []u8,
     write_pos: usize,
 
-    // Inline param storage (reused across requests, zero allocations, cache-friendly)
+    // Inline param/query storage (reused across requests, zero allocations, cache-friendly)
     param_cache: ParamArray,
+    query_cache: QueryArray,
 
     // Cosocket: non-null when handler is suspended on outbound I/O
     suspended: ?SuspendedState = null,
@@ -112,16 +162,26 @@ pub const Connection = struct {
             .read_buffer = read_buf,
             .write_buffer = write_buf,
             .write_pos = 0,
-            .param_cache = ParamArray{},  // Inline struct, zero allocations
+            .param_cache = ParamArray{},
+            .query_cache = QueryArray{},
         };
 
         return conn;
     }
 
     pub fn deinit(self: *Connection, allocator: std.mem.Allocator) void {
+        // Clean up suspended coroutine state if connection closes mid-I/O
+        if (self.suspended) |s| {
+            // Unref pinned coroutine to prevent Lua registry leak
+            if (s.coroutine_ref != 0) {
+                self.lua_state.lua.unref(Lua.PseudoIndex.Registry, s.coroutine_ref);
+            }
+            // Close leaked outbound fd
+            if (s.outbound_fd != 0) std.posix.close(s.outbound_fd);
+        }
         std.posix.close(self.socket);
         self.arena.deinit();
-        // param_cache is inline struct, no deinit needed
+        // param_cache/query_cache are inline structs, no deinit needed
         self.base_allocator.free(self.write_buffer);
         self.base_allocator.free(self.read_buffer.data);
         allocator.destroy(self);
@@ -201,9 +261,18 @@ pub const Connection = struct {
         };
         // headers are arena-allocated, freed on arena reset in onWrite
 
-        // Clear param cache and match route
+        // Strip query string from path for routing, parse query params
+        const query_pos = std.mem.indexOfScalar(u8, request.path, '?');
+        const clean_path = if (query_pos) |qi| request.path[0..qi] else request.path;
+
+        self.query_cache.clear();
+        if (query_pos) |qi| {
+            parseQueryString(request.path[qi + 1 ..], &self.query_cache);
+        }
+
+        // Clear param cache and match route (using clean path without query string)
         self.param_cache.clear();
-        const lua_ref = self.router.match(request.method, request.path, &self.param_cache) catch {
+        const lua_ref = self.router.match(request.method, clean_path, &self.param_cache) catch {
             self.send400BadRequest();
             return;
         };
@@ -211,7 +280,7 @@ pub const Connection = struct {
         if (lua_ref) |ref| {
             // Arena-allocate exchange (must persist across yields)
             const exchange_ptr = try alloc.create(HttpExchange);
-            exchange_ptr.* = try HttpExchange.init(alloc, &request, &self.param_cache);
+            exchange_ptr.* = try HttpExchange.init(alloc, &request, &self.param_cache, &self.query_cache, clean_path);
 
             const handler_result = self.lua_state.callLuaHandler(ref, exchange_ptr) catch |err| {
                 std.log.err("Lua handler error: {}", .{err});
@@ -522,11 +591,16 @@ pub const Connection = struct {
             self.close();
             return .disarm;
         };
-        _ = bytes_written;
 
         // Reset for next request (HTTP/1.1 keep-alive)
         self.suspended = null;
-        _ = self.arena.reset(.retain_capacity);
+        // Shrink arena if response was large (> 1MB) to prevent unbounded growth
+        // on keep-alive connections that occasionally serve large responses.
+        if (bytes_written > 1024 * 1024) {
+            _ = self.arena.reset(.free_all);
+        } else {
+            _ = self.arena.reset(.retain_capacity);
+        }
         self.read_buffer.reset();
 
         // Continue reading for next request on same connection

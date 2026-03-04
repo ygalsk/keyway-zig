@@ -13,6 +13,7 @@ pub fn main() !void {
     const config = Server.Config{
         .host = "0.0.0.0",
         .port = 8080,
+        .enable_bpf_affinity = true,
     };
 
     // Create thread pool (one worker per CPU core)

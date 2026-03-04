@@ -92,6 +92,19 @@ pub const Router = struct {
         pattern: []const u8,
         lua_ref: i32,
     ) !void {
+        // Validate param count doesn't exceed ParamArray capacity
+        var param_count: usize = 0;
+        var count_it = std.mem.splitScalar(u8, pattern, '/');
+        while (count_it.next()) |seg| {
+            if (seg.len >= 2 and seg[0] == '{' and seg[seg.len - 1] == '}') {
+                param_count += 1;
+            }
+        }
+        if (param_count > handler.MAX_ROUTE_PARAMS) {
+            std.log.err("route '{s}' has {d} params, max is {d}", .{ pattern, param_count, handler.MAX_ROUTE_PARAMS });
+            return error.TooManyParams;
+        }
+
         var node = self.root;
         var it = std.mem.splitScalar(u8, pattern, '/');
 

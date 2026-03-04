@@ -1,198 +1,134 @@
 const std = @import("std");
 
-/// Classic BPF module for SO_REUSEPORT connection affinity
-/// Deep module: Simple interface, complex implementation
+/// Classic BPF module for SO_REUSEPORT connection affinity.
 ///
-/// This module generates classic BPF (cBPF) bytecode that hashes incoming
-/// connections based on source IP and port, ensuring all connections from
-/// the same client hit the same worker thread (and thus the same Lua state).
-/// BPF instruction structure (from linux/filter.h)
-pub const sock_filter = extern struct {
-    code: u16, // Opcode
-    jt: u8, // Jump if true
-    jf: u8, // Jump if false
-    k: u32, // Generic value
+/// Single public function: `attachAffinity` builds a BPF program on the stack
+/// and attaches it to a socket so the kernel routes connections deterministically
+/// to worker threads based on RX hash.
 
-    pub fn stmt(code: u16, k: u32) sock_filter {
+const sock_filter = extern struct {
+    code: u16,
+    jt: u8,
+    jf: u8,
+    k: u32,
+
+    fn stmt(code: u16, k: u32) sock_filter {
         return .{ .code = code, .jt = 0, .jf = 0, .k = k };
     }
-
-    pub fn jump(code: u16, k: u32, jt: u8, jf: u8) sock_filter {
-        return .{ .code = code, .jt = jt, .jf = jf, .k = k };
-    }
 };
 
-/// BPF program structure (from linux/filter.h)
-pub const sock_fprog = extern struct {
-    len: u16, // Number of filter instructions
-    filter: [*]const sock_filter, // Pointer to filter array
+const sock_fprog = extern struct {
+    len: u16,
+    filter: [*]const sock_filter,
 };
 
-// BPF instruction classes (from linux/filter.h)
-const BPF_LD = 0x00; // Load
-const BPF_ALU = 0x04; // ALU operations
-const BPF_RET = 0x06; // Return
+// BPF instruction classes
+const BPF_LD = 0x00;
+const BPF_ALU = 0x04;
+const BPF_RET = 0x06;
 
 // BPF load/store modes
-const BPF_ABS = 0x20; // Absolute offset
-const BPF_W = 0x00; // Word (32-bit)
-const BPF_H = 0x08; // Half-word (16-bit)
+const BPF_ABS = 0x20;
+const BPF_W = 0x00;
 
 // BPF ALU operations
-const BPF_ADD = 0x00;
-const BPF_XOR = 0x30;
-const BPF_LSH = 0x60; // Left shift
 const BPF_MOD = 0x90;
-const BPF_A = 0x10; // Accumulator
+const BPF_A = 0x10;
 
-// BPF special offsets (SKF_AD_OFF from linux/filter.h)
+// BPF special offsets
 const SKF_AD_OFF = -0x1000;
-const SKF_AD_PROTOCOL = 0; // Protocol (IPv4/IPv6)
-const SKF_AD_PKTTYPE = 4;
-const SKF_AD_IFINDEX = 8;
-const SKF_AD_NLATTR = 12;
-const SKF_AD_NLATTR_NEST = 16;
-const SKF_AD_MARK = 20;
-const SKF_AD_QUEUE = 24;
-const SKF_AD_HATYPE = 28;
-const SKF_AD_RXHASH = 32; // RX hash (from kernel)
-const SKF_AD_CPU = 36;
+const SKF_AD_RXHASH = 32;
 
 // Socket constants
-pub const SO_ATTACH_REUSEPORT_CBPF = 51; // From linux/socket.h
+const SO_ATTACH_REUSEPORT_CBPF = 51;
 
-/// Generate classic BPF program for SO_REUSEPORT connection affinity
-///
-/// The BPF program hashes the connection using:
-///   hash = SKF_AD_RXHASH (kernel-provided RX hash)
-///   worker = hash % num_workers
-///
-/// This is simpler and more reliable than manually hashing IP/port fields,
-/// as the kernel already provides a well-distributed hash.
-pub fn generateBpfProgram(allocator: std.mem.Allocator, num_workers: u32) ![]sock_filter {
+const BpfProgram = struct {
+    insns: [3]sock_filter,
+    len: u16,
+};
+
+fn buildProgram(num_workers: u32) error{InvalidWorkerCount}!BpfProgram {
     if (num_workers == 0) return error.InvalidWorkerCount;
     if (num_workers == 1) {
-        // Single worker: just return 0
-        var program = try allocator.alloc(sock_filter, 1);
-        program[0] = sock_filter.stmt(BPF_RET | BPF_A, 0);
-        return program;
+        // Single worker: return constant 0
+        return .{
+            .insns = .{
+                sock_filter.stmt(BPF_RET, 0),
+                undefined,
+                undefined,
+            },
+            .len = 1,
+        };
     }
 
-    // BPF program:
-    // 1. Load SKF_AD_RXHASH (kernel RX hash) into accumulator
-    // 2. Modulo by num_workers
-    // 3. Return accumulator (worker index)
-    var program = try allocator.alloc(sock_filter, 3);
-
-    // A = skb->rxhash (load kernel RX hash)
-    program[0] = sock_filter.stmt(
-        BPF_LD | BPF_W | BPF_ABS,
-        @as(u32, @bitCast(@as(i32, SKF_AD_OFF + SKF_AD_RXHASH))),
-    );
-
-    // A = A % num_workers
-    program[1] = sock_filter.stmt(BPF_ALU | BPF_MOD, num_workers);
-
-    // return A
-    program[2] = sock_filter.stmt(BPF_RET | BPF_A, 0);
-
-    return program;
-}
-
-/// Attach BPF program to socket for SO_REUSEPORT affinity
-///
-/// This must be called on one of the SO_REUSEPORT socket group members.
-/// The BPF filter will apply to all sockets in the group.
-pub fn attachToSocket(socket: std.posix.socket_t, program: []const sock_filter) !void {
-    if (program.len == 0) return error.EmptyBpfProgram;
-    if (program.len > 4096) return error.BpfProgramTooLarge; // Kernel limit
-
-    const fprog = sock_fprog{
-        .len = @intCast(program.len),
-        .filter = program.ptr,
-    };
-
-    const fprog_bytes = std.mem.asBytes(&fprog);
-
-    std.posix.setsockopt(
-        socket,
-        std.posix.SOL.SOCKET,
-        SO_ATTACH_REUSEPORT_CBPF,
-        fprog_bytes,
-    ) catch |err| {
-        // Common errors:
-        // - ENOPROTOOPT: Kernel doesn't support SO_ATTACH_REUSEPORT_CBPF (pre-4.5)
-        // - EINVAL: BPF program validation failed
-        // - EPERM: Missing CAP_NET_RAW capability
-        return err;
+    return .{
+        .insns = .{
+            // A = skb->rxhash
+            sock_filter.stmt(
+                BPF_LD | BPF_W | BPF_ABS,
+                @as(u32, @bitCast(@as(i32, SKF_AD_OFF + SKF_AD_RXHASH))),
+            ),
+            // A = A % num_workers
+            sock_filter.stmt(BPF_ALU | BPF_MOD, num_workers),
+            // return A
+            sock_filter.stmt(BPF_RET | BPF_A, 0),
+        },
+        .len = 3,
     };
 }
 
-/// Detach BPF program from socket (set to null program)
-pub fn detachFromSocket(socket: std.posix.socket_t) !void {
-    const fprog = sock_fprog{
-        .len = 0,
-        .filter = undefined,
-    };
+/// Attach a BPF program to `socket` that routes connections to one of
+/// `num_workers` workers based on the kernel RX hash. No allocator needed.
+pub fn attachAffinity(socket: std.posix.socket_t, num_workers: u32) !void {
+    var prog = try buildProgram(num_workers);
 
-    const fprog_bytes = std.mem.asBytes(&fprog);
+    const fprog = sock_fprog{
+        .len = prog.len,
+        .filter = &prog.insns,
+    };
 
     try std.posix.setsockopt(
         socket,
         std.posix.SOL.SOCKET,
         SO_ATTACH_REUSEPORT_CBPF,
-        fprog_bytes,
+        std.mem.asBytes(&fprog),
     );
 }
 
 // Tests
-test "BPF program generation - single worker" {
-    const allocator = std.testing.allocator;
 
-    const program = try generateBpfProgram(allocator, 1);
-    defer allocator.free(program);
-
-    try std.testing.expectEqual(@as(usize, 1), program.len);
-    try std.testing.expectEqual(BPF_RET | BPF_A, program[0].code);
+test "buildProgram - single worker returns constant 0" {
+    const prog = try buildProgram(1);
+    try std.testing.expectEqual(@as(u16, 1), prog.len);
+    // BPF_RET with k=0 (return constant 0, not accumulator)
+    try std.testing.expectEqual(BPF_RET, prog.insns[0].code);
+    try std.testing.expectEqual(@as(u32, 0), prog.insns[0].k);
 }
 
-test "BPF program generation - multiple workers" {
-    const allocator = std.testing.allocator;
+test "buildProgram - multiple workers" {
+    const prog = try buildProgram(8);
+    try std.testing.expectEqual(@as(u16, 3), prog.len);
 
-    const program = try generateBpfProgram(allocator, 8);
-    defer allocator.free(program);
+    // Instruction 0: Load RX hash
+    try std.testing.expectEqual(BPF_LD | BPF_W | BPF_ABS, prog.insns[0].code);
 
-    try std.testing.expectEqual(@as(usize, 3), program.len);
+    // Instruction 1: Modulo by worker count
+    try std.testing.expectEqual(BPF_ALU | BPF_MOD, prog.insns[1].code);
+    try std.testing.expectEqual(@as(u32, 8), prog.insns[1].k);
 
-    // Check instruction 0: Load RX hash
-    try std.testing.expectEqual(BPF_LD | BPF_W | BPF_ABS, program[0].code);
-
-    // Check instruction 1: Modulo
-    try std.testing.expectEqual(BPF_ALU | BPF_MOD, program[1].code);
-    try std.testing.expectEqual(@as(u32, 8), program[1].k);
-
-    // Check instruction 2: Return
-    try std.testing.expectEqual(BPF_RET | BPF_A, program[2].code);
+    // Instruction 2: Return accumulator
+    try std.testing.expectEqual(BPF_RET | BPF_A, prog.insns[2].code);
 }
 
-test "BPF program generation - zero workers" {
-    const allocator = std.testing.allocator;
-
-    const result = generateBpfProgram(allocator, 0);
-    try std.testing.expectError(error.InvalidWorkerCount, result);
+test "buildProgram - zero workers is error" {
+    try std.testing.expectError(error.InvalidWorkerCount, buildProgram(0));
 }
 
-test "BPF program generation - power of two workers" {
-    const allocator = std.testing.allocator;
-
-    // Test various worker counts
-    const worker_counts = [_]u32{ 2, 4, 8, 16, 32 };
-
-    for (worker_counts) |count| {
-        const program = try generateBpfProgram(allocator, count);
-        defer allocator.free(program);
-
-        try std.testing.expectEqual(@as(usize, 3), program.len);
-        try std.testing.expectEqual(@as(u32, count), program[1].k);
+test "buildProgram - various worker counts" {
+    const counts = [_]u32{ 2, 4, 8, 16, 32 };
+    for (counts) |count| {
+        const prog = try buildProgram(count);
+        try std.testing.expectEqual(@as(u16, 3), prog.len);
+        try std.testing.expectEqual(@as(u32, count), prog.insns[1].k);
     }
 }
