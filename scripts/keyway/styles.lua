@@ -1,0 +1,340 @@
+-- keyway.styles — Complete brand CSS string for Keyway tools
+-- All tokens from BRAND.md, typography scale, spacing, components, responsive.
+-- Usage: require("keyway.styles").css
+
+local M = {}
+
+M.css = [[
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700&family=JetBrains+Mono:wght@400&display=swap');
+
+/* ============================================================
+   CSS Custom Properties (BRAND.md tokens)
+   ============================================================ */
+:root {
+  /* Primary */
+  --kiwi-green: #73B44C;
+  --kiwi-green-light: #9CCC65;
+  --kiwi-green-dark: #5A9138;
+
+  /* Accent */
+  --kiwi-lime: #BFD85F;
+  --kiwi-lime-light: #D4E78E;
+
+  /* Secondary */
+  --kiwi-brown: #5C4033;
+  --kiwi-brown-light: #8B7355;
+  --kiwi-brown-dark: #3D2B22;
+
+  /* Neutral backgrounds */
+  --kiwi-cream: #FAFADC;
+  --kiwi-cream-dark: #F5F5DC;
+
+  /* Text / seeds */
+  --kiwi-seed: #2C2C2C;
+  --kiwi-seed-light: #4A4A4A;
+  --kiwi-white: #FFFFFF;
+  --kiwi-border: #E5E7EB;
+
+  /* Semantic */
+  --success: #73B44C;
+  --warning: #F59E0B;
+  --error: #EF4444;
+  --info: #3B82F6;
+
+  /* Typography scale */
+  --text-xs:   0.75rem;
+  --text-sm:   0.875rem;
+  --text-base: 1rem;
+  --text-lg:   1.25rem;
+  --text-xl:   1.5rem;
+  --text-2xl:  2rem;
+  --text-3xl:  2.5rem;
+  --text-4xl:  3rem;
+
+  /* Font weights */
+  --weight-regular:  400;
+  --weight-medium:   500;
+  --weight-semibold: 600;
+  --weight-bold:     700;
+
+  /* Line heights */
+  --leading-tight:   1.25;
+  --leading-normal:  1.5;
+  --leading-relaxed: 1.75;
+
+  /* Spacing (8px grid) */
+  --space-1:  0.5rem;
+  --space-2:  1rem;
+  --space-3:  1.5rem;
+  --space-4:  2rem;
+  --space-5:  2.5rem;
+  --space-6:  3rem;
+  --space-8:  4rem;
+  --space-10: 5rem;
+  --space-12: 6rem;
+  --space-16: 8rem;
+
+  /* Font families */
+  --font-body: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', 'Roboto', 'Helvetica Neue', sans-serif;
+  --font-code: 'JetBrains Mono', 'Fira Code', 'Consolas', 'Monaco', 'Courier New', monospace;
+}
+
+/* ============================================================
+   Base Reset
+   ============================================================ */
+*, *::before, *::after {
+  box-sizing: border-box;
+  margin: 0;
+  padding: 0;
+}
+
+body {
+  font-family: var(--font-body);
+  font-size: var(--text-base);
+  font-weight: var(--weight-regular);
+  color: var(--kiwi-seed-light);
+  background: var(--kiwi-white);
+  line-height: var(--leading-normal);
+}
+
+h1, h2, h3, h4, h5, h6 {
+  color: var(--kiwi-seed);
+  font-weight: var(--weight-bold);
+  line-height: var(--leading-tight);
+}
+
+a {
+  color: var(--kiwi-green);
+  text-decoration: none;
+}
+
+a:hover {
+  color: var(--kiwi-green-dark);
+}
+
+/* ============================================================
+   Layout
+   ============================================================ */
+.container {
+  max-width: 48rem;
+  margin-left: auto;
+  margin-right: auto;
+  padding: var(--space-4);
+}
+
+/* ============================================================
+   Navigation
+   ============================================================ */
+nav {
+  display: flex;
+  align-items: center;
+  gap: var(--space-3);
+  background: var(--kiwi-white);
+  border-bottom: 1px solid var(--kiwi-border);
+  padding: var(--space-2) var(--space-4);
+}
+
+nav .brand {
+  font-weight: var(--weight-bold);
+  color: var(--kiwi-green);
+  font-size: var(--text-lg);
+  text-decoration: none;
+}
+
+nav .brand:hover {
+  color: var(--kiwi-green-dark);
+}
+
+nav a {
+  color: var(--kiwi-seed-light);
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  padding: var(--space-1) 0;
+}
+
+nav a:hover {
+  color: var(--kiwi-seed);
+}
+
+nav a.active {
+  color: var(--kiwi-green);
+  border-bottom: 2px solid var(--kiwi-green);
+}
+
+/* ============================================================
+   Worker Badge
+   ============================================================ */
+.worker-badge {
+  font-size: var(--text-xs);
+  color: var(--kiwi-seed-light);
+  text-align: center;
+  padding: var(--space-2);
+}
+
+/* ============================================================
+   Banner Alerts
+   ============================================================ */
+.banner-error {
+  background: rgba(239, 68, 68, 0.08);
+  border-left: 4px solid var(--error);
+  padding: var(--space-2);
+  margin-bottom: var(--space-3);
+  border-radius: 0 0.375rem 0.375rem 0;
+  color: var(--kiwi-seed);
+  font-size: var(--text-sm);
+}
+
+.banner-success {
+  background: rgba(115, 180, 76, 0.08);
+  border-left: 4px solid var(--success);
+  padding: var(--space-2);
+  margin-bottom: var(--space-3);
+  border-radius: 0 0.375rem 0.375rem 0;
+  color: var(--kiwi-seed);
+  font-size: var(--text-sm);
+}
+
+/* ============================================================
+   Forms
+   ============================================================ */
+label {
+  display: block;
+  font-size: var(--text-sm);
+  font-weight: var(--weight-medium);
+  color: var(--kiwi-seed);
+  margin-bottom: var(--space-1);
+}
+
+input, textarea, select {
+  width: 100%;
+  border: 1px solid var(--kiwi-border);
+  border-radius: 0.375rem;
+  padding: calc(var(--space-1) * 1.5) var(--space-2);
+  font-size: var(--text-base);
+  font-family: var(--font-body);
+  color: var(--kiwi-seed);
+  background: var(--kiwi-white);
+  transition: border-color 150ms ease, outline 150ms ease;
+}
+
+input:focus, textarea:focus, select:focus {
+  outline: 2px solid var(--kiwi-green);
+  outline-offset: 0;
+  border-color: var(--kiwi-green);
+}
+
+.form-group {
+  margin-bottom: var(--space-3);
+}
+
+/* ============================================================
+   Buttons
+   ============================================================ */
+.btn-primary {
+  display: inline-block;
+  padding: var(--space-2) var(--space-4);
+  background: var(--kiwi-green);
+  color: var(--kiwi-white);
+  border-radius: 0.5rem;
+  font-weight: var(--weight-semibold);
+  font-size: var(--text-base);
+  text-decoration: none;
+  border: none;
+  cursor: pointer;
+  transition: background 150ms ease;
+  font-family: var(--font-body);
+}
+
+.btn-primary:hover {
+  background: var(--kiwi-green-dark);
+  color: var(--kiwi-white);
+}
+
+.btn-primary:active {
+  background: var(--kiwi-green-light);
+}
+
+.btn-secondary {
+  display: inline-block;
+  padding: var(--space-2) var(--space-4);
+  background: transparent;
+  color: var(--kiwi-green);
+  border: 2px solid var(--kiwi-green);
+  border-radius: 0.5rem;
+  font-weight: var(--weight-semibold);
+  font-size: var(--text-base);
+  text-decoration: none;
+  cursor: pointer;
+  transition: all 150ms ease;
+  font-family: var(--font-body);
+}
+
+.btn-secondary:hover {
+  background: var(--kiwi-green);
+  color: var(--kiwi-white);
+}
+
+/* ============================================================
+   Code Blocks
+   ============================================================ */
+pre {
+  background: var(--kiwi-cream-dark);
+  border: 1px solid var(--kiwi-border);
+  border-left: 4px solid var(--kiwi-green);
+  padding: var(--space-3);
+  border-radius: 0.5rem;
+  overflow-x: auto;
+  font-size: var(--text-sm);
+}
+
+code {
+  font-family: var(--font-code);
+  color: var(--kiwi-seed);
+}
+
+pre code {
+  background: none;
+  padding: 0;
+}
+
+:not(pre) > code {
+  background: var(--kiwi-cream-dark);
+  padding: 0.125rem 0.375rem;
+  border-radius: 0.25rem;
+  font-size: 0.9em;
+}
+
+/* ============================================================
+   Cards
+   ============================================================ */
+.card {
+  background: var(--kiwi-white);
+  border: 1px solid var(--kiwi-border);
+  border-radius: 0.75rem;
+  padding: var(--space-4);
+  box-shadow: 0 1px 3px rgba(0, 0, 0, 0.05);
+  transition: box-shadow 150ms ease;
+}
+
+.card:hover {
+  box-shadow: 0 4px 12px rgba(115, 180, 76, 0.1);
+}
+
+/* ============================================================
+   Responsive
+   ============================================================ */
+@media (max-width: 600px) {
+  nav {
+    flex-direction: column;
+    align-items: flex-start;
+    gap: var(--space-1);
+    padding: var(--space-2);
+  }
+
+  .container {
+    padding: var(--space-2);
+  }
+}
+]]
+
+return M
