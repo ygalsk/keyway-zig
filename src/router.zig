@@ -101,7 +101,7 @@ pub const Router = struct {
             }
         }
         if (param_count > handler.MAX_ROUTE_PARAMS) {
-            std.log.err("route '{s}' has {d} params, max is {d}", .{ pattern, param_count, handler.MAX_ROUTE_PARAMS });
+            std.log.err("route has too many params pattern={s} count={d} max={d}", .{ pattern, param_count, handler.MAX_ROUTE_PARAMS });
             return error.TooManyParams;
         }
 
@@ -315,4 +315,51 @@ test "radix router: no match" {
 
     const result = try router.match("GET", "/posts", &params);
     try std.testing.expect(result == null);
+}
+
+test "security: path traversal in param is literal string" {
+    const allocator = std.testing.allocator;
+
+    var router = try Router.init(allocator);
+    defer router.deinit();
+
+    try router.addRoute("GET", "/h/{id}", 1);
+
+    var params = handler.ParamArray{};
+
+    // ".." is captured as a literal param value, not interpreted as directory traversal
+    const r1 = try router.match("GET", "/h/..", &params);
+    try std.testing.expect(r1 != null);
+    try std.testing.expectEqualStrings("..", params.get("id").?);
+    params.clear();
+
+    // Extra segments beyond the route pattern → no match
+    const r2 = try router.match("GET", "/h/../../etc/passwd", &params);
+    try std.testing.expect(r2 == null);
+    params.clear();
+
+    // URL-encoded traversal is a literal string (picohttpparser doesn't decode)
+    const r3 = try router.match("GET", "/h/..%2F..%2Fetc%2Fpasswd", &params);
+    try std.testing.expect(r3 != null);
+    try std.testing.expectEqualStrings("..%2F..%2Fetc%2Fpasswd", params.get("id").?);
+}
+
+test "security: traversal does not escape route tree" {
+    const allocator = std.testing.allocator;
+
+    var router = try Router.init(allocator);
+    defer router.deinit();
+
+    try router.addRoute("GET", "/hooks/{id}", 1);
+
+    var params = handler.ParamArray{};
+
+    // 3 segments vs 2-segment route → no match
+    const r1 = try router.match("GET", "/hooks/../kv", &params);
+    try std.testing.expect(r1 == null);
+    params.clear();
+
+    // 4 segments vs 2-segment route → no match
+    const r2 = try router.match("GET", "/hooks/foo/../../", &params);
+    try std.testing.expect(r2 == null);
 }

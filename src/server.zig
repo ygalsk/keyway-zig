@@ -4,6 +4,7 @@ const Connection = @import("handler.zig").Connection;
 const Router = @import("router.zig").Router;
 const LuaState = @import("lua_state.zig").LuaState;
 const bpf_reuseport = @import("bpf_reuseport.zig");
+const TlsContext = @import("tls.zig").TlsContext;
 
 // TCP socket configuration
 const DEFAULT_BACKLOG: u31 = 128;
@@ -18,12 +19,15 @@ pub const Server = struct {
     accept_completion: xev.Completion,
     router: *Router,
     lua_state: *LuaState,
+    tls_ctx: ?TlsContext,
 
     /// Server configuration
     pub const Config = struct {
         host: []const u8 = "0.0.0.0",
         port: u16 = 8080,
-        enable_bpf_affinity: bool = false, // Enable BPF connection affinity (disabled by default)
+        enable_bpf_affinity: bool = false,
+        tls_cert_path: ?[*:0]const u8 = null,
+        tls_key_path: ?[*:0]const u8 = null,
     };
 
     /// Initialize server
@@ -99,6 +103,12 @@ pub const Server = struct {
             try std.posix.listen(socket, DEFAULT_BACKLOG);
         }
 
+        // Initialize TLS context if cert+key are configured
+        const tls_ctx: ?TlsContext = if (config.tls_cert_path != null and config.tls_key_path != null)
+            try TlsContext.init(config.tls_cert_path.?, config.tls_key_path.?)
+        else
+            null;
+
         return Server{
             .allocator = allocator,
             .loop = loop,
@@ -107,6 +117,7 @@ pub const Server = struct {
             .accept_completion = undefined,
             .router = router,
             .lua_state = lua_state,
+            .tls_ctx = tls_ctx,
         };
     }
 
@@ -139,7 +150,7 @@ pub const Server = struct {
         const self: *Server = @ptrCast(@alignCast(userdata.?));
 
         const client_socket = result.accept catch |err| {
-            std.log.err("Accept failed: {}", .{err});
+            std.log.err("accept failed err={}", .{err});
             self.acceptNext();
             return .disarm;
         };
@@ -151,7 +162,7 @@ pub const Server = struct {
             std.posix.TCP.NODELAY,
             &std.mem.toBytes(@as(c_int, 1)),
         ) catch |err| {
-            std.log.err("Failed to set TCP_NODELAY: {}", .{err});
+            std.log.err("setsockopt TCP_NODELAY failed err={}", .{err});
         };
 
         // Create connection handler
@@ -162,11 +173,21 @@ pub const Server = struct {
             self.router,
             self.lua_state,
         ) catch |err| {
-            std.log.err("Connection init failed: {}", .{err});
+            std.log.err("connection init failed err={}", .{err});
             std.posix.close(client_socket);
             self.acceptNext();
             return .disarm;
         };
+
+        // Initialize TLS if configured
+        if (self.tls_ctx) |*tc| {
+            conn.initTls(tc) catch |err| {
+                std.log.err("TLS init failed err={}", .{err});
+                conn.deinit(self.allocator);
+                self.acceptNext();
+                return .disarm;
+            };
+        }
 
         // Start reading from connection
         conn.startRead();
@@ -178,6 +199,7 @@ pub const Server = struct {
 
     /// Clean up server resources
     pub fn deinit(self: *Server) void {
+        if (self.tls_ctx) |*tc| tc.deinit();
         std.posix.close(self.socket);
     }
 };

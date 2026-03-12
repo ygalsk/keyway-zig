@@ -7,6 +7,9 @@ const lua_api = @import("lua_api.zig");
 const IoRequest = @import("io_request.zig").IoRequest;
 const io_request = @import("io_request.zig");
 const ConnectionPool = @import("connection_pool.zig").ConnectionPool;
+const tls = @import("tls.zig");
+const TlsConn = tls.TlsConn;
+const ClientTlsContext = tls.ClientTlsContext;
 
 // zig-luajit marks resumeCoroutine as private — call C API directly.
 // Lua is an opaque type that maps 1:1 to lua_State*, so @ptrCast is safe.
@@ -37,6 +40,10 @@ pub const LuaState = struct {
 
     // Connection pool for cosocket keepalive (per-worker, outlives requests)
     pool: ConnectionPool,
+
+    // Outbound TLS: client context (one per worker) + fd→TLS mapping (persists across yields)
+    client_tls_ctx: ClientTlsContext,
+    tls_map: std.AutoHashMapUnmanaged(std.posix.socket_t, *TlsConn),
 
     /// Initialize Lua state with standard libraries
     pub fn init(allocator: std.mem.Allocator) !LuaState {
@@ -87,11 +94,14 @@ pub const LuaState = struct {
             \\    local home = os.getenv("HOME") or ""
             \\    package.cpath = home .. "/.luarocks/lib/lua/5.1/?.so;"
             \\        .. "/usr/lib/lua/5.1/?.so;"
+            \\        .. "/usr/lib64/lua/5.1/?.so;"
             \\        .. "/usr/share/lua/5.1/?.so;"
             \\        .. "/usr/local/lib/lua/5.1/?.so;"
             \\        .. package.cpath
             \\end
         ) catch {};
+
+        const client_tls_ctx = ClientTlsContext.init() catch return error.TlsInitFailed;
 
         return LuaState{
             .lua = lua,
@@ -99,6 +109,8 @@ pub const LuaState = struct {
             .cached_thread = cached_thread,
             .cached_thread_ref = cached_thread_ref,
             .pool = ConnectionPool.init(allocator),
+            .client_tls_ctx = client_tls_ctx,
+            .tls_map = .{},
         };
     }
 
@@ -203,7 +215,7 @@ pub const LuaState = struct {
             else => {
                 if (thread.isString(-1)) {
                     const err_msg = thread.toString(-1) catch "unknown error";
-                    std.log.err("Lua handler error: {s}", .{err_msg});
+                    std.log.err("lua handler error path={s} method={s} err=\"{s}\"", .{ exchange.path, exchange.method, err_msg });
                 }
                 if (self.cached_thread_ref == 0) self.lua.pop(1);
                 return error.Runtime;
@@ -238,7 +250,7 @@ pub const LuaState = struct {
                 const lua_thread: *Lua = @ptrCast(@alignCast(thread));
                 if (lua_thread.isString(-1)) {
                     const err_msg = lua_thread.toString(-1) catch "unknown error";
-                    std.log.err("Lua handler error on resume: {s}", .{err_msg});
+                    std.log.err("lua resume error err=\"{s}\"", .{err_msg});
                 }
                 return error.Runtime;
             },
@@ -265,6 +277,7 @@ pub const LuaState = struct {
             .{ "__keyway_pool_connect", io_request.keyway_pool_connect },
             .{ "__keyway_pool_setkeepalive", io_request.keyway_pool_setkeepalive },
             .{ "__keyway_io_udp_connect", io_request.keyway_io_udp_connect },
+            .{ "__keyway_io_sslhandshake", io_request.keyway_io_sslhandshake },
         };
 
         inline for (funcs) |entry| {
@@ -274,8 +287,38 @@ pub const LuaState = struct {
         }
     }
 
+    /// Ownership transfers to LuaState.
+    pub fn registerTls(self: *LuaState, fd: std.posix.socket_t, tls_conn: *TlsConn) !void {
+        try self.tls_map.put(self.allocator, fd, tls_conn);
+    }
+
+    /// Borrow — returns null for plain TCP.
+    pub fn getTls(self: *LuaState, fd: std.posix.socket_t) ?*TlsConn {
+        return self.tls_map.get(fd);
+    }
+
+    /// Ownership transfers to caller. Used for pool transfer or manual cleanup.
+    pub fn detachTls(self: *LuaState, fd: std.posix.socket_t) ?*TlsConn {
+        return if (self.tls_map.fetchRemove(fd)) |kv| kv.value else null;
+    }
+
+    /// Remove and free. Used on close paths.
+    pub fn removeTls(self: *LuaState, fd: std.posix.socket_t) void {
+        if (self.tls_map.fetchRemove(fd)) |kv| {
+            tls.freeTlsConn(self.allocator, kv.value);
+        }
+    }
+
     /// Clean up Lua state
     pub fn deinit(self: *LuaState) void {
+        // Clean up all outbound TLS connections
+        var tls_it = self.tls_map.iterator();
+        while (tls_it.next()) |entry| {
+            tls.freeTlsConn(self.allocator, entry.value_ptr.*);
+        }
+        self.tls_map.deinit(self.allocator);
+        self.client_tls_ctx.deinit();
+
         self.pool.deinit();
         if (self.cached_thread_ref != 0) {
             self.lua.unref(Lua.PseudoIndex.Registry, self.cached_thread_ref);
@@ -528,6 +571,165 @@ test "middleware short-circuit" {
     try std.testing.expectEqual(HandlerResult.completed, result);
     try std.testing.expectEqual(@as(u16, 401), exchange.status);
     try std.testing.expectEqualStrings("unauthorized", exchange.response_body);
+
+    allocator.free(exchange.response_body);
+}
+
+test "security: request body with lua code is not executed" {
+    const allocator = std.testing.allocator;
+    const handler = @import("handler.zig");
+
+    var router = try Router.init(allocator);
+    defer router.deinit();
+
+    var state = try LuaState.init(allocator);
+    defer state.deinit();
+
+    // Handler echoes body back — body content must never be evaluated as Lua
+    try state.loadString(
+        \\keyway.routes = {
+        \\    ["/echo"] = {
+        \\        POST = function(ctx)
+        \\            ctx.status = 200
+        \\            ctx.body = ctx.body
+        \\        end,
+        \\    },
+        \\}
+    );
+    try state.processRouteTable(&router);
+
+    var params = handler.ParamArray{};
+    var query = handler.QueryArray{};
+    const lua_ref = router.match("POST", "/echo", &params);
+    try std.testing.expect(lua_ref != null);
+
+    var response_headers = try std.ArrayList(http.Header).initCapacity(allocator, 4);
+    defer response_headers.deinit(allocator);
+
+    var exchange = HttpExchange{
+        .method = "POST",
+        .path = "/echo",
+        .headers = &[_]http.Header{},
+        .params = &params,
+        .query = &query,
+        .body = "os.execute('touch /tmp/pwned')",
+        .status = 200,
+        .response_headers = response_headers,
+        .response_body = "",
+        .allocator = allocator,
+    };
+
+    const result = try state.callLuaHandler(lua_ref.?, &exchange);
+    try std.testing.expectEqual(HandlerResult.completed, result);
+    try std.testing.expectEqual(@as(u16, 200), exchange.status);
+    // Body is the literal string, never evaluated as Lua code
+    try std.testing.expectEqualStrings("os.execute('touch /tmp/pwned')", exchange.response_body);
+
+    allocator.free(exchange.response_body);
+}
+
+test "security: param with lua code is literal string" {
+    const allocator = std.testing.allocator;
+    const handler = @import("handler.zig");
+
+    var router = try Router.init(allocator);
+    defer router.deinit();
+
+    var state = try LuaState.init(allocator);
+    defer state.deinit();
+
+    // Handler reads param and sets it as response body
+    try state.loadString(
+        \\keyway.routes = {
+        \\    ["/h/{id}"] = {
+        \\        GET = function(ctx)
+        \\            ctx.status = 200
+        \\            ctx.body = ctx.params.id
+        \\        end,
+        \\    },
+        \\}
+    );
+    try state.processRouteTable(&router);
+
+    var params = handler.ParamArray{};
+    var query = handler.QueryArray{};
+    const lua_ref = router.match("GET", "/h/os.execute('id')", &params);
+    try std.testing.expect(lua_ref != null);
+
+    var response_headers = try std.ArrayList(http.Header).initCapacity(allocator, 4);
+    defer response_headers.deinit(allocator);
+
+    var exchange = HttpExchange{
+        .method = "GET",
+        .path = "/h/os.execute('id')",
+        .headers = &[_]http.Header{},
+        .params = &params,
+        .query = &query,
+        .body = "",
+        .status = 200,
+        .response_headers = response_headers,
+        .response_body = "",
+        .allocator = allocator,
+    };
+
+    const result = try state.callLuaHandler(lua_ref.?, &exchange);
+    try std.testing.expectEqual(HandlerResult.completed, result);
+    // Param value is literal string, never evaluated
+    try std.testing.expectEqualStrings("os.execute('id')", exchange.response_body);
+
+    allocator.free(exchange.response_body);
+}
+
+test "security: ctx.method and ctx.path are read-only" {
+    const allocator = std.testing.allocator;
+    const handler = @import("handler.zig");
+
+    var router = try Router.init(allocator);
+    defer router.deinit();
+
+    var state = try LuaState.init(allocator);
+    defer state.deinit();
+
+    // Handler tries to overwrite method and path, then reads them back
+    try state.loadString(
+        \\keyway.routes = {
+        \\    ["/test"] = {
+        \\        GET = function(ctx)
+        \\            ctx.method = "EVIL"
+        \\            ctx.path = "/evil"
+        \\            ctx.status = 200
+        \\            ctx.body = ctx.method .. " " .. ctx.path
+        \\        end,
+        \\    },
+        \\}
+    );
+    try state.processRouteTable(&router);
+
+    var params = handler.ParamArray{};
+    var query = handler.QueryArray{};
+    const lua_ref = router.match("GET", "/test", &params);
+    try std.testing.expect(lua_ref != null);
+
+    var response_headers = try std.ArrayList(http.Header).initCapacity(allocator, 4);
+    defer response_headers.deinit(allocator);
+
+    var exchange = HttpExchange{
+        .method = "GET",
+        .path = "/test",
+        .headers = &[_]http.Header{},
+        .params = &params,
+        .query = &query,
+        .body = "",
+        .status = 200,
+        .response_headers = response_headers,
+        .response_body = "",
+        .allocator = allocator,
+    };
+
+    const result = try state.callLuaHandler(lua_ref.?, &exchange);
+    try std.testing.expectEqual(HandlerResult.completed, result);
+    // Writes to method/path are silently ignored — original values preserved
+    try std.testing.expectEqualStrings("GET /test", exchange.response_body);
 
     allocator.free(exchange.response_body);
 }

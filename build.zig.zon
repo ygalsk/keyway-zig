@@ -7,7 +7,7 @@
     .dependencies = .{
         .libxev = .{
             .url = "https://github.com/mitchellh/libxev/archive/refs/heads/main.tar.gz",
-            .hash = "libxev-0.0.0-86vtc3kbEwBykzpSo2s87dYDs1G0fPxn__T4tG5AipAN",
+            .hash = "libxev-0.0.0-86vtc689EwAjQWysidPm9NKkAwwUNByiE3kZTg_xu0Hp",
         },
         .luajit = .{
             .url = "https://github.com/sackosoft/zig-luajit/archive/refs/heads/main.tar.gz",

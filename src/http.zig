@@ -12,6 +12,8 @@ pub const Request = struct {
     version: u8,
     headers: []Header,
     body: []const u8,
+    /// Total bytes consumed from input buffer (headers + body per Content-Length)
+    raw_len: usize,
 };
 
 /// HTTP response
@@ -146,9 +148,28 @@ pub const Parser = struct {
             };
         }
 
-        // Body starts after headers (result is bytes consumed)
+        // Body: use Content-Length to determine exact body boundaries.
+        // Without this, leftover body bytes corrupt the next keep-alive request.
         const bytes_consumed = @as(usize, @intCast(result));
-        const body = if (bytes_consumed < buf.len) buf[bytes_consumed..] else &[_]u8{};
+
+        var content_length: usize = 0;
+        for (0..num_headers) |i| {
+            const h = c_headers[i];
+            const name = h.name[0..h.name_len];
+            if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+                content_length = std.fmt.parseInt(usize, h.value[0..h.value_len], 10) catch 0;
+                break;
+            }
+        }
+
+        const total_needed = bytes_consumed + content_length;
+        if (buf.len < total_needed) {
+            // Body not fully received yet — need more data
+            self.allocator.free(headers);
+            return error.Incomplete;
+        }
+
+        const body = if (content_length > 0) buf[bytes_consumed .. bytes_consumed + content_length] else &[_]u8{};
 
         return Request{
             .method = method,
@@ -156,6 +177,7 @@ pub const Parser = struct {
             .version = @as(u8, @intCast(minor_version)),
             .headers = headers,
             .body = body,
+            .raw_len = total_needed,
         };
     }
 

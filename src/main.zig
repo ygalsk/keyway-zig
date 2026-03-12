@@ -1,6 +1,12 @@
 const std = @import("std");
+const log = @import("log.zig");
 const Server = @import("server.zig").Server;
 const ThreadPool = @import("worker.zig").ThreadPool;
+
+pub const std_options: std.Options = .{
+    .log_level = .info,
+    .logFn = log.logFn,
+};
 
 pub fn main() !void {
     std.log.info("Keyway - Starting...", .{});
@@ -14,6 +20,8 @@ pub fn main() !void {
         .host = "0.0.0.0",
         .port = 8080,
         .enable_bpf_affinity = true,
+        .tls_cert_path = "certs/server.crt",
+        .tls_key_path = "certs/server.key",
     };
 
     // Create thread pool (one worker per CPU core)

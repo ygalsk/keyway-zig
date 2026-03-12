@@ -1,4 +1,6 @@
 const std = @import("std");
+const tls_mod = @import("tls.zig");
+const TlsConn = tls_mod.TlsConn;
 
 /// Per-worker connection pool for cosocket connections.
 /// Keyed by destination string (e.g. "127.0.0.1:6379"), LIFO retrieval,
@@ -15,6 +17,7 @@ pub const ConnectionPool = struct {
         fd: std.posix.socket_t,
         reuse_count: u32,
         inserted_at_ms: i64,
+        tls_conn: ?*TlsConn = null,
     };
 
     const Pool = struct {
@@ -33,8 +36,9 @@ pub const ConnectionPool = struct {
     pub fn deinit(self: *ConnectionPool) void {
         var it = self.pools.iterator();
         while (it.next()) |entry| {
-            // Close all pooled fds
+            // Close all pooled fds and free TLS state
             for (entry.value_ptr.entries.items) |pool_entry| {
+                freePoolEntryTls(self.allocator, pool_entry);
                 std.posix.close(pool_entry.fd);
             }
             entry.value_ptr.entries.deinit(self.allocator);
@@ -56,7 +60,8 @@ pub const ConnectionPool = struct {
             const entry = pool.entries.items[len - 1];
             pool.entries.items.len = len - 1;
             if (@max(0, now - entry.inserted_at_ms) > @as(i64, pool.max_idle_ms)) {
-                // Expired — close and continue
+                // Expired — free TLS state, close, and continue
+                freePoolEntryTls(self.allocator, entry);
                 std.posix.close(entry.fd);
                 continue;
             }
@@ -75,6 +80,7 @@ pub const ConnectionPool = struct {
         reuse_count: u32,
         timeout_ms: u32,
         max_size: u32,
+        tls_conn_ptr: ?*TlsConn,
     ) !void {
         const effective_timeout = if (timeout_ms == 0) DEFAULT_IDLE_TIMEOUT_MS else timeout_ms;
         const effective_size = if (max_size == 0) DEFAULT_POOL_SIZE else max_size;
@@ -94,6 +100,7 @@ pub const ConnectionPool = struct {
 
         // Enforce max size
         if (pool.entries.items.len >= pool.max_size) {
+            if (tls_conn_ptr) |tc| tls_mod.freeTlsConn(self.allocator, tc);
             std.posix.close(fd);
             return;
         }
@@ -102,9 +109,15 @@ pub const ConnectionPool = struct {
             .fd = fd,
             .reuse_count = reuse_count,
             .inserted_at_ms = std.time.milliTimestamp(),
+            .tls_conn = tls_conn_ptr,
         });
     }
 };
+
+/// Free TLS state from a pool entry if present
+fn freePoolEntryTls(allocator: std.mem.Allocator, entry: ConnectionPool.PoolEntry) void {
+    if (entry.tls_conn) |tc| tls_mod.freeTlsConn(allocator, tc);
+}
 
 // ── Tests ───────────────────────────────────────────────────────────────────
 
@@ -130,7 +143,7 @@ test "connection pool put and get roundtrip" {
     std.posix.close(pipes[0]); // close read end, keep write end as our "fd"
     const fake_fd = pipes[1];
 
-    try pool.put("127.0.0.1:6379", fake_fd, 0, 0, 0);
+    try pool.put("127.0.0.1:6379", fake_fd, 0, 0, 0, null);
 
     const entry = pool.get("127.0.0.1:6379");
     try std.testing.expect(entry != null);
@@ -158,8 +171,8 @@ test "connection pool LIFO order" {
     std.posix.close(pipes2[0]);
     const fd2 = pipes2[1];
 
-    try pool.put("host:1234", fd1, 0, 0, 0);
-    try pool.put("host:1234", fd2, 1, 0, 0);
+    try pool.put("host:1234", fd1, 0, 0, 0, null);
+    try pool.put("host:1234", fd2, 1, 0, 0, null);
 
     // LIFO: fd2 (inserted last) should come out first
     const first = pool.get("host:1234");
@@ -187,8 +200,8 @@ test "connection pool max size enforcement" {
     std.posix.close(pipes2[0]);
     const fd2 = pipes2[1];
 
-    try pool.put("host:80", fd1, 0, 0, 1); // max_size=1
-    try pool.put("host:80", fd2, 0, 0, 1); // should close fd2 (pool full)
+    try pool.put("host:80", fd1, 0, 0, 1, null); // max_size=1
+    try pool.put("host:80", fd2, 0, 0, 1, null); // should close fd2 (pool full)
 
     // Only fd1 should be in the pool
     const entry = pool.get("host:80");
@@ -211,7 +224,7 @@ test "connection pool default values for zero args" {
     const fd = pipes[1];
 
     // Put with 0,0 — should use defaults
-    try pool.put("host:80", fd, 0, 0, 0);
+    try pool.put("host:80", fd, 0, 0, 0, null);
 
     const p = pool.pools.getPtr("host:80").?;
     try std.testing.expectEqual(ConnectionPool.DEFAULT_POOL_SIZE, p.max_size);

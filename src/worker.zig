@@ -1,5 +1,6 @@
 const std = @import("std");
 const xev = @import("xev");
+const log = @import("log.zig");
 const Server = @import("server.zig").Server;
 const Router = @import("router.zig").Router;
 const LuaState = @import("lua_state.zig").LuaState;
@@ -82,6 +83,7 @@ pub const Worker = struct {
         // CRITICAL: Pin thread to core BEFORE any allocations
         // This ensures NUMA-local memory and cache locality
         try pinThreadToCore(ctx.worker_id);
+        log.worker_id = @intCast(ctx.worker_id);
 
         defer ctx.allocator.destroy(ctx);
 

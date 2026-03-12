@@ -220,7 +220,7 @@ pub fn registerHttpExchangeMetatable(lua: *Lua) void {
 
     lua.pop(1);
 
-    std.log.info("HttpExchange metatables registered", .{});
+    std.log.debug("HttpExchange metatables registered", .{});
 }
 
 // === Keyway Module ===
@@ -255,7 +255,7 @@ pub fn registerKeywayModule(lua: *Lua) void {
         \\end
     ) catch unreachable;
 
-    std.log.info("Keyway Lua module registered", .{});
+    std.log.debug("keyway lua module registered", .{});
 }
 
 // === Declarative Route Table Processing ===
@@ -417,7 +417,7 @@ fn registerRoute(
             lua.unref(Lua.PseudoIndex.Registry, lua_ref);
             return error.Runtime;
         };
-        std.log.info("Route registered: {s} {s} -> lua_ref:{d}", .{ method, path, lua_ref });
+        std.log.debug("route registered method={s} path={s} lua_ref={d}", .{ method, path, lua_ref });
     } else {
         // Build middleware chain via __keyway_wrap_chain(handler, middleware_table)
         _ = lua.getGlobal("__keyway_wrap_chain");
@@ -442,6 +442,6 @@ fn registerRoute(
             lua.unref(Lua.PseudoIndex.Registry, lua_ref);
             return error.Runtime;
         };
-        std.log.info("Route registered: {s} {s} -> lua_ref:{d} (with {d} middleware)", .{ method, path, lua_ref, middleware.len });
+        std.log.debug("route registered method={s} path={s} lua_ref={d} middleware={d}", .{ method, path, lua_ref, middleware.len });
     }
 }

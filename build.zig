@@ -73,6 +73,8 @@ fn addSharedDeps(
     });
     compile.addIncludePath(b.path("vendor"));
     compile.linkLibC();
+    compile.linkSystemLibrary("ssl");
+    compile.linkSystemLibrary("crypto");
 
     // GCC 15's crt1.o has .sframe sections with R_X86_64_PC64 relocations that
     // Zig's bundled lld can't handle. --gc-sections discards unreferenced .sframe.
