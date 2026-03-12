@@ -1,24 +1,26 @@
-<h1>Webhook Catcher</h1>
-<p>Generate a unique endpoint URL. Send any HTTP request to it — we'll catch it.</p>
+<div class="page-header">
+  <h1>Webhook Catcher</h1>
+  <p>Generate a unique endpoint URL. Send any HTTP request to it — we'll catch it.</p>
+</div>
 
 <% if error_msg then %>
-<div class="banner-error" style="margin-bottom: var(--space-4);"><%= error_msg %></div>
+<div class="banner-error"><%= error_msg %></div>
 <% end %>
 
 <% if new_id then %>
-<div class="card" style="margin-bottom: var(--space-4); border: 1px solid var(--kiwi-green);">
-  <h2 style="margin-bottom: var(--space-3); font-size: var(--text-base); color: var(--kiwi-green);">Your webhook is ready</h2>
-  <div style="margin-bottom: var(--space-3);">
-    <p style="font-size: var(--text-sm); color: var(--kiwi-seed-light); margin-bottom: var(--space-1);">Send requests here:</p>
-    <code style="display: block; padding: var(--space-2) var(--space-3); background: var(--kiwi-dark); border: 1px solid var(--kiwi-border); border-radius: 4px; font-family: var(--font-code); font-size: var(--text-sm); word-break: break-all;">http://localhost:8080/h/<%= new_id %></code>
+<div class="result-card">
+  <h2>Your webhook is ready</h2>
+  <div style="margin-bottom: 1rem;">
+    <label>Send requests here</label>
+    <code class="catch-url">http://localhost:8080/h/<%= new_id %></code>
   </div>
-  <a href="/hooks/<%= new_id %>" style="font-size: var(--text-sm); color: var(--kiwi-green);">View captured requests →</a>
+  <a href="/hooks/<%= new_id %>">View captured requests →</a>
 </div>
 <% end %>
 
 <div class="card">
-  <h2 style="margin-bottom: var(--space-3); font-size: var(--text-base);">Create Webhook</h2>
+  <h2>Create Webhook</h2>
   <form method="POST" action="/hooks">
-    <button type="submit" class="btn-primary">Generate Endpoint</button>
+    <button type="submit" class="btn btn-primary">Generate Endpoint</button>
   </form>
 </div>

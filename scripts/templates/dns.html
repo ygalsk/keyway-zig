@@ -1,15 +1,17 @@
-<h1>DNS Lookup</h1>
-<p>Resolve a domain name to its A records via live DNS query</p>
+<div class="page-header">
+  <h1>DNS Lookup</h1>
+  <p>Resolve a domain name to its A records via live DNS query</p>
+</div>
 
-<div class="card" style="margin-bottom: var(--space-4);">
-  <h2 style="margin-bottom: var(--space-3); font-size: var(--text-base);">Lookup a Domain</h2>
+<div class="card">
+  <h2>Lookup a Domain</h2>
   <form method="POST" action="/dns">
     <div class="form-group">
-      <label for="domain">Domain:</label>
+      <label for="domain">Domain</label>
       <input type="text" id="domain" name="domain" placeholder="example.com"
              value="<%= domain or '' %>" required>
     </div>
-    <button type="submit" class="btn-primary">Lookup</button>
+    <button type="submit" class="btn btn-primary">Lookup</button>
   </form>
 </div>
 
@@ -19,16 +21,14 @@
 
 <% if records then %>
 <div class="card">
-  <h2 style="margin-bottom: var(--space-3); font-size: var(--text-base);">
-    A Records for <code style="font-family: var(--font-code);"><%= domain %></code>
-  </h2>
-  <table style="width: 100%; border-collapse: collapse;">
+  <h2>A Records for <code><%= domain %></code></h2>
+  <table class="data-table">
     <tr>
-      <th style="text-align: left; padding: var(--space-1) var(--space-2); border-bottom: 2px solid var(--kiwi-green); font-size: var(--text-sm); color: var(--kiwi-seed-light);">IP Address</th>
+      <th>IP Address</th>
     </tr>
     <% for _, ip in ipairs(records) do %>
     <tr>
-      <td style="padding: var(--space-1) var(--space-2); border-bottom: 1px solid var(--kiwi-border); font-family: var(--font-code); font-size: var(--text-sm); color: var(--kiwi-green);"><%= ip %></td>
+      <td style="color: var(--accent);"><%= ip %></td>
     </tr>
     <% end %>
   </table>

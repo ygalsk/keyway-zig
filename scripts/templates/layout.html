@@ -12,11 +12,14 @@
 
 <body>
   <nav>
-    <a href="/" class="brand<% if page == 'home' then %> active<% end %>">Keyway</a>
+    <a href="/" class="brand<% if page == 'home' then %> active<% end %>">keyway</a>
     <a href="/kv" <% if page=='kv' then %> class="active"<% end %>>KV Store</a>
     <a href="/probe"<% if page == 'probe' then %> class="active"<% end %>>Probe</a>
     <a href="/hooks"<% if page == 'hooks' or page == 'hook_detail' then %> class="active"<% end %>>Hooks</a>
+    <a href="/webhook"<% if page == 'webhook' then %> class="active"<% end %>>Webhook</a>
     <a href="/dns"<% if page == 'dns' then %> class="active"<% end %>>DNS</a>
+    <a href="/db"<% if page == 'db' then %> class="active"<% end %>>DB</a>
+    <a href="/scripts"<% if page == 'scripts' then %> class="active"<% end %>>Scripts</a>
   </nav>
 
   <% if error_msg then %>
@@ -25,23 +28,23 @@
         <%= error_msg %>
       </div>
     </div>
-    <% end %>
+  <% end %>
 
-      <% if success_msg then %>
-        <div class="container">
-          <div class="banner-success">
-            <%= success_msg %>
-          </div>
-        </div>
-        <% end %>
+  <% if success_msg then %>
+    <div class="container">
+      <div class="banner-success">
+        <%= success_msg %>
+      </div>
+    </div>
+  <% end %>
 
-          <main class="container" style="padding-top: var(--space-6); padding-bottom: var(--space-6);">
-            <%- content %>
-          </main>
+  <main class="container">
+    <%- content %>
+  </main>
 
-          <footer class="worker-badge">
-            Worker <%= worker_id %>
-          </footer>
+  <footer class="worker-badge">
+    Worker <%= worker_id %>
+  </footer>
 </body>
 
 </html>

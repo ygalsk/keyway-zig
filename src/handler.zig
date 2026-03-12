@@ -7,6 +7,7 @@ const HttpExchange = @import("http_exchange.zig").HttpExchange;
 const Router = @import("router.zig").Router;
 const LuaState = @import("lua_state.zig").LuaState;
 const IoRequest = @import("io_request.zig").IoRequest;
+const ring = @import("ring.zig");
 const tls_mod = @import("tls.zig");
 const TlsConn = tls_mod.TlsConn;
 const TlsContext = tls_mod.TlsContext;
@@ -137,6 +138,14 @@ pub const Connection = struct {
     request_method: []const u8 = "",
     request_path: []const u8 = "",
     request_raw_len: usize = 0, // total bytes consumed by current request (headers + body)
+
+    // I/O ring: per-connection submission/completion buffers for batched I/O
+    sq: ring.SubmissionRing = .{},
+    cq: ring.CompletionRing = .{},
+    pending_completions: u8 = 0,
+    batch_completions: [ring.SubmissionRing.MAX_DEPTH]xev.Completion = undefined,
+    batch_recv_bufs: [ring.SubmissionRing.MAX_DEPTH]?[]u8 = .{null} ** ring.SubmissionRing.MAX_DEPTH,
+    batch_tls_conns: [ring.SubmissionRing.MAX_DEPTH]?*TlsConn = .{null} ** ring.SubmissionRing.MAX_DEPTH,
 
     // Cosocket: non-null when handler is suspended on outbound I/O
     suspended: ?SuspendedState = null,
@@ -440,7 +449,9 @@ pub const Connection = struct {
             const exchange_ptr = try alloc.create(HttpExchange);
             exchange_ptr.* = try HttpExchange.init(alloc, &request, &self.param_cache, &self.query_cache, clean_path);
 
+            self.lua_state.current_connection = self;
             const handler_result = self.lua_state.callLuaHandler(ref, exchange_ptr) catch |err| {
+                self.lua_state.current_connection = null;
                 std.log.err("lua handler error path={s} method={s} err={}", .{ clean_path, request.method, err });
                 self.logAccess(500);
                 self.send500InternalError();
@@ -449,6 +460,7 @@ pub const Connection = struct {
 
             switch (handler_result) {
                 .completed => {
+                    self.lua_state.current_connection = null;
                     self.logAccess(exchange_ptr.status);
                     try self.writeResponse(exchange_ptr);
                 },
@@ -465,7 +477,7 @@ pub const Connection = struct {
                     };
                     self.lua_state.coroutine_ref = 0;
                     self.lua_state.coroutine_thread = null;
-                    self.submitOutboundIO();
+                    self.dispatchIo();
                 },
             }
         } else {
@@ -610,8 +622,13 @@ pub const Connection = struct {
                 self.loop.add(&s.completion);
             },
             .send => {
-                const data = pending.send_data orelse {
+                const raw_data = pending.send_data orelse {
                     self.resumeWithError("send: missing data");
+                    return;
+                };
+                // Arena-dupe send_data before async submission — Lua string may be GC'd across yield
+                const data = self.arena.allocator().dupe(u8, raw_data) catch {
+                    self.resumeWithError("send: arena alloc failed");
                     return;
                 };
                 // TLS-aware send: encrypt if fd has TLS state
@@ -989,14 +1006,389 @@ pub const Connection = struct {
 
     /// Resume coroutine and dispatch based on result
     fn dispatchResume(self: *Connection, thread: *Lua, nresults: c_int, exchange_ptr: *HttpExchange) void {
+        self.lua_state.current_connection = self;
         const resume_result = self.lua_state.resumeHandler(@ptrCast(thread), nresults, exchange_ptr) catch {
+            self.lua_state.current_connection = null;
             self.send500InternalError();
             return;
         };
 
         switch (resume_result) {
-            .completed => self.completeHandler(),
-            .yielded => self.submitOutboundIO(),
+            .completed => {
+                self.lua_state.current_connection = null;
+                self.completeHandler();
+            },
+            .yielded => {
+                self.dispatchIo();
+            },
+        }
+    }
+
+    /// Dispatch I/O after a Lua yield: ring path (SQ has entries) or old single-shot path.
+    fn dispatchIo(self: *Connection) void {
+        if (self.sq.len() > 0) {
+            self.drainSubmissionRing();
+        } else {
+            self.submitOutboundIO();
+        }
+    }
+
+    /// Drain the submission ring: process each IoEntry, submit async I/O to xev.
+    /// Synchronous ops (pool_connect hit, setkeepalive) write CQE immediately.
+    /// After all entries are drained, if pending_completions == 0 we resume immediately.
+    fn drainSubmissionRing(self: *Connection) void {
+        const s = &self.suspended.?;
+        self.cq.reset();
+        var io_index: u8 = 0;
+
+        while (self.sq.pop()) |entry| {
+            switch (entry.*) {
+                .connect => |c| {
+                    self.submitBatchConnect(c.host, c.port, io_index, .connect);
+                    io_index += 1;
+                },
+                .pool_connect => |c| {
+                    // Sync pool hit → write CQE immediately, no xev submission
+                    if (self.lua_state.pool.get(c.pool_name)) |hit| {
+                        // Restore TLS state from pool if present
+                        if (hit.tls_conn) |tls_conn| {
+                            self.lua_state.registerTls(hit.fd, tls_conn) catch {
+                                tls_mod.freeTlsConn(self.lua_state.allocator, tls_conn);
+                            };
+                        }
+                        self.cq.push(.{ .result = @intCast(hit.fd) });
+                    } else {
+                        self.submitBatchConnect(c.host, c.port, io_index, .pool_connect);
+                    }
+                    io_index += 1;
+                },
+                .send => |snd| {
+                    // Arena-dupe send_data before async submission (Lua string lifetime safety)
+                    const duped = self.arena.allocator().dupe(u8, snd.data) catch {
+                        self.cq.push(.{ .result = -1, .err_msg = "send: arena alloc failed" });
+                        io_index += 1;
+                        continue;
+                    };
+                    // TLS-aware send
+                    if (self.lua_state.getTls(snd.fd)) |tls_conn| {
+                        const ciphertext = tlsEncryptAlloc(tls_conn, duped, self.arena.allocator()) orelse {
+                            self.cq.push(.{ .result = -1, .err_msg = "send: tls encrypt failed" });
+                            io_index += 1;
+                            continue;
+                        };
+                        self.batch_completions[io_index] = .{
+                            .op = .{ .send = .{ .fd = snd.fd, .buffer = .{ .slice = ciphertext } } },
+                            .userdata = self,
+                            .callback = onBatchComplete,
+                        };
+                    } else {
+                        self.batch_completions[io_index] = .{
+                            .op = .{ .send = .{ .fd = snd.fd, .buffer = .{ .slice = duped } } },
+                            .userdata = self,
+                            .callback = onBatchComplete,
+                        };
+                    }
+                    self.pending_completions += 1;
+                    self.loop.add(&self.batch_completions[io_index]);
+                    io_index += 1;
+                },
+                .recv => |r| {
+                    // Check for buffered TLS plaintext first
+                    if (self.lua_state.getTls(r.fd)) |tls_conn| {
+                        if (tls_conn.hasPending()) {
+                            var plaintext_buf: [tls_mod.TLS_RECORD_MAX_SIZE]u8 = undefined;
+                            switch (tls_conn.decrypt(&plaintext_buf)) {
+                                .data => |n| {
+                                    const buf_copy = self.arena.allocator().dupe(u8, plaintext_buf[0..n]) catch {
+                                        self.cq.push(.{ .result = -1, .err_msg = "recv: alloc failed" });
+                                        io_index += 1;
+                                        continue;
+                                    };
+                                    self.cq.push(.{ .result = @intCast(n), .buf = buf_copy });
+                                    io_index += 1;
+                                    continue;
+                                },
+                                .want_read => {}, // fall through to kernel recv
+                                .err => {
+                                    self.cq.push(.{ .result = -1, .err_msg = "recv: tls decrypt failed" });
+                                    io_index += 1;
+                                    continue;
+                                },
+                            }
+                        }
+                    }
+                    const buf = self.arena.allocator().alloc(u8, r.max_len) catch {
+                        self.cq.push(.{ .result = -1, .err_msg = "recv: alloc failed" });
+                        io_index += 1;
+                        continue;
+                    };
+                    self.batch_recv_bufs[io_index] = buf;
+                    self.batch_completions[io_index] = .{
+                        .op = .{ .recv = .{ .fd = r.fd, .buffer = .{ .slice = buf } } },
+                        .userdata = self,
+                        .callback = onBatchComplete,
+                    };
+                    self.pending_completions += 1;
+                    self.loop.add(&self.batch_completions[io_index]);
+                    io_index += 1;
+                },
+                .close => |c| {
+                    self.lua_state.removeTls(c.fd);
+                    self.batch_completions[io_index] = .{
+                        .op = .{ .close = .{ .fd = c.fd } },
+                        .userdata = self,
+                        .callback = onBatchComplete,
+                    };
+                    self.pending_completions += 1;
+                    self.loop.add(&self.batch_completions[io_index]);
+                    io_index += 1;
+                },
+                .setkeepalive => |k| {
+                    // Always synchronous — put fd into pool
+                    const tls_ptr: ?*TlsConn = self.lua_state.detachTls(k.fd);
+                    self.lua_state.pool.put(
+                        k.pool_name,
+                        k.fd,
+                        @intCast(k.reuse_count),
+                        @intCast(k.timeout_ms),
+                        @intCast(k.pool_size),
+                        tls_ptr,
+                    ) catch {
+                        self.cq.push(.{ .result = -1, .err_msg = "setkeepalive: pool put failed" });
+                        io_index += 1;
+                        continue;
+                    };
+                    self.cq.push(.{ .result = 1 });
+                    io_index += 1;
+                },
+                .tls_handshake => |t| {
+                    // TLS handshake is multi-step — submit as a sequence via the existing mechanism
+                    // For now, allocate TlsConn and send ClientHello
+                    const tls_conn = self.base_allocator.create(TlsConn) catch {
+                        self.cq.push(.{ .result = -1, .err_msg = "tls_handshake: alloc failed" });
+                        io_index += 1;
+                        continue;
+                    };
+                    tls_conn.* = TlsConn.init(self.base_allocator, self.lua_state.client_tls_ctx.ctx, .client) catch {
+                        self.base_allocator.destroy(tls_conn);
+                        self.cq.push(.{ .result = -1, .err_msg = "tls_handshake: tls init failed" });
+                        io_index += 1;
+                        continue;
+                    };
+                    if (t.sni_host) |host| {
+                        const host_z = self.arena.allocator().dupeZ(u8, host) catch {
+                            tls_mod.freeTlsConn(self.base_allocator, tls_conn);
+                            self.cq.push(.{ .result = -1, .err_msg = "tls_handshake: alloc failed" });
+                            io_index += 1;
+                            continue;
+                        };
+                        tls_conn.setSni(host_z);
+                    }
+
+                    _ = tls_conn.handshake();
+                    const total = tls_conn.drainAll();
+                    if (total == 0) {
+                        tls_mod.freeTlsConn(self.base_allocator, tls_conn);
+                        self.cq.push(.{ .result = -1, .err_msg = "tls_handshake: no data produced" });
+                        io_index += 1;
+                        continue;
+                    }
+
+                    // Store tls_conn for the handshake continuation
+                    self.batch_tls_conns[io_index] = tls_conn;
+                    // For TLS handshake, fall back to single-shot mechanism via suspended state
+                    // since handshake is multi-round-trip. We store in s.outbound_tls and delegate.
+                    s.outbound_tls = tls_conn;
+                    s.outbound_fd = t.fd;
+                    s.pending_op = .tls_handshake;
+                    self.batch_completions[io_index] = .{
+                        .op = .{ .send = .{ .fd = t.fd, .buffer = .{ .slice = tls_conn.encrypt_buf[0..total] } } },
+                        .userdata = self,
+                        .callback = onTlsOutboundHandshakeSend,
+                    };
+                    // TLS handshake hijacks the suspended state — can only have one per batch
+                    self.pending_completions += 1;
+                    self.loop.add(&self.batch_completions[io_index]);
+                    io_index += 1;
+                },
+                .udp_connect => |u| {
+                    self.submitBatchUdpConnect(u.host, u.port, u.timeout_ms, io_index);
+                    io_index += 1;
+                },
+            }
+        }
+        self.sq.reset();
+
+        if (self.pending_completions == 0) {
+            // All ops were synchronous (pool hits, setkeepalive) — resume immediately
+            const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
+            thread.pushInteger(@intCast(self.cq.tail));
+            self.dispatchResume(thread, 1, s.exchange);
+        }
+        // else: wait for onBatchComplete callbacks to decrement pending_completions
+    }
+
+    /// Helper: create TCP socket and submit connect for batched I/O
+    fn submitBatchConnect(self: *Connection, host: []const u8, port: u16, io_index: u8, _: IoRequest.Op) void {
+        const sock = std.posix.socket(
+            std.posix.AF.INET,
+            std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
+            0,
+        ) catch {
+            self.cq.push(.{ .result = -1, .err_msg = "socket creation failed" });
+            return;
+        };
+
+        const addr = std.net.Address.parseIp4(host, port) catch {
+            std.posix.close(sock);
+            self.cq.push(.{ .result = -1, .err_msg = "connect: invalid address" });
+            return;
+        };
+
+        self.batch_completions[io_index] = .{
+            .op = .{ .connect = .{ .socket = sock, .addr = addr } },
+            .userdata = self,
+            .callback = onBatchComplete,
+        };
+        self.pending_completions += 1;
+        self.loop.add(&self.batch_completions[io_index]);
+    }
+
+    /// Helper: create UDP socket and submit connect for batched I/O
+    fn submitBatchUdpConnect(self: *Connection, host: []const u8, port: u16, timeout_ms: u32, io_index: u8) void {
+        const sock = std.posix.socket(
+            std.posix.AF.INET,
+            std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC,
+            0,
+        ) catch {
+            self.cq.push(.{ .result = -1, .err_msg = "udp_connect: socket creation failed" });
+            return;
+        };
+
+        if (timeout_ms > 0) {
+            const tv = std.posix.timeval{
+                .sec = @intCast(timeout_ms / 1000),
+                .usec = @intCast((timeout_ms % 1000) * 1000),
+            };
+            _ = std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+        }
+
+        const addr = std.net.Address.parseIp4(host, port) catch {
+            std.posix.close(sock);
+            self.cq.push(.{ .result = -1, .err_msg = "udp_connect: invalid address" });
+            return;
+        };
+
+        self.batch_completions[io_index] = .{
+            .op = .{ .connect = .{ .socket = sock, .addr = addr } },
+            .userdata = self,
+            .callback = onBatchComplete,
+        };
+        self.pending_completions += 1;
+        self.loop.add(&self.batch_completions[io_index]);
+    }
+
+    /// xev callback for batched I/O completions.
+    /// Writes result into CQ at the correct index. When all completions arrive, resumes Lua once.
+    fn onBatchComplete(
+        userdata: ?*anyopaque,
+        loop: *xev.Loop,
+        completion: *xev.Completion,
+        result: xev.Result,
+    ) xev.CallbackAction {
+        _ = loop;
+
+        const self: *Connection = @ptrCast(@alignCast(userdata.?));
+
+        // Determine which SQE index this completion corresponds to
+        const base = @intFromPtr(&self.batch_completions[0]);
+        const this = @intFromPtr(completion);
+        const sqe_index: u8 = @intCast((this - base) / @sizeOf(xev.Completion));
+
+        const op = completion.op;
+
+        if (op == .connect) {
+            _ = result.connect catch {
+                // Close the socket on connect failure
+                std.posix.close(completion.op.connect.socket);
+                self.cq.push(.{ .result = -1, .err_msg = "connection refused" });
+                self.batchCompletionCheck();
+                return .disarm;
+            };
+            self.cq.push(.{ .result = @intCast(completion.op.connect.socket) });
+        } else if (op == .send) {
+            const bytes_sent = result.send catch {
+                self.cq.push(.{ .result = -1, .err_msg = "send failed" });
+                self.batchCompletionCheck();
+                return .disarm;
+            };
+            self.cq.push(.{ .result = @intCast(bytes_sent) });
+        } else if (op == .recv) {
+            const bytes_read = result.recv catch {
+                self.batch_recv_bufs[sqe_index] = null;
+                self.cq.push(.{ .result = -1, .err_msg = "recv failed" });
+                self.batchCompletionCheck();
+                return .disarm;
+            };
+            if (self.batch_recv_bufs[sqe_index]) |buf| {
+                // Check for TLS decryption
+                if (self.lua_state.getTls(completion.op.recv.fd)) |tls_conn| {
+                    tls_conn.feedCiphertext(buf[0..bytes_read]);
+                    var plaintext_buf: [tls_mod.TLS_RECORD_MAX_SIZE]u8 = undefined;
+                    switch (tls_conn.decrypt(&plaintext_buf)) {
+                        .data => |n| {
+                            const duped = self.arena.allocator().dupe(u8, plaintext_buf[0..n]) catch {
+                                self.cq.push(.{ .result = -1, .err_msg = "recv: alloc failed" });
+                                self.batch_recv_bufs[sqe_index] = null;
+                                self.batchCompletionCheck();
+                                return .disarm;
+                            };
+                            self.cq.push(.{ .result = @intCast(n), .buf = duped });
+                        },
+                        .want_read => {
+                            // Need more ciphertext — re-submit recv (stays in batch)
+                            self.batch_completions[sqe_index] = .{
+                                .op = .{ .recv = .{ .fd = completion.op.recv.fd, .buffer = .{ .slice = buf } } },
+                                .userdata = self,
+                                .callback = onBatchComplete,
+                            };
+                            self.loop.add(&self.batch_completions[sqe_index]);
+                            return .disarm; // Don't decrement pending_completions
+                        },
+                        .err => {
+                            self.cq.push(.{ .result = -1, .err_msg = "recv: tls decrypt failed" });
+                        },
+                    }
+                } else {
+                    self.cq.push(.{ .result = @intCast(bytes_read), .buf = buf[0..bytes_read] });
+                }
+            } else {
+                self.cq.push(.{ .result = -1, .err_msg = "recv: no buffer" });
+            }
+            self.batch_recv_bufs[sqe_index] = null;
+        } else if (op == .close) {
+            _ = result.close catch {
+                self.cq.push(.{ .result = -1, .err_msg = "close failed" });
+                self.batchCompletionCheck();
+                return .disarm;
+            };
+            self.cq.push(.{ .result = 1 });
+        } else {
+            self.cq.push(.{ .result = -1, .err_msg = "unknown op" });
+        }
+
+        self.batchCompletionCheck();
+        return .disarm;
+    }
+
+    /// Check if all batch completions have arrived; if so, resume Lua with CQ count.
+    fn batchCompletionCheck(self: *Connection) void {
+        self.pending_completions -= 1;
+        if (self.pending_completions == 0) {
+            const s = &self.suspended.?;
+            const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
+            thread.pushInteger(@intCast(self.cq.tail));
+            self.dispatchResume(thread, 1, s.exchange);
         }
     }
 
@@ -1096,6 +1488,9 @@ pub const Connection = struct {
 
         // Reset for next request (HTTP/1.1 keep-alive)
         self.suspended = null;
+        self.sq.reset();
+        self.cq.reset();
+        self.pending_completions = 0;
         // Shrink arena if response was large to prevent unbounded growth
         // on keep-alive connections that occasionally serve large responses.
         if (bytes_written > LARGE_RESPONSE_THRESHOLD) {

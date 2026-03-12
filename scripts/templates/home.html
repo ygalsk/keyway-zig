@@ -1,29 +1,26 @@
-<!-- Hero -->
-<div style="background: var(--kiwi-green); color: var(--kiwi-white); border-radius: 0.75rem; padding: var(--space-8) var(--space-6); margin-bottom: var(--space-6); text-align: center;">
-  <h1 style="font-size: var(--text-4xl); font-weight: var(--weight-bold); color: var(--kiwi-white); margin-bottom: var(--space-2); line-height: var(--leading-tight);">Keyway</h1>
-  <p style="font-size: var(--text-xl); color: var(--kiwi-cream); margin-bottom: var(--space-3); font-style: italic;">A highly opinionated engine with no opinions</p>
-  <p style="font-size: var(--text-base); color: var(--kiwi-cream-dark); max-width: 40rem; margin: 0 auto;">HTTP engine powered by Zig, controlled by Lua. You write the logic, Zig handles the rest.</p>
+<section class="hero">
+  <h1>keyway</h1>
+  <p class="tagline">A highly opinionated engine with no opinions</p>
+  <p>HTTP engine powered by Zig, controlled by Lua. You write the logic, Zig handles the rest.</p>
+</section>
+
+<div class="feature-grid">
+  <div class="feature-card">
+    <h2>Write Handlers in Lua</h2>
+    <p>Define routes and logic in plain Lua. Change behavior without recompiling. No restarts.</p>
+  </div>
+  <div class="feature-card">
+    <h2>One Core, One Thread, One State</h2>
+    <p>Every CPU core runs its own isolated event loop. No locks, no sharing, no surprises.</p>
+  </div>
+  <div class="feature-card">
+    <h2>Zero-Copy from Kernel to Handler</h2>
+    <p>Request bytes stay in one buffer from recv to response. Parse, route, respond — nothing moves.</p>
+  </div>
 </div>
 
-<!-- Feature highlights -->
-<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: var(--space-3); margin-bottom: var(--space-6);">
-  <div class="card">
-    <h2 style="font-size: var(--text-base); font-weight: var(--weight-semibold); color: var(--kiwi-green); margin-bottom: var(--space-2);">Write Handlers in Lua</h2>
-    <p style="font-size: var(--text-sm); color: var(--kiwi-seed-light); line-height: var(--leading-relaxed);">Define routes and logic in plain Lua. Change behavior without recompiling. No restarts.</p>
-  </div>
-  <div class="card">
-    <h2 style="font-size: var(--text-base); font-weight: var(--weight-semibold); color: var(--kiwi-green); margin-bottom: var(--space-2);">One Core, One Thread, One State</h2>
-    <p style="font-size: var(--text-sm); color: var(--kiwi-seed-light); line-height: var(--leading-relaxed);">Every CPU core runs its own isolated event loop. No locks, no sharing, no surprises.</p>
-  </div>
-  <div class="card">
-    <h2 style="font-size: var(--text-base); font-weight: var(--weight-semibold); color: var(--kiwi-green); margin-bottom: var(--space-2);">Zero-Copy from Kernel to Handler</h2>
-    <p style="font-size: var(--text-sm); color: var(--kiwi-seed-light); line-height: var(--leading-relaxed);">Request bytes stay in one buffer from recv to response. Parse, route, respond — nothing moves.</p>
-  </div>
-</div>
-
-<!-- Code example -->
-<div class="card" style="margin-bottom: var(--space-6);">
-  <h2 style="font-size: var(--text-base); font-weight: var(--weight-semibold); margin-bottom: var(--space-3);">The Interface</h2>
+<div class="card">
+  <h2>The Interface</h2>
   <pre><code>keyway.routes = {
     ["/users/{id}"] = {
         GET = function(ctx)
@@ -33,30 +30,34 @@
         end,
     },
 }</code></pre>
-  <p style="font-size: var(--text-sm); color: var(--kiwi-seed-light); margin-top: var(--space-3);">No <code style="font-family: var(--font-code); font-size: var(--text-xs); background: var(--kiwi-cream-dark); padding: 0.1em 0.3em; border-radius: 0.2em;">send()</code>. No <code style="font-family: var(--font-code); font-size: var(--text-xs); background: var(--kiwi-cream-dark); padding: 0.1em 0.3em; border-radius: 0.2em;">write()</code>. Set fields on <code style="font-family: var(--font-code); font-size: var(--text-xs); background: var(--kiwi-cream-dark); padding: 0.1em 0.3em; border-radius: 0.2em;">ctx</code> — Lua expresses intent, Zig commits I/O.</p>
+  <p class="metric">No <code>send()</code>. No <code>write()</code>. Set fields on <code>ctx</code> — Lua expresses intent, Zig commits I/O.</p>
 </div>
 
-<!-- Tools -->
-<h2 style="font-size: var(--text-lg); font-weight: var(--weight-semibold); margin-bottom: var(--space-3);">Developer Tools</h2>
-<div style="display: grid; grid-template-columns: repeat(auto-fit, minmax(16rem, 1fr)); gap: var(--space-3);">
-  <div class="card">
-    <h3 style="font-size: var(--text-base); font-weight: var(--weight-semibold); margin-bottom: var(--space-2);">HTTP Probe</h3>
-    <p style="font-size: var(--text-sm); color: var(--kiwi-seed-light); margin-bottom: var(--space-3); line-height: var(--leading-relaxed);">Inspect HTTP responses from any public URL — status code, headers, and round-trip timing.</p>
-    <a href="/probe" class="btn-primary" style="font-size: var(--text-sm); padding: var(--space-1) var(--space-3);">Open Tool</a>
+<h2>Developer Tools</h2>
+<div class="feature-grid">
+  <div class="tool-card">
+    <h3>HTTP Probe</h3>
+    <p>Inspect HTTP responses from any public URL — status code, headers, and round-trip timing.</p>
+    <a href="/probe" class="btn btn-primary">Open Tool</a>
   </div>
-  <div class="card">
-    <h3 style="font-size: var(--text-base); font-weight: var(--weight-semibold); margin-bottom: var(--space-2);">DNS Lookup</h3>
-    <p style="font-size: var(--text-sm); color: var(--kiwi-seed-light); margin-bottom: var(--space-3); line-height: var(--leading-relaxed);">Resolve domain names to A records via a live UDP DNS query to a public resolver.</p>
-    <a href="/dns" class="btn-primary" style="font-size: var(--text-sm); padding: var(--space-1) var(--space-3);">Open Tool</a>
+  <div class="tool-card">
+    <h3>DNS Lookup</h3>
+    <p>Resolve domain names to A records via a live UDP DNS query to a public resolver.</p>
+    <a href="/dns" class="btn btn-primary">Open Tool</a>
   </div>
-  <div class="card">
-    <h3 style="font-size: var(--text-base); font-weight: var(--weight-semibold); margin-bottom: var(--space-2);">Webhook Catcher</h3>
-    <p style="font-size: var(--text-sm); color: var(--kiwi-seed-light); margin-bottom: var(--space-3); line-height: var(--leading-relaxed);">Generate a unique endpoint, send requests to it, and inspect everything that arrives.</p>
-    <a href="/hooks" class="btn-primary" style="font-size: var(--text-sm); padding: var(--space-1) var(--space-3);">Open Tool</a>
+  <div class="tool-card">
+    <h3>Webhook Catcher</h3>
+    <p>Generate a unique endpoint, send requests to it, and inspect everything that arrives.</p>
+    <a href="/hooks" class="btn btn-primary">Open Tool</a>
   </div>
-  <div class="card">
-    <h3 style="font-size: var(--text-base); font-weight: var(--weight-semibold); margin-bottom: var(--space-2);">KV Store</h3>
-    <p style="font-size: var(--text-sm); color: var(--kiwi-seed-light); margin-bottom: var(--space-3); line-height: var(--leading-relaxed);">Set, get, and delete key-value pairs backed by Redis over a raw RESP2 cosocket connection.</p>
-    <a href="/kv" class="btn-primary" style="font-size: var(--text-sm); padding: var(--space-1) var(--space-3);">Open Tool</a>
+  <div class="tool-card">
+    <h3>KV Store</h3>
+    <p>Set, get, and delete key-value pairs backed by Redis over a raw RESP2 cosocket connection.</p>
+    <a href="/kv" class="btn btn-primary">Open Tool</a>
+  </div>
+  <div class="tool-card">
+    <h3>Postgres Notes</h3>
+    <p>A guestbook with full CRUD backed by PostgreSQL (Neon) via pgmoon over the cosocket pipeline.</p>
+    <a href="/db" class="btn btn-primary">Open Tool</a>
   </div>
 </div>

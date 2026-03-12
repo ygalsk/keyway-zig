@@ -1,5 +1,32 @@
 -- keyway.dns — DNS A-record lookup via UDP cosocket
 -- Sends a raw DNS query to 8.8.8.8:53 and parses the A record response.
+-- Also provides resolve_host() for FFI-based getaddrinfo resolution.
+
+local ffi = require("ffi")
+pcall(ffi.cdef, [[
+    struct addrinfo_hint {
+        int ai_flags;
+        int ai_family;
+        int ai_socktype;
+        int ai_protocol;
+        unsigned int ai_addrlen;
+        void *ai_addr;
+        char *ai_canonname;
+        void *ai_next;
+    };
+    struct sockaddr_in {
+        unsigned short sin_family;
+        unsigned short sin_port;
+        unsigned char sin_addr[4];
+        char sin_zero[8];
+    };
+    int getaddrinfo(const char *node, const char *service,
+        const struct addrinfo_hint *hints, struct addrinfo_hint **res);
+    void freeaddrinfo(struct addrinfo_hint *res);
+    const char* inet_ntop(int af, const void* src, char* dst, unsigned int size);
+]])
+local AF_INET = 2
+local SOCK_STREAM = 1
 
 local M = {}
 
@@ -107,6 +134,27 @@ local function parse_response(data)
     end
 
     return records
+end
+
+--- Resolve hostname to IPv4 address string via FFI getaddrinfo.
+--- Skips resolution if already an IP address.
+--- Returns ip or nil + error string.
+function M.resolve_host(hostname)
+    if hostname:match("^%d+%.%d+%.%d+%.%d+$") then return hostname end
+    local res = ffi.new("struct addrinfo_hint*[1]")
+    local hints = ffi.new("struct addrinfo_hint")
+    hints.ai_family = AF_INET
+    hints.ai_socktype = SOCK_STREAM
+    local rc = ffi.C.getaddrinfo(hostname, nil, hints, res)
+    if rc ~= 0 then
+        return nil, "DNS resolution failed for: " .. hostname
+    end
+    local sa = ffi.cast("struct sockaddr_in*", res[0].ai_addr)
+    local buf = ffi.new("char[16]")
+    ffi.C.inet_ntop(AF_INET, sa.sin_addr, buf, 16)
+    local ip = ffi.string(buf)
+    ffi.C.freeaddrinfo(res[0])
+    return ip
 end
 
 --- Perform a DNS A-record lookup for `domain`.

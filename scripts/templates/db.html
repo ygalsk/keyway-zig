@@ -1,0 +1,66 @@
+<div class="page-header">
+  <h1>Postgres Notes</h1>
+  <p>A guestbook backed by PostgreSQL (Neon) via pgmoon over cosockets</p>
+</div>
+
+<% if result_msg then %>
+<div class="result-card">
+  <h2>Result</h2>
+  <p class="metric"><%= result_msg %></p>
+</div>
+<% end %>
+
+<div class="card">
+  <h2>Add a Note</h2>
+  <form method="POST" action="/db">
+    <input type="hidden" name="action" value="add">
+    <div class="form-group">
+      <label for="author">Author</label>
+      <input type="text" id="author" name="author" placeholder="anonymous" maxlength="100">
+    </div>
+    <div class="form-group">
+      <label for="content">Note</label>
+      <textarea id="content" name="content" placeholder="Write something..." required></textarea>
+    </div>
+    <button type="submit" class="btn btn-primary">Add Note</button>
+  </form>
+</div>
+
+<div class="card">
+  <h2>Notes</h2>
+  <% if notes and #notes > 0 then %>
+  <table class="data-table">
+    <tr>
+      <th>ID</th>
+      <th>Author</th>
+      <th>Note</th>
+      <th>Created</th>
+      <th></th>
+    </tr>
+    <% for _, note in ipairs(notes) do %>
+    <tr>
+      <td><%= note.id %></td>
+      <td><%= note.author %></td>
+      <td class="truncate"><%= note.content %></td>
+      <td style="white-space: nowrap; color: var(--text-secondary);"><%= note.created_at %></td>
+      <td style="text-align: right;">
+        <form method="POST" action="/db" style="display: inline;">
+          <input type="hidden" name="action" value="delete">
+          <input type="hidden" name="id" value="<%= note.id %>">
+          <button type="submit" class="btn btn-danger" style="padding: 0.15em 0.5em; font-size: 0.75rem;">Del</button>
+        </form>
+      </td>
+    </tr>
+    <% end %>
+  </table>
+  <% else %>
+  <p class="empty-state">No notes yet</p>
+  <% end %>
+</div>
+
+<% if reuse_count or server_time then %>
+<div class="metric" style="text-align: right; margin-top: 0.5rem;">
+  <% if reuse_count then %>Connection reuse: <%= reuse_count %><% end %>
+  <% if server_time then %> &middot; Server time: <%= server_time %><% end %>
+</div>
+<% end %>

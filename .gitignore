@@ -14,9 +14,15 @@ deps.zig
 *.swo
 *~
 
+# Environment secrets
+.env
+
 # OS
 .DS_Store
 Thumbs.db
+
+# TLS certificates
+certs/
 
 # Profiling
 perf.data*

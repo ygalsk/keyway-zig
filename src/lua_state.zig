@@ -6,6 +6,7 @@ const Router = @import("router.zig").Router;
 const lua_api = @import("lua_api.zig");
 const IoRequest = @import("io_request.zig").IoRequest;
 const io_request = @import("io_request.zig");
+const ring_api = @import("ring_api.zig");
 const ConnectionPool = @import("connection_pool.zig").ConnectionPool;
 const tls = @import("tls.zig");
 const TlsConn = tls.TlsConn;
@@ -40,6 +41,10 @@ pub const LuaState = struct {
 
     // Connection pool for cosocket keepalive (per-worker, outlives requests)
     pool: ConnectionPool,
+
+    // Current connection being served (set during handler call/resume, cleared on completion)
+    // Used by ring C bridge functions to access the Connection's SQ/CQ.
+    current_connection: ?*anyopaque = null,
 
     // Outbound TLS: client context (one per worker) + fd→TLS mapping (persists across yields)
     client_tls_ctx: ClientTlsContext,
@@ -278,6 +283,10 @@ pub const LuaState = struct {
             .{ "__keyway_pool_setkeepalive", io_request.keyway_pool_setkeepalive },
             .{ "__keyway_io_udp_connect", io_request.keyway_io_udp_connect },
             .{ "__keyway_io_sslhandshake", io_request.keyway_io_sslhandshake },
+            // Ring API: batched I/O
+            .{ "__keyway_ring_push", ring_api.keyway_ring_push },
+            .{ "__keyway_ring_submit", ring_api.keyway_ring_submit },
+            .{ "__keyway_ring_result", ring_api.keyway_ring_result },
         };
 
         inline for (funcs) |entry| {
