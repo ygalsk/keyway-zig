@@ -1,30 +1,22 @@
 const std = @import("std");
 const Lua = @import("luajit").Lua;
 const LuaState = @import("lua_state.zig").LuaState;
+const IoEntry = @import("ring.zig").IoEntry;
 const tls_mod = @import("tls.zig");
 const TlsConn = tls_mod.TlsConn;
 
 extern "c" fn lua_yield(L: *anyopaque, nresults: c_int) c_int;
 
-/// Describes a single pending outbound I/O intent from Lua.
-/// Written by C yield functions, read by Zig after lua_resume returns LUA_YIELD.
-pub const IoRequest = struct {
-    op: Op = .none,
-    fd: std.posix.socket_t = 0,
-    host: ?[]const u8 = null,
-    port: u16 = 0,
-    send_data: ?[]const u8 = null,
-    max_len: usize = 0,
-
-    pool_name: ?[]const u8 = null,
-    timeout_ms: u32 = 0,
-
-    pub const Op = enum { connect, send, recv, close, pool_connect, udp_connect, tls_handshake, none };
-};
+/// TLS context selector — which SSL_CTX to use for a handshake.
+pub const TlsMode = enum { verify, insecure, custom };
 
 /// Helper: extract *LuaState from closure upvalue(1)
 inline fn getState(lua: *Lua) *LuaState {
-    const ptr = lua.toUserdata(Lua.PseudoIndex.upvalue(1)) orelse @panic("cosocket: expected LuaState upvalue");
+    const ptr = lua.toUserdata(Lua.PseudoIndex.upvalue(1)) orelse {
+        lua.pushString("cosocket: expected LuaState upvalue");
+        lua.raiseError();
+        unreachable;
+    };
     return @as(*LuaState, @ptrCast(@alignCast(ptr)));
 }
 
@@ -39,11 +31,10 @@ pub fn keyway_io_connect(lua: *Lua) callconv(.c) c_int {
     };
     const port_raw = lua.toInteger(2);
 
-    state.pending_io = .{
-        .op = .connect,
+    state.pending_io = .{ .connect = .{
         .host = std.mem.span(host_cstr),
         .port = @intCast(port_raw),
-    };
+    } };
 
     return lua_yield(@ptrCast(lua), 0);
 }
@@ -60,11 +51,10 @@ pub fn keyway_io_send(lua: *Lua) callconv(.c) c_int {
         return 0;
     };
 
-    state.pending_io = .{
-        .op = .send,
+    state.pending_io = .{ .send = .{
         .fd = @intCast(fd_raw),
-        .send_data = data,
-    };
+        .data = data,
+    } };
 
     return lua_yield(@ptrCast(lua), 0);
 }
@@ -76,11 +66,10 @@ pub fn keyway_io_recv(lua: *Lua) callconv(.c) c_int {
     const fd_raw = lua.toInteger(1);
     const max_len_raw = lua.toInteger(2);
 
-    state.pending_io = .{
-        .op = .recv,
+    state.pending_io = .{ .recv = .{
         .fd = @intCast(fd_raw),
         .max_len = @intCast(max_len_raw),
-    };
+    } };
 
     return lua_yield(@ptrCast(lua), 0);
 }
@@ -91,10 +80,9 @@ pub fn keyway_io_close(lua: *Lua) callconv(.c) c_int {
 
     const fd_raw = lua.toInteger(1);
 
-    state.pending_io = .{
-        .op = .close,
+    state.pending_io = .{ .close = .{
         .fd = @intCast(fd_raw),
-    };
+    } };
 
     return lua_yield(@ptrCast(lua), 0);
 }
@@ -134,12 +122,11 @@ pub fn keyway_pool_connect(lua: *Lua) callconv(.c) c_int {
     }
 
     // Pool miss — async connect via io_uring
-    state.pending_io = .{
-        .op = .pool_connect,
+    state.pending_io = .{ .pool_connect = .{
         .host = std.mem.span(host_cstr),
         .port = @intCast(port_raw),
         .pool_name = pool_name,
-    };
+    } };
 
     return lua_yield(@ptrCast(lua), 0);
 }
@@ -181,9 +168,10 @@ pub fn keyway_pool_setkeepalive(lua: *Lua) callconv(.c) c_int {
     return 1;
 }
 
-/// __keyway_io_sslhandshake(fd, sni_host) → yields, resumes with 1 or nil,err
+/// __keyway_io_sslhandshake(fd, sni_host, no_verify_or_mode) → yields, resumes with 1 or nil,err
 /// Initiates a TLS handshake on an existing connected socket.
 /// sni_host is optional — used for SNI and hostname verification.
+/// no_verify_or_mode: boolean (true=insecure) or string ("verify","insecure","custom")
 pub fn keyway_io_sslhandshake(lua: *Lua) callconv(.c) c_int {
     const state = getState(lua);
 
@@ -193,11 +181,42 @@ pub fn keyway_io_sslhandshake(lua: *Lua) callconv(.c) c_int {
     else
         null;
 
-    state.pending_io = .{
-        .op = .tls_handshake,
+    // Parse TLS mode from arg 3: boolean (backward compat) or string
+    const tls_mode: TlsMode = if (lua.isString(3)) blk: {
+        const mode_str = std.mem.span(lua.toString(3) catch break :blk TlsMode.verify);
+        if (std.mem.eql(u8, mode_str, "custom")) break :blk TlsMode.custom;
+        if (std.mem.eql(u8, mode_str, "insecure")) break :blk TlsMode.insecure;
+        break :blk TlsMode.verify;
+    } else if (lua.isBoolean(3) and lua.toBoolean(3))
+        TlsMode.insecure
+    else
+        TlsMode.verify;
+
+    state.pending_io = .{ .tls_handshake = .{
         .fd = @intCast(fd_raw),
-        .host = sni_host,
+        .sni_host = sni_host,
+        .tls_mode = tls_mode,
+    } };
+
+    return lua_yield(@ptrCast(lua), 0);
+}
+
+/// __keyway_ws_send(data) → yields, resumes after WS frame is sent
+pub fn keyway_ws_send(lua: *Lua) callconv(.c) c_int {
+    const state = getState(lua);
+
+    // arg 1 = self (WsContext userdata, from ws:send() colon syntax), arg 2 = data string
+    const data = lua.toLString(2) catch {
+        lua.pushString("ws_send: data must be a string");
+        lua.raiseError();
+        return 0;
     };
+
+    // Use send with fd=0 as ws_send signal (conn_ws checks for this)
+    state.pending_io = .{ .send = .{
+        .fd = 0,
+        .data = data,
+    } };
 
     return lua_yield(@ptrCast(lua), 0);
 }
@@ -217,12 +236,11 @@ pub fn keyway_io_udp_connect(lua: *Lua) callconv(.c) c_int {
     const port_raw = lua.toInteger(2);
     const timeout_raw = lua.toInteger(3);
 
-    state.pending_io = .{
-        .op = .udp_connect,
+    state.pending_io = .{ .udp_connect = .{
         .host = std.mem.span(host_cstr),
         .port = @intCast(port_raw),
         .timeout_ms = @intCast(timeout_raw),
-    };
+    } };
 
     return lua_yield(@ptrCast(lua), 0);
 }

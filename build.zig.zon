@@ -20,6 +20,5 @@
         "build.zig.zon",
         "src",
         "scripts",
-        "examples",
     },
 }

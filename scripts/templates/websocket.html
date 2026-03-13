@@ -1,0 +1,236 @@
+<div class="page-header page-header-ws">
+  <h1>WebSocket</h1>
+  <p>Bidirectional echo over a persistent WebSocket connection</p>
+</div>
+
+<div class="card">
+  <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem;">
+    <h2 style="margin-bottom: 0;">Connection</h2>
+    <span id="ws-status" class="ws-status ws-status-closed" role="status" aria-live="polite">&#9679; disconnected</span>
+  </div>
+  <div class="ws-endpoint" id="ws-url"></div>
+  <div style="display: flex; gap: 0.75rem; margin-top: 1rem;">
+    <button id="btn-connect" class="btn btn-primary" onclick="wsConnect()">Connect</button>
+    <button id="btn-disconnect" class="btn btn-danger" onclick="wsDisconnect()" disabled>Disconnect</button>
+  </div>
+</div>
+
+<div class="card">
+  <h2>Send Message</h2>
+  <div style="display: flex; gap: 0.75rem; align-items: flex-end;">
+    <div class="form-group" style="flex: 1; margin-bottom: 0;">
+      <label for="ws-input">Message</label>
+      <input type="text" id="ws-input" placeholder="Type a message..." disabled
+             onkeydown="if(event.key==='Enter')wsSend()">
+    </div>
+    <button id="btn-send" class="btn btn-primary" onclick="wsSend()" disabled>Send</button>
+  </div>
+  <div class="quick-actions">
+    <button class="btn-ghost" onclick="wsSendQuick('hello')">hello</button>
+    <button class="btn-ghost" onclick="wsSendQuick('ping')">ping</button>
+    <button class="btn-ghost" onclick="wsSendQuick(JSON.stringify({test:true}))">{"test":true}</button>
+  </div>
+</div>
+
+<div class="card">
+  <div style="display: flex; align-items: center; justify-content: space-between; margin-bottom: 1rem;">
+    <h2 style="margin-bottom: 0;">Messages</h2>
+    <button class="btn-ghost" onclick="clearLog()">Clear</button>
+  </div>
+  <div id="ws-log" class="ws-log">
+    <div class="empty-state">No messages yet &mdash; connect and send something</div>
+  </div>
+</div>
+
+<style>
+  .ws-status {
+    font-family: var(--font-mono);
+    font-size: 0.75rem;
+    font-weight: 500;
+    padding: 0.125rem 0.625rem;
+    border-radius: 2px;
+    border: 1px solid;
+    text-transform: uppercase;
+    letter-spacing: 0.06em;
+  }
+
+  .ws-status-open {
+    color: var(--accent);
+    border-color: var(--accent);
+    background: rgba(115,180,76,0.08);
+  }
+
+  .ws-status-closed {
+    color: var(--text-muted);
+    border-color: var(--border);
+  }
+
+  .ws-status-connecting {
+    color: var(--warning);
+    border-color: var(--warning);
+    background: rgba(251,191,36,0.08);
+  }
+
+  .ws-endpoint {
+    font-family: var(--font-mono);
+    font-size: 0.8125rem;
+    color: var(--accent);
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    padding: 0.625rem 1rem;
+    word-break: break-all;
+  }
+
+  .ws-log {
+    background: var(--bg);
+    border: 1px solid var(--border);
+    border-radius: 2px;
+    max-height: 24rem;
+    overflow-y: auto;
+    scrollbar-width: thin;
+    scrollbar-color: var(--border) var(--bg);
+  }
+
+  .ws-log::-webkit-scrollbar { width: 6px; }
+  .ws-log::-webkit-scrollbar-track { background: var(--bg); }
+  .ws-log::-webkit-scrollbar-thumb { background: var(--border); border-radius: 3px; }
+
+  .ws-msg {
+    display: flex;
+    gap: 0.75rem;
+    padding: 0.5rem 1rem;
+    font-family: var(--font-mono);
+    font-size: 0.8125rem;
+    border-bottom: 1px solid rgba(42,53,40,0.5);
+    animation: slideIn 0.2s ease-out;
+  }
+
+  .ws-msg:last-child { border-bottom: none; }
+
+  .ws-msg-dir {
+    flex-shrink: 0;
+    font-weight: 500;
+    width: 1.25rem;
+    text-align: center;
+    user-select: none;
+  }
+
+  .ws-msg-out .ws-msg-dir { color: var(--info); }
+  .ws-msg-in .ws-msg-dir { color: var(--accent); }
+  .ws-msg-sys .ws-msg-dir { color: var(--text-muted); }
+  .ws-msg-err .ws-msg-dir { color: var(--error); }
+
+  .ws-msg-body {
+    flex: 1;
+    word-break: break-all;
+    color: var(--text-primary);
+  }
+
+  .ws-msg-sys .ws-msg-body { color: var(--text-muted); font-style: italic; }
+  .ws-msg-err .ws-msg-body { color: var(--error); }
+
+  .ws-msg-time {
+    flex-shrink: 0;
+    font-size: 0.6875rem;
+    color: var(--text-muted);
+    align-self: center;
+  }
+
+  .page-header-ws h1::before {
+    content: '^ ';
+    color: var(--accent-light);
+    font-family: var(--font-mono);
+  }
+</style>
+
+<script>
+  var ws = null;
+  var logEl = document.getElementById('ws-log');
+  var inputEl = document.getElementById('ws-input');
+  var statusEl = document.getElementById('ws-status');
+  var urlEl = document.getElementById('ws-url');
+  var btnConnect = document.getElementById('btn-connect');
+  var btnDisconnect = document.getElementById('btn-disconnect');
+  var btnSend = document.getElementById('btn-send');
+  var hasMessages = false;
+
+  var proto = location.protocol === 'https:' ? 'wss:' : 'ws:';
+  var wsUrl = proto + '//' + location.host + '/ws';
+  urlEl.textContent = wsUrl;
+
+  function setStatus(state) {
+    statusEl.className = 'ws-status ws-status-' + state;
+    var icon = state === 'open' ? '\u2713 ' : state === 'connecting' ? '\u25CB ' : '\u25CF ';
+    var label = state === 'open' ? 'connected' : state;
+    statusEl.textContent = icon + label;
+    btnConnect.disabled = state === 'open' || state === 'connecting';
+    btnDisconnect.disabled = state !== 'open';
+    btnSend.disabled = state !== 'open';
+    inputEl.disabled = state !== 'open';
+  }
+
+  function addMsg(dir, symbol, body) {
+    if (!hasMessages) { logEl.innerHTML = ''; hasMessages = true; }
+    var row = document.createElement('div');
+    row.className = 'ws-msg ws-msg-' + dir;
+    var now = new Date();
+    var ts = String(now.getHours()).padStart(2,'0') + ':' +
+             String(now.getMinutes()).padStart(2,'0') + ':' +
+             String(now.getSeconds()).padStart(2,'0') + '.' +
+             String(now.getMilliseconds()).padStart(3,'0');
+    row.innerHTML =
+      '<span class="ws-msg-dir">' + symbol + '</span>' +
+      '<span class="ws-msg-body"></span>' +
+      '<span class="ws-msg-time">' + ts + '</span>';
+    row.querySelector('.ws-msg-body').textContent = body;
+    logEl.appendChild(row);
+    logEl.scrollTop = logEl.scrollHeight;
+  }
+
+  function wsConnect() {
+    if (ws) return;
+    setStatus('connecting');
+    ws = new WebSocket(wsUrl);
+    ws.onopen = function() {
+      setStatus('open');
+      addMsg('sys', '*', 'connected to ' + wsUrl);
+      inputEl.focus();
+    };
+    ws.onmessage = function(e) {
+      addMsg('in', '\u2190', e.data);
+    };
+    ws.onclose = function(e) {
+      addMsg('sys', '*', 'disconnected (code ' + e.code + ')');
+      setStatus('closed');
+      ws = null;
+    };
+    ws.onerror = function() {
+      addMsg('err', '!', 'connection error');
+    };
+  }
+
+  function wsDisconnect() {
+    if (ws) ws.close();
+  }
+
+  function wsSend() {
+    var msg = inputEl.value.trim();
+    if (!msg || !ws) return;
+    ws.send(msg);
+    addMsg('out', '\u2192', msg);
+    inputEl.value = '';
+    inputEl.focus();
+  }
+
+  function wsSendQuick(msg) {
+    if (!ws || ws.readyState !== 1) { wsConnect(); return; }
+    ws.send(msg);
+    addMsg('out', '\u2192', msg);
+  }
+
+  function clearLog() {
+    logEl.innerHTML = '<div class="empty-state">No messages yet &mdash; connect and send something</div>';
+    hasMessages = false;
+  }
+</script>

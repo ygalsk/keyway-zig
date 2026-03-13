@@ -8,21 +8,12 @@ extern "c" fn lua_yield(L: *anyopaque, nresults: c_int) c_int;
 
 /// Helper: extract *LuaState from closure upvalue(1)
 inline fn getState(lua: *Lua) *LuaState {
-    const ptr = lua.toUserdata(Lua.PseudoIndex.upvalue(1)) orelse @panic("ring_api: expected LuaState upvalue");
+    const ptr = lua.toUserdata(Lua.PseudoIndex.upvalue(1)) orelse {
+        lua.pushString("ring_api: expected LuaState upvalue");
+        lua.raiseError();
+        unreachable;
+    };
     return @as(*LuaState, @ptrCast(@alignCast(ptr)));
-}
-
-/// Helper: get the Connection's SubmissionRing from the current_connection pointer.
-/// Returns null if no connection is active.
-inline fn getSQ(state: *LuaState) ?*ring.SubmissionRing {
-    const conn_ptr = state.current_connection orelse return null;
-    // current_connection is *Connection stored as *anyopaque
-    // We need to access the sq field. Since Connection is defined in handler.zig,
-    // we use @fieldParentPtr or direct offset. But since we store *anyopaque,
-    // we cast to the Connection type.
-    const Connection = @import("handler.zig").Connection;
-    const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-    return &conn.sq;
 }
 
 /// Helper: extract a required string argument from the Lua stack, raising a Lua error on failure.
@@ -32,14 +23,6 @@ inline fn requireString(lua: *Lua, idx: i32, err_msg: [:0]const u8) []const u8 {
         lua.raiseError();
         unreachable;
     });
-}
-
-/// Helper: get the Connection's CompletionRing.
-inline fn getCQ(state: *LuaState) ?*ring.CompletionRing {
-    const conn_ptr = state.current_connection orelse return null;
-    const Connection = @import("handler.zig").Connection;
-    const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
-    return &conn.cq;
 }
 
 /// __keyway_ring_push(op_str, ...) — Push one IoEntry onto the SQ. Never yields.
@@ -55,11 +38,6 @@ inline fn getCQ(state: *LuaState) ?*ring.CompletionRing {
 ///   __keyway_ring_push("tls_handshake", fd, sni_host_or_nil)
 pub fn keyway_ring_push(lua: *Lua) callconv(.c) c_int {
     const state = getState(lua);
-    const sq = getSQ(state) orelse {
-        lua.pushString("ring_push: no active request");
-        lua.raiseError();
-        return 0;
-    };
 
     const op = requireString(lua, 1, "ring_push: op must be a string");
 
@@ -105,17 +83,35 @@ pub fn keyway_ring_push(lua: *Lua) callconv(.c) c_int {
             if (lua.toString(3)) |s| std.mem.span(s) else |_| null
         else
             null;
-        break :blk .{ .tls_handshake = .{ .fd = fd, .sni_host = sni_host } };
+        // Arg 4: boolean (backward compat) or string mode
+        const TlsMode = @import("io_request.zig").TlsMode;
+        const tls_mode: TlsMode = if (lua.isString(4)) mode_blk: {
+            const mode_str = std.mem.span(lua.toString(4) catch break :mode_blk TlsMode.verify);
+            if (std.mem.eql(u8, mode_str, "custom")) break :mode_blk TlsMode.custom;
+            if (std.mem.eql(u8, mode_str, "insecure")) break :mode_blk TlsMode.insecure;
+            break :mode_blk TlsMode.verify;
+        } else if (lua.isBoolean(4) and lua.toBoolean(4))
+            TlsMode.insecure
+        else
+            TlsMode.verify;
+        break :blk .{ .tls_handshake = .{ .fd = fd, .sni_host = sni_host, .tls_mode = tls_mode } };
     } else {
         lua.pushString("ring_push: unknown op");
         lua.raiseError();
         unreachable;
     };
 
-    sq.push(entry) catch {
-        lua.pushString("ring_push: ring full");
-        lua.raiseError();
-        return 0;
+    state.pushSqEntry(entry) catch |err| switch (err) {
+        error.NoActiveRequest => {
+            lua.pushString("ring_push: no active request");
+            lua.raiseError();
+            return 0;
+        },
+        error.RingFull => {
+            lua.pushString("ring_push: ring full");
+            lua.raiseError();
+            return 0;
+        },
     };
 
     return 0;
@@ -126,13 +122,13 @@ pub fn keyway_ring_push(lua: *Lua) callconv(.c) c_int {
 /// If SQ is empty, returns 0 without yielding.
 pub fn keyway_ring_submit(lua: *Lua) callconv(.c) c_int {
     const state = getState(lua);
-    const sq = getSQ(state) orelse {
+    const sq_len = state.sqLen() orelse {
         lua.pushString("ring_submit: no active request");
         lua.raiseError();
         return 0;
     };
 
-    if (sq.len() == 0) {
+    if (sq_len == 0) {
         lua.pushInteger(0);
         return 1; // no yield needed
     }
@@ -144,21 +140,14 @@ pub fn keyway_ring_submit(lua: *Lua) callconv(.c) c_int {
 /// Returns: result, buf_or_nil, err_or_nil
 pub fn keyway_ring_result(lua: *Lua) callconv(.c) c_int {
     const state = getState(lua);
-    const cq = getCQ(state) orelse {
-        lua.pushString("ring_result: no active request");
-        lua.raiseError();
-        return 0;
-    };
-
     const index: u8 = @intCast(lua.toInteger(1));
-    if (index >= cq.tail) {
+
+    const cqe = state.getCqEntry(index) orelse {
         lua.pushNil();
         lua.pushNil();
         lua.pushString("ring_result: index out of range");
         return 3;
-    }
-
-    const cqe = cq.get(index);
+    };
     lua.pushInteger(@intCast(cqe.result));
     if (cqe.buf) |b| lua.pushLString(b) else lua.pushNil();
     if (cqe.err_msg) |e| lua.pushString(e) else lua.pushNil();

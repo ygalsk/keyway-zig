@@ -11,40 +11,90 @@
 </head>
 
 <body>
-  <nav>
-    <a href="/" class="brand<% if page == 'home' then %> active<% end %>">keyway</a>
-    <a href="/kv" <% if page=='kv' then %> class="active"<% end %>>KV Store</a>
-    <a href="/probe"<% if page == 'probe' then %> class="active"<% end %>>Probe</a>
-    <a href="/hooks"<% if page == 'hooks' or page == 'hook_detail' then %> class="active"<% end %>>Hooks</a>
-    <a href="/webhook"<% if page == 'webhook' then %> class="active"<% end %>>Webhook</a>
-    <a href="/dns"<% if page == 'dns' then %> class="active"<% end %>>DNS</a>
-    <a href="/db"<% if page == 'db' then %> class="active"<% end %>>DB</a>
-    <a href="/scripts"<% if page == 'scripts' then %> class="active"<% end %>>Scripts</a>
+  <a href="#main-content" class="skip-link">Skip to main content</a>
+
+  <nav aria-label="Main navigation" role="navigation">
+    <a href="/" class="brand<% if page == 'home' then %> active<% end %>" aria-label="Keyway home">keyway</a>
+    <span class="nav-links" role="list">
+      <a href="/kv" role="listitem"<% if page=='kv' then %> class="active" aria-current="page"<% end %>>KV Store</a>
+      <a href="/probe" role="listitem"<% if page == 'probe' then %> class="active" aria-current="page"<% end %>>Probe</a>
+      <a href="/hooks" role="listitem"<% if page == 'hooks' or page == 'hook_detail' then %> class="active" aria-current="page"<% end %>>Hooks</a>
+      <a href="/webhook" role="listitem"<% if page == 'webhook' then %> class="active" aria-current="page"<% end %>>Webhook</a>
+      <a href="/dns" role="listitem"<% if page == 'dns' then %> class="active" aria-current="page"<% end %>>DNS</a>
+      <a href="/db" role="listitem"<% if page == 'db' then %> class="active" aria-current="page"<% end %>>DB</a>
+      <a href="/scripts" role="listitem"<% if page == 'scripts' then %> class="active" aria-current="page"<% end %>>Scripts</a>
+      <a href="/short" role="listitem"<% if page == 'short' then %> class="active" aria-current="page"<% end %>>Short</a>
+      <a href="/paste" role="listitem"<% if page == 'paste' or page == 'paste_detail' then %> class="active" aria-current="page"<% end %>>Paste</a>
+      <a href="/ratelimit" role="listitem"<% if page == 'ratelimit' then %> class="active" aria-current="page"<% end %>>Rate Limit</a>
+      <a href="/chat" role="listitem"<% if page == 'chat' then %> class="active" aria-current="page"<% end %>>Chat</a>
+      <a href="/websocket" role="listitem"<% if page == 'websocket' then %> class="active" aria-current="page"<% end %>>WebSocket</a>
+    </span>
   </nav>
 
   <% if error_msg then %>
-    <div class="container">
+    <div class="container" role="alert">
       <div class="banner-error">
-        <%= error_msg %>
+        <span class="sr-only">Error:</span> <%= error_msg %>
       </div>
     </div>
   <% end %>
 
   <% if success_msg then %>
-    <div class="container">
+    <div class="container" role="status">
       <div class="banner-success">
-        <%= success_msg %>
+        <span class="sr-only">Success:</span> <%= success_msg %>
       </div>
     </div>
   <% end %>
 
-  <main class="container">
+  <main id="main-content" class="container">
     <%- content %>
   </main>
 
-  <footer class="worker-badge">
+  <footer class="worker-badge" role="contentinfo">
     Worker <%= worker_id %>
   </footer>
+
+  <script>
+  function escapeHtml(s) {
+    var d = document.createElement('div');
+    d.textContent = s;
+    return d.innerHTML;
+  }
+
+  function copyText(text, btn) {
+    if (navigator.clipboard) {
+      navigator.clipboard.writeText(text).then(function() {
+        var orig = btn.textContent;
+        btn.textContent = 'Copied';
+        btn.classList.add('copied');
+        btn.setAttribute('aria-label', 'Copied to clipboard');
+        setTimeout(function() {
+          btn.textContent = orig;
+          btn.classList.remove('copied');
+          btn.setAttribute('aria-label', 'Copy to clipboard');
+        }, 2000);
+      });
+    }
+  }
+
+  function connectSSE(url, handler) {
+    var es = new EventSource(url);
+    es.onmessage = function(e) {
+      try {
+        var data = JSON.parse(e.data);
+        handler(data);
+      } catch(err) {}
+    };
+    es.onerror = function() {
+      setTimeout(function() {
+        es.close();
+        connectSSE(url, handler);
+      }, 5000);
+    };
+    return es;
+  }
+  </script>
 </body>
 
 </html>

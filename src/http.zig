@@ -61,8 +61,10 @@ pub const Response = struct {
             }
         }
 
-        // Content-Length
-        try writer.print("Content-Length: {d}\r\n", .{self.body.len});
+        // Content-Length (skip for 101 Switching Protocols — no body follows)
+        if (self.status != 101) {
+            try writer.print("Content-Length: {d}\r\n", .{self.body.len});
+        }
 
         // Blank line
         try writer.writeAll("\r\n");
@@ -73,12 +75,24 @@ pub const Response = struct {
 
     fn statusText(self: Response) []const u8 {
         return switch (self.status) {
+            101 => "Switching Protocols",
             200 => "OK",
             201 => "Created",
+            204 => "No Content",
+            301 => "Moved Permanently",
+            302 => "Found",
+            304 => "Not Modified",
             400 => "Bad Request",
             401 => "Unauthorized",
+            403 => "Forbidden",
             404 => "Not Found",
+            405 => "Method Not Allowed",
+            408 => "Request Timeout",
+            413 => "Content Too Large",
+            429 => "Too Many Requests",
             500 => "Internal Server Error",
+            502 => "Bad Gateway",
+            503 => "Service Unavailable",
             else => "Unknown",
         };
     }
@@ -233,4 +247,52 @@ test "http parser - incomplete request" {
     const partial_request = "GET /test HTTP";
     const result = parser.parseRequest(partial_request);
     try std.testing.expectError(error.Incomplete, result);
+}
+
+test "101 switching protocols serialization" {
+    const allocator = std.testing.allocator;
+
+    var resp = Response.init(allocator);
+    defer resp.deinit();
+    resp.status = 101;
+    try resp.addHeader("Upgrade", "websocket");
+    try resp.addHeader("Connection", "Upgrade");
+    try resp.addHeader("Sec-WebSocket-Accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+
+    var buf = std.ArrayList(u8).initCapacity(allocator, 0) catch unreachable;
+    defer buf.deinit(allocator);
+    try resp.serialize(buf.writer(allocator));
+
+    const expected = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
+    try std.testing.expectEqualStrings(expected, buf.items);
+}
+
+test "picohttpparser websocket upgrade headers" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+
+    const ws_request = "GET /ws HTTP/1.1\r\nHost: localhost:8080\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: VRr1Px7jQfIhHCVGc+tb4w==\r\nSec-WebSocket-Version: 13\r\n\r\n";
+    const request = try parser.parseRequest(ws_request);
+    defer allocator.free(request.headers);
+
+    // Verify picohttpparser returns exact header value (no trailing whitespace)
+    const sec_key = getHeader(&request, "Sec-WebSocket-Key").?;
+    try std.testing.expectEqualStrings("VRr1Px7jQfIhHCVGc+tb4w==", sec_key);
+    try std.testing.expectEqual(@as(usize, 24), sec_key.len);
+
+    const upgrade = getHeader(&request, "Upgrade").?;
+    try std.testing.expectEqualStrings("websocket", upgrade);
+
+    // Verify accept key computation with this specific key
+    const ws = @import("ws.zig");
+    const trimmed = std.mem.trim(u8, sec_key, " \t");
+    var accept_key: [28]u8 = undefined;
+    ws.computeAcceptKey(trimmed, &accept_key);
+
+    // Verify the accept key is valid base64 (28 chars)
+    try std.testing.expectEqual(@as(usize, 28), accept_key.len);
+}
+
+fn getHeader(req: *const Request, name: []const u8) ?[]const u8 {
+    return Parser.getHeader(req, name);
 }

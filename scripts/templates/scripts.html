@@ -1,18 +1,20 @@
-<div class="page-header">
+<div class="page-header page-header-scripts">
   <h1>Script Console</h1>
   <p>Write Redis Lua scripts, execute them live, and save as callable API endpoints</p>
 </div>
 
 <div class="card">
   <h2>Editor</h2>
-  <form method="POST" action="/scripts">
-    <div class="form-group">
-      <label for="name">Function Name</label>
-      <input type="text" id="name" name="name" placeholder="my_script" value="<%= script_name or '' %>" pattern="[A-Za-z0-9_\-]+" title="Letters, numbers, hyphens, underscores only">
-    </div>
-    <div class="form-group">
-      <label for="description">Description (optional)</label>
-      <input type="text" id="description" name="description" placeholder="What does this script do?" value="<%= script_description or '' %>">
+  <form method="POST" action="/scripts" id="script-form">
+    <div class="flex-row">
+      <div class="form-group">
+        <label for="name">Function Name</label>
+        <input type="text" id="name" name="name" placeholder="my_script" value="<%= script_name or '' %>" pattern="[A-Za-z0-9_\-]+" title="Letters, numbers, hyphens, underscores only">
+      </div>
+      <div class="form-group">
+        <label for="description">Description (optional)</label>
+        <input type="text" id="description" name="description" placeholder="What does this script do?" value="<%= script_description or '' %>">
+      </div>
     </div>
     <div class="form-group">
       <label for="script">Lua Script</label>
@@ -33,59 +35,84 @@
       <button type="submit" name="action" value="save" class="btn btn-secondary">Save</button>
     </div>
   </form>
+  <div class="quick-actions" style="margin-top: 1rem;">
+    <span class="metric" style="margin-right: 0.25rem;">Snippets:</span>
+    <button class="btn-ghost" onclick="loadSnippet('ping')">PING</button>
+    <button class="btn-ghost" onclick="loadSnippet('counter')">Counter</button>
+    <button class="btn-ghost" onclick="loadSnippet('ttl_set')">TTL Set</button>
+    <button class="btn-ghost" onclick="loadSnippet('keys_scan')">Key Scan</button>
+    <button class="btn-ghost" onclick="loadSnippet('hash_ops')">Hash Ops</button>
+  </div>
 </div>
 
 <% if eval_result then %>
-<div class="result-card">
-  <h2>Result</h2>
-  <p class="metric">Executed in <%= eval_time_us %> &micro;s</p>
-  <pre><code><%= eval_result %></code></pre>
+<div class="terminal-response">
+  <div style="display: flex; align-items: center; gap: 1rem; margin-bottom: 0.5rem;">
+    <span class="terminal-prompt">&gt;</span> <span style="color: var(--text-secondary);">EVAL</span>
+    <% if eval_time_us then %>
+    <span class="metric" style="margin-left: auto;"><%= eval_time_us %> &micro;s</span>
+    <% end %>
+  </div>
+  <pre style="margin: 0; border: none; padding: 0.5rem 0 0; background: transparent;"><code class="terminal-result"><%= eval_result %></code></pre>
 </div>
 <% end %>
 
 <% if eval_error then %>
-<div class="result-card" style="border-left-color: var(--error);">
-  <h2 style="color: var(--error);">Error</h2>
-  <pre><code style="color: var(--error);"><%= eval_error %></code></pre>
+<div class="terminal-response terminal-error">
+  <div style="display: flex; align-items: center; gap: 1rem;">
+    <span class="terminal-prompt">&gt;</span> <span style="color: var(--error);">ERR</span>
+  </div>
+  <pre style="margin: 0; border: none; padding: 0.5rem 0 0; background: transparent;"><code style="color: var(--error);"><%= eval_error %></code></pre>
 </div>
 <% end %>
 
-<div class="card">
-  <h2>Saved Functions</h2>
+<% if success_msg then %>
+<div class="terminal-response">
+  <span class="success-check">&#10003;</span> <span class="terminal-result"><%= success_msg %></span>
+</div>
+<% end %>
+
+<div style="margin-top: 1.5rem;">
+  <h2 style="margin-bottom: 0.75rem;">Saved Functions <% if functions and #functions > 0 then %><span class="count-badge"><%= #functions %></span><% end %></h2>
   <% if functions and #functions > 0 then %>
-  <table class="data-table">
-    <tr>
-      <th>Name</th>
-      <th>Description</th>
-      <th>Endpoint</th>
-      <th></th>
-    </tr>
-    <% for _, fn in ipairs(functions) do %>
-    <tr>
-      <td><%= fn.name %></td>
-      <td class="truncate" style="color: var(--text-secondary);"><%= fn.description or '' %></td>
-      <td><code>/fn/<%= fn.name %></code></td>
-      <td style="text-align: right; white-space: nowrap;">
+  <% for _, fn in ipairs(functions) do %>
+  <div class="fn-card">
+    <div class="fn-card-header">
+      <div class="fn-card-name"><%= fn.name %></div>
+      <div class="fn-card-actions">
         <form method="POST" action="/scripts" style="display: inline;">
           <input type="hidden" name="action" value="load">
           <input type="hidden" name="name" value="<%= fn.name %>">
-          <button type="submit" class="btn btn-secondary" style="padding: 0.15em 0.5em; font-size: 0.75rem;">Load</button>
+          <button type="submit" class="btn-ghost">Load</button>
         </form>
         <form method="POST" action="/scripts" style="display: inline;">
           <input type="hidden" name="action" value="delete">
           <input type="hidden" name="name" value="<%= fn.name %>">
-          <button type="submit" class="btn btn-danger" style="padding: 0.15em 0.5em; font-size: 0.75rem;">Del</button>
+          <button type="submit" class="btn btn-danger" style="padding: 0.25rem 0.5rem; font-size: 0.75rem;">Del</button>
         </form>
-      </td>
-    </tr>
+      </div>
+    </div>
+    <% if fn.description and fn.description ~= "" then %>
+    <p class="fn-card-desc"><%= fn.description %></p>
     <% end %>
-  </table>
+    <div class="fn-card-endpoint">
+      <code class="fn-endpoint-url">/fn/<%= fn.name %></code>
+      <button class="btn-copy" onclick="copyText('/fn/<%= fn.name %>', this)" style="padding: 0.25rem 0.5rem;" aria-label="Copy endpoint URL for <%= fn.name %>">Copy</button>
+    </div>
+    <div class="fn-card-curl">
+      <code class="metric">curl localhost:8080/fn/<%= fn.name %></code>
+    </div>
+  </div>
+  <% end %>
   <% else %>
-  <p class="empty-state">No saved functions yet — write a script and click Save</p>
+  <div class="card">
+    <p class="empty-state">No saved functions yet — write a script and click Save</p>
+  </div>
   <% end %>
 </div>
 
 <script>
+// Tab support in editor
 document.getElementById('script').addEventListener('keydown', function(e) {
   if (e.key === 'Tab') {
     e.preventDefault();
@@ -94,4 +121,45 @@ document.getElementById('script').addEventListener('keydown', function(e) {
     this.selectionStart = this.selectionEnd = s + 2;
   }
 });
+
+// Ctrl+Enter to run
+document.getElementById('script-form').addEventListener('keydown', function(e) {
+  if ((e.ctrlKey || e.metaKey) && e.key === 'Enter') {
+    e.preventDefault();
+    var btn = document.querySelector('button[value="eval"]');
+    btn.click();
+  }
+});
+
+// Snippet quick-load
+var snippets = {
+  ping: { script: 'return "PONG"', name: '', desc: '', keys: '', argv: '' },
+  counter: {
+    script: 'local current = redis.call("INCR", KEYS[1])\nreturn current',
+    name: 'counter', desc: 'Atomic counter', keys: 'my_counter', argv: ''
+  },
+  ttl_set: {
+    script: 'redis.call("SET", KEYS[1], ARGV[1])\nredis.call("EXPIRE", KEYS[1], ARGV[2])\nreturn "OK"',
+    name: 'ttl_set', desc: 'Set key with TTL', keys: 'temp_key', argv: 'hello,60'
+  },
+  keys_scan: {
+    script: 'return redis.call("KEYS", ARGV[1] or "*")',
+    name: 'keys_scan', desc: 'List keys by pattern', keys: '', argv: '*'
+  },
+  hash_ops: {
+    script: 'redis.call("HSET", KEYS[1], ARGV[1], ARGV[2])\nreturn redis.call("HGETALL", KEYS[1])',
+    name: 'hash_ops', desc: 'Hash set and get all', keys: 'my_hash', argv: 'field1,value1'
+  }
+};
+
+function loadSnippet(name) {
+  var s = snippets[name];
+  if (!s) return;
+  document.getElementById('script').value = s.script;
+  document.getElementById('name').value = s.name;
+  document.getElementById('description').value = s.desc;
+  document.getElementById('keys_input').value = s.keys;
+  document.getElementById('argv_input').value = s.argv;
+}
+
 </script>

@@ -1,63 +1,157 @@
 <section class="hero">
   <h1>keyway</h1>
   <p class="tagline">A highly opinionated engine with no opinions</p>
-  <p>HTTP engine powered by Zig, controlled by Lua. You write the logic, Zig handles the rest.</p>
+  <p class="hero-desc">Zig handles memory, I/O, and the event loop. You write Lua. That's it.</p>
+  <div class="hero-cta">
+    <a href="#playground" class="btn btn-primary">Try the tools</a>
+    <a href="#how-it-works" class="btn btn-secondary">See the code</a>
+  </div>
+  <div class="hero-status" role="status">
+    <span class="status-dot" aria-hidden="true"></span>
+    <span aria-hidden="true">&#9679;</span><span class="sr-only">Live:</span> this page is running on keyway right now
+  </div>
 </section>
 
-<div class="feature-grid">
-  <div class="feature-card">
-    <h2>Write Handlers in Lua</h2>
-    <p>Define routes and logic in plain Lua. Change behavior without recompiling. No restarts.</p>
-  </div>
-  <div class="feature-card">
-    <h2>One Core, One Thread, One State</h2>
-    <p>Every CPU core runs its own isolated event loop. No locks, no sharing, no surprises.</p>
-  </div>
-  <div class="feature-card">
-    <h2>Zero-Copy from Kernel to Handler</h2>
-    <p>Request bytes stay in one buffer from recv to response. Parse, route, respond — nothing moves.</p>
-  </div>
-</div>
+<section id="playground">
+  <h2 class="section-heading" style="margin-bottom: 0.75rem;">Playground</h2>
+  <p class="section-intro">Every tool on this page runs on Keyway right now — pick one.</p>
 
-<div class="card">
-  <h2>The Interface</h2>
-  <pre><code>keyway.routes = {
-    ["/users/{id}"] = {
-        GET = function(ctx)
-            ctx.status = 200
-            ctx.headers["Content-Type"] = "application/json"
-            ctx.body = '{"id":' .. ctx.params.id .. '}'
-        end,
+  <div class="tool-featured">
+    <a href="/scripts" class="tool-card-link">
+      <div class="tool-card tool-card-lg">
+        <h3>Script Console</h3>
+        <p>Write Lua scripts and run them live on Redis.</p>
+      </div>
+    </a>
+    <a href="/hooks" class="tool-card-link">
+      <div class="tool-card tool-card-lg">
+        <h3>Webhook Catcher</h3>
+        <p>Generate an endpoint and watch requests arrive live.</p>
+      </div>
+    </a>
+  </div>
+
+  <div class="tool-grid-sm">
+    <a href="/probe" class="tool-card-link">
+      <div class="tool-card">
+        <h3>HTTP Probe</h3>
+        <p>Hit any URL and see status, headers and timing.</p>
+      </div>
+    </a>
+    <a href="/dns" class="tool-card-link">
+      <div class="tool-card">
+        <h3>DNS Lookup</h3>
+        <p>Resolve domains to IPs.</p>
+      </div>
+    </a>
+    <a href="/kv" class="tool-card-link">
+      <div class="tool-card">
+        <h3>KV Store</h3>
+        <p>Redis key-value with a CLI bar.</p>
+      </div>
+    </a>
+    <a href="/db" class="tool-card-link">
+      <div class="tool-card">
+        <h3>Postgres Notes</h3>
+        <p>Guestbook with full CRUD.</p>
+      </div>
+    </a>
+    <a href="/webhook" class="tool-card-link">
+      <div class="tool-card">
+        <h3>Outbound Webhook</h3>
+        <p>Fire messages to Discord.</p>
+      </div>
+    </a>
+    <a href="/short" class="tool-card-link">
+      <div class="tool-card">
+        <h3>URL Shortener</h3>
+        <p>Shorten links with base36 codes.</p>
+      </div>
+    </a>
+    <a href="/paste" class="tool-card-link">
+      <div class="tool-card">
+        <h3>Paste Bin</h3>
+        <p>Share text with optional expiry.</p>
+      </div>
+    </a>
+    <a href="/ratelimit" class="tool-card-link">
+      <div class="tool-card">
+        <h3>Rate Limiter</h3>
+        <p>Sliding window with Redis EVAL.</p>
+      </div>
+    </a>
+    <a href="/chat" class="tool-card-link">
+      <div class="tool-card">
+        <h3>Chat Rooms</h3>
+        <p>Cassandra-backed chat.</p>
+      </div>
+    </a>
+  </div>
+</section>
+
+<div class="section-break"></div>
+
+<section id="how-it-works">
+  <h2 class="section-heading" style="margin-bottom: 0.75rem;">How It Works</h2>
+
+  <div class="card">
+    <h2>The Entire Interface</h2>
+    <pre><code>keyway.routes <span class="syn-op">=</span> {
+    [<span class="syn-str">"/users/{id}"</span>] <span class="syn-op">=</span> {
+        <span class="syn-kw">GET</span> <span class="syn-op">=</span> <span class="syn-kw">function</span>(ctx)
+            ctx.status <span class="syn-op">=</span> <span class="syn-num">200</span>
+            ctx.headers[<span class="syn-str">"Content-Type"</span>] <span class="syn-op">=</span> <span class="syn-str">"application/json"</span>
+            ctx.body <span class="syn-op">=</span> <span class="syn-str">'{"id":'</span> <span class="syn-op">..</span> ctx.params.id <span class="syn-op">..</span> <span class="syn-str">'}'</span>
+        <span class="syn-kw">end</span>,
     },
 }</code></pre>
-  <p class="metric">No <code>send()</code>. No <code>write()</code>. Set fields on <code>ctx</code> — Lua expresses intent, Zig commits I/O.</p>
-</div>
+    <p class="metric">No <code>send()</code>. No <code>write()</code>. Set fields on <code>ctx</code> — Lua expresses intent, Zig commits I/O.</p>
+  </div>
 
-<h2>Developer Tools</h2>
-<div class="feature-grid">
-  <div class="tool-card">
-    <h3>HTTP Probe</h3>
-    <p>Inspect HTTP responses from any public URL — status code, headers, and round-trip timing.</p>
-    <a href="/probe" class="btn btn-primary">Open Tool</a>
-  </div>
-  <div class="tool-card">
-    <h3>DNS Lookup</h3>
-    <p>Resolve domain names to A records via a live UDP DNS query to a public resolver.</p>
-    <a href="/dns" class="btn btn-primary">Open Tool</a>
-  </div>
-  <div class="tool-card">
-    <h3>Webhook Catcher</h3>
-    <p>Generate a unique endpoint, send requests to it, and inspect everything that arrives.</p>
-    <a href="/hooks" class="btn btn-primary">Open Tool</a>
-  </div>
-  <div class="tool-card">
-    <h3>KV Store</h3>
-    <p>Set, get, and delete key-value pairs backed by Redis over a raw RESP2 cosocket connection.</p>
-    <a href="/kv" class="btn btn-primary">Open Tool</a>
-  </div>
-  <div class="tool-card">
-    <h3>Postgres Notes</h3>
-    <p>A guestbook with full CRUD backed by PostgreSQL (Neon) via pgmoon over the cosocket pipeline.</p>
-    <a href="/db" class="btn btn-primary">Open Tool</a>
-  </div>
-</div>
+  <details class="code-examples-toggle">
+    <summary>More examples</summary>
+    <div class="code-example">
+      <h4>Route Anything</h4>
+      <pre><code>[<span class="syn-str">"/api/users/{id}"</span>] <span class="syn-op">=</span> {
+  <span class="syn-kw">GET</span> <span class="syn-op">=</span> <span class="syn-kw">function</span>(ctx)
+    ctx.body <span class="syn-op">=</span> <span class="syn-fn">get_user</span>(ctx.params.id)
+  <span class="syn-kw">end</span>,
+}</code></pre>
+    </div>
+    <div class="code-example">
+      <h4>Middleware Per Route</h4>
+      <pre><code>[<span class="syn-str">"/admin/{path}"</span>] <span class="syn-op">=</span> {
+  middleware <span class="syn-op">=</span> { auth, rate_limit, log },
+  <span class="syn-kw">GET</span> <span class="syn-op">=</span> <span class="syn-kw">function</span>(ctx)
+    ctx.body <span class="syn-op">=</span> <span class="syn-fn">admin_panel</span>(ctx)
+  <span class="syn-kw">end</span>,
+}</code></pre>
+    </div>
+    <div class="code-example">
+      <h4>Talk to Redis</h4>
+      <pre><code><span class="syn-kw">local</span> redis <span class="syn-op">=</span> <span class="syn-fn">require</span>(<span class="syn-str">"keyway.redis"</span>)
+<span class="syn-kw">local</span> client <span class="syn-op">=</span> redis.<span class="syn-fn">connect</span>()
+client:<span class="syn-fn">set</span>(<span class="syn-str">"hits"</span>, client:<span class="syn-fn">incr</span>(<span class="syn-str">"hits"</span>))</code></pre>
+    </div>
+    <div class="code-example">
+      <h4>Query Cassandra</h4>
+      <pre><code><span class="syn-kw">local</span> cass <span class="syn-op">=</span> <span class="syn-fn">require</span>(<span class="syn-str">"keyway.cassandra"</span>)
+<span class="syn-kw">local</span> db <span class="syn-op">=</span> cass.<span class="syn-fn">connect</span>(config)
+<span class="syn-kw">local</span> rows <span class="syn-op">=</span> db:<span class="syn-fn">execute</span>(<span class="syn-str">"SELECT * FROM messages WHERE room = ?"</span>, {room})</code></pre>
+    </div>
+    <div class="code-example">
+      <h4>Call External APIs</h4>
+      <pre><code><span class="syn-kw">local</span> http <span class="syn-op">=</span> <span class="syn-fn">require</span>(<span class="syn-str">"keyway.http_client"</span>)
+<span class="syn-kw">local</span> res <span class="syn-op">=</span> http.<span class="syn-fn">request</span>(<span class="syn-str">"GET"</span>,
+  <span class="syn-str">"https://api.github.com/users/torvalds"</span>)</code></pre>
+    </div>
+    <div class="code-example">
+      <h4>Run Lua on Redis</h4>
+      <pre><code>client:<span class="syn-fn">eval</span>(<span class="syn-str">[[
+  <span class="syn-kw">local</span> n = redis.<span class="syn-fn">call</span>(<span class="syn-str">"INCR"</span>, KEYS[<span class="syn-num">1</span>])
+  <span class="syn-kw">if</span> n > <span class="syn-num">100</span> <span class="syn-kw">then</span> <span class="syn-kw">return</span> <span class="syn-str">"limit"</span> <span class="syn-kw">end</span>
+  <span class="syn-kw">return</span> n
+]]</span>, <span class="syn-num">1</span>, <span class="syn-str">"counter"</span>)</code></pre>
+    </div>
+  </details>
+</section>

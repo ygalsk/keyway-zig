@@ -59,6 +59,19 @@ pub const LinearBuffer = struct {
         return self.write_pos - self.read_pos;
     }
 
+    /// Move unread data to the front, reclaiming consumed space.
+    /// Prevents write_pos from marching to the end when frames are
+    /// partially consumed (common with WebSocket frame streams).
+    pub fn compact(self: *LinearBuffer) void {
+        if (self.read_pos == 0) return;
+        const remaining = self.write_pos - self.read_pos;
+        if (remaining > 0) {
+            std.mem.copyForwards(u8, self.data[0..remaining], self.data[self.read_pos..self.write_pos]);
+        }
+        self.write_pos = remaining;
+        self.read_pos = 0;
+    }
+
     /// Reset buffer to empty state
     pub fn reset(self: *LinearBuffer) void {
         self.read_pos = 0;
@@ -91,6 +104,46 @@ test "linear buffer basic operations" {
     // Positions should be reset
     try std.testing.expectEqual(@as(usize, 0), buf.read_pos);
     try std.testing.expectEqual(@as(usize, 0), buf.write_pos);
+}
+
+test "linear buffer compact" {
+    const allocator = std.testing.allocator;
+
+    var buf = try LinearBuffer.init(allocator, 32);
+    defer buf.deinit();
+
+    // Write "Hello World", consume "Hello " to advance read_pos
+    const ws = buf.writeSlice();
+    @memcpy(ws[0..11], "Hello World");
+    buf.commitWrite(11);
+    buf.consume(6); // read_pos=6, write_pos=11, remaining="World"
+
+    try std.testing.expectEqual(@as(usize, 6), buf.read_pos);
+    try std.testing.expectEqual(@as(usize, 21), buf.availableWrite()); // 32 - 11
+
+    buf.compact();
+
+    // After compact: data moved to front, full tail space reclaimed
+    try std.testing.expectEqual(@as(usize, 0), buf.read_pos);
+    try std.testing.expectEqual(@as(usize, 5), buf.write_pos);
+    try std.testing.expectEqual(@as(usize, 27), buf.availableWrite()); // 32 - 5
+    try std.testing.expectEqualStrings("World", buf.readSlice());
+}
+
+test "linear buffer compact noop when read_pos is zero" {
+    const allocator = std.testing.allocator;
+
+    var buf = try LinearBuffer.init(allocator, 32);
+    defer buf.deinit();
+
+    const ws = buf.writeSlice();
+    @memcpy(ws[0..5], "Hello");
+    buf.commitWrite(5);
+
+    buf.compact(); // should be a no-op
+    try std.testing.expectEqual(@as(usize, 0), buf.read_pos);
+    try std.testing.expectEqual(@as(usize, 5), buf.write_pos);
+    try std.testing.expectEqualStrings("Hello", buf.readSlice());
 }
 
 test "linear buffer partial consume" {

@@ -101,11 +101,14 @@ function tcp_mt:receive(pattern)
     return nil, "invalid receive pattern"
 end
 
-function tcp_mt:sslhandshake(reused_session, server_name)
+function tcp_mt:sslhandshake(reused_session, server_name, no_verify_or_mode)
     if not self.fd then return nil, "not connected" end
+    -- Skip handshake on pooled connections — TLS state is preserved in the pool
+    if self.reuse_count and self.reuse_count > 0 then return 1 end
     local sni = server_name or self._host
     -- TLS handshake is multi-round-trip, keep using old single-shot API
-    local ok, err = __keyway_io_sslhandshake(self.fd, sni)
+    -- no_verify_or_mode: boolean (true=insecure) or string ("verify","insecure","custom")
+    local ok, err = __keyway_io_sslhandshake(self.fd, sni, no_verify_or_mode or false)
     if not ok then return nil, err end
     return 1
 end

@@ -1,4 +1,6 @@
 const std = @import("std");
+const config = @import("config.zig");
+const TlsMode = @import("io_request.zig").TlsMode;
 
 /// Tagged union describing a single outbound I/O intent.
 /// Each variant carries only the fields relevant to that operation.
@@ -12,8 +14,9 @@ pub const IoEntry = union(Op) {
     close: CloseInfo,
     setkeepalive: KeepaliveInfo,
     tls_handshake: TlsHandshakeInfo,
+    none: void,
 
-    pub const Op = enum { connect, pool_connect, udp_connect, send, recv, close, setkeepalive, tls_handshake };
+    pub const Op = enum { connect, pool_connect, udp_connect, send, recv, close, setkeepalive, tls_handshake, none };
 
     pub const ConnectInfo = struct { host: []const u8, port: u16 };
     pub const PoolConnectInfo = struct { host: []const u8, port: u16, pool_name: []const u8 };
@@ -28,7 +31,7 @@ pub const IoEntry = union(Op) {
         pool_size: u32,
         reuse_count: u32,
     };
-    pub const TlsHandshakeInfo = struct { fd: std.posix.socket_t, sni_host: ?[]const u8 };
+    pub const TlsHandshakeInfo = struct { fd: std.posix.socket_t, sni_host: ?[]const u8, tls_mode: TlsMode = .verify };
 };
 
 /// Completion queue entry — result of one I/O operation.
@@ -45,7 +48,7 @@ pub const SubmissionRing = struct {
     head: u8 = 0,
     tail: u8 = 0,
 
-    pub const MAX_DEPTH = 16;
+    pub const MAX_DEPTH = config.RING_DEPTH;
 
     pub fn push(self: *SubmissionRing, entry: IoEntry) error{RingFull}!void {
         if (self.len() >= MAX_DEPTH) return error.RingFull;
@@ -76,7 +79,7 @@ pub const CompletionRing = struct {
     entries: [MAX_DEPTH]CQEntry = undefined,
     tail: u8 = 0,
 
-    pub const MAX_DEPTH = 16;
+    pub const MAX_DEPTH = config.RING_DEPTH;
 
     pub fn push(self: *CompletionRing, entry: CQEntry) void {
         std.debug.assert(self.tail < MAX_DEPTH);

@@ -8,39 +8,17 @@
 --       pg_client.keepalive(pg)
 --   end
 
-local socket  = require("keyway.socket")
-local dns     = require("keyway.dns")
+local db_socket = require("keyway.db_socket")
 require("keyway.pgcrypto")  -- install openssl.* shims before pgmoon loads
 local flatten = require("pgmoon.util").flatten
 
-local resolve_host = dns.resolve_host
+local resolve_host = db_socket.resolve_host
 
 -- Patch pgmoon.socket.new to return our cosocket (with table-send support)
 -- instead of calling ngx.socket.tcp(). Must happen before require("pgmoon").
 local pgmoon_socket = require("pgmoon.socket")
 pgmoon_socket.new = function(sock_type)
-    local sock = socket.tcp()
-
-    -- pgmoon sends nested tables to sock:send(); our cosocket expects a string.
-    local orig_send = sock.send
-    sock.send = function(self, data)
-        if type(data) == "table" then
-            data = flatten(data)
-        end
-        return orig_send(self, data)
-    end
-
-    -- pgmoon calls sock:connect(ip, port, opts) which sets _host = ip.
-    -- We need _host to stay as the original hostname for TLS SNI/verification.
-    -- Preserve any pre-set _sni_host across the connect call.
-    local orig_connect = sock.connect
-    sock.connect = function(self, host, port, opts)
-        local sni = self._sni_host
-        local ok, err = orig_connect(self, host, port, opts)
-        if sni then self._host = sni end
-        return ok, err
-    end
-
+    local sock = db_socket.tcp(flatten)
     return sock, "nginx"
 end
 

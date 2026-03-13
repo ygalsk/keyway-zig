@@ -1,0 +1,96 @@
+<div class="page-header page-header-short">
+  <h1>URL Shortener</h1>
+  <p>Shorten URLs with atomic Redis counters and base36 codes</p>
+</div>
+
+<div class="card">
+  <h2>Shorten a URL</h2>
+  <form method="POST" action="/short">
+    <div class="form-group">
+      <label for="url">Target URL</label>
+      <input type="url" id="url" name="url" placeholder="https://example.com/very/long/path" required>
+    </div>
+    <button type="submit" class="btn btn-primary">Shorten</button>
+  </form>
+</div>
+
+<% if created then %>
+<div class="result-card" role="status">
+  <h2><span aria-hidden="true">&#10003;</span> Short URL Created</h2>
+  <div class="copy-row" style="margin-top: 0.75rem;">
+    <span class="catch-url" id="short-url"><%= created.short_url %></span>
+    <button class="btn-copy" aria-label="Copy short URL to clipboard" onclick="copyText(document.getElementById('short-url').textContent, this)">Copy</button>
+  </div>
+  <p class="metric" style="margin-top: 0.5rem;">Code: <code><%= created.code %></code> &rarr; <a href="<%= created.target %>" style="word-break: break-all;"><%= created.target %></a></p>
+</div>
+<% end %>
+
+<% if error_msg then %>
+<div class="banner-error"><%= error_msg %></div>
+<% end %>
+
+<div class="card">
+  <h2>Recent Links <% if links and #links > 0 then %><span class="count-badge" id="link-count"><%= #links %></span><% end %></h2>
+  <% if links and #links > 0 then %>
+  <table class="data-table" id="links-table">
+    <thead>
+      <tr>
+        <th>Code</th>
+        <th>Target</th>
+        <th>Hits</th>
+      </tr>
+    </thead>
+    <tbody id="links-body">
+      <% for _, link in ipairs(links) do %>
+      <tr data-code="<%= link.code %>">
+        <td><a href="/s/<%= link.code %>"><%= link.code %></a></td>
+        <td class="truncate"><a href="<%= link.url %>"><%= link.url %></a></td>
+        <td class="hits-cell"><%= link.hits or 0 %></td>
+      </tr>
+      <% end %>
+    </tbody>
+  </table>
+  <% else %>
+  <p class="empty-state" id="empty-state">No shortened URLs yet</p>
+  <% end %>
+</div>
+
+<script>
+var es = new EventSource('/short/events');
+es.onmessage = function(e) {
+  var d = JSON.parse(e.data);
+  if (d.type === 'hit') {
+    var row = document.querySelector('tr[data-code="' + d.code + '"]');
+    if (row) {
+      var cell = row.querySelector('.hits-cell');
+      if (cell) cell.textContent = d.hits;
+    }
+  } else if (d.type === 'created') {
+    var empty = document.getElementById('empty-state');
+    if (empty) empty.style.display = 'none';
+    var tbody = document.getElementById('links-body');
+    if (!tbody) {
+      // Table doesn't exist yet — create it
+      var card = empty ? empty.parentNode : null;
+      if (card) {
+        var table = document.createElement('table');
+        table.className = 'data-table';
+        table.id = 'links-table';
+        table.innerHTML = '<thead><tr><th>Code</th><th>Target</th><th>Hits</th></tr></thead><tbody id="links-body"></tbody>';
+        card.appendChild(table);
+        tbody = document.getElementById('links-body');
+      }
+    }
+    if (tbody) {
+      var tr = document.createElement('tr');
+      tr.setAttribute('data-code', d.code);
+      tr.innerHTML = '<td><a href="/s/' + escapeHtml(d.code) + '">' + escapeHtml(d.code) + '</a></td>'
+        + '<td class="truncate"><a href="' + escapeHtml(d.url) + '">' + escapeHtml(d.url) + '</a></td>'
+        + '<td class="hits-cell">0</td>';
+      tbody.insertBefore(tr, tbody.firstChild);
+    }
+    var badge = document.getElementById('link-count');
+    if (badge) badge.textContent = parseInt(badge.textContent || '0') + 1;
+  }
+};
+</script>

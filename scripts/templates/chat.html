@@ -1,0 +1,136 @@
+<div class="page-header page-header-chat">
+  <h1>Chat Rooms</h1>
+  <p>Real-time chat backed by Apache Cassandra via lua-cassandra over cosockets</p>
+</div>
+
+<% if error_msg then %>
+<div class="banner-error"><%= error_msg %></div>
+<% end %>
+
+<% if room then %>
+  <% -- Room detail view %>
+  <div style="margin-bottom: 1.5rem;">
+    <a href="/chat" class="btn btn-secondary" style="padding: 0.375rem 0.75rem; font-size: 0.8125rem;">&larr; All Rooms</a>
+    <span style="margin-left: 0.75rem; font-size: 1.125rem; font-weight: 500; color: var(--accent);">#<%= room %></span>
+  </div>
+
+  <div class="card">
+    <h2>Post Message</h2>
+    <form id="chat-form" method="POST" action="/chat/<%= room %>">
+      <div class="flex-row">
+        <div class="form-group" style="flex: 1; min-width: 8rem;">
+          <label for="author">Author</label>
+          <input type="text" id="author" name="author" placeholder="anonymous" maxlength="50">
+        </div>
+        <div class="form-group" style="flex: 3; min-width: 12rem;">
+          <label for="body">Message</label>
+          <input type="text" id="body" name="body" placeholder="Say something..." required maxlength="500">
+        </div>
+      </div>
+      <button type="submit" class="btn btn-primary" style="margin-top: 0.5rem;">Send</button>
+    </form>
+  </div>
+
+  <div style="margin-top: 1.5rem;">
+    <h2 style="margin-bottom: 0.75rem;">Messages <% if messages and #messages > 0 then %><span class="count-badge" id="msg-count"><%= #messages %></span><% else %><span class="count-badge" id="msg-count" style="display:none">0</span><% end %></h2>
+    <div id="messages-container" aria-live="polite" aria-label="Chat messages">
+    <% if messages and #messages > 0 then %>
+    <% for _, msg in ipairs(messages) do %>
+    <div class="note-card">
+      <div class="note-card-header">
+        <div class="note-card-meta">
+          <span class="note-card-author"><%= msg.author %></span>
+          <span class="note-card-time"><%= msg.ts %></span>
+        </div>
+      </div>
+      <div class="note-card-body"><%= msg.body %></div>
+    </div>
+    <% end %>
+    <% else %>
+    <p class="empty-state" id="empty-state">No messages yet &mdash; be the first to say something</p>
+    <% end %>
+    </div>
+  </div>
+
+  <script>
+  (function() {
+    var room = '<%= room %>';
+    var container = document.getElementById('messages-container');
+    var countBadge = document.getElementById('msg-count');
+    var emptyState = document.getElementById('empty-state');
+    var msgCount = container.querySelectorAll('.note-card').length;
+
+    var form = document.getElementById('chat-form');
+    var bodyInput = document.getElementById('body');
+    form.addEventListener('submit', function(e) {
+      e.preventDefault();
+      var formData = new FormData(form);
+      fetch(form.action, {
+        method: 'POST',
+        body: new URLSearchParams(formData),
+        redirect: 'manual'
+      }).then(function() {
+        bodyInput.value = '';
+        bodyInput.focus();
+      });
+    });
+
+    var es = new EventSource('/chat/' + encodeURIComponent(room) + '/events');
+    es.onmessage = function(e) {
+      try {
+        var msg = JSON.parse(e.data);
+        var card = document.createElement('div');
+        card.className = 'note-card';
+        card.innerHTML =
+          '<div class="note-card-header">' +
+            '<div class="note-card-meta">' +
+              '<span class="note-card-author">' + escapeHtml(msg.author) + '</span>' +
+              '<span class="note-card-time">' + escapeHtml(msg.ts) + '</span>' +
+            '</div>' +
+          '</div>' +
+          '<div class="note-card-body">' + escapeHtml(msg.body) + '</div>';
+
+        if (emptyState) {
+          emptyState.remove();
+          emptyState = null;
+        }
+        container.insertBefore(card, container.firstChild);
+        msgCount++;
+        countBadge.textContent = msgCount;
+        countBadge.style.display = '';
+      } catch(err) {}
+    };
+  })();
+  </script>
+
+<% else %>
+  <% -- Room list view %>
+  <div class="card">
+    <h2>Create a Room</h2>
+    <form method="POST" action="/chat">
+      <div class="form-group">
+        <label for="room-name">Room Name</label>
+        <input type="text" id="room-name" name="name" placeholder="general" required maxlength="50" pattern="[a-zA-Z0-9_-]+">
+      </div>
+      <button type="submit" class="btn btn-primary">Create Room</button>
+    </form>
+  </div>
+
+  <div style="margin-top: 1.5rem;">
+    <h2 style="margin-bottom: 0.75rem;">Rooms <% if rooms and #rooms > 0 then %><span class="count-badge"><%= #rooms %></span><% end %></h2>
+    <% if rooms and #rooms > 0 then %>
+    <div class="tool-grid-sm">
+      <% for _, r in ipairs(rooms) do %>
+      <a href="/chat/<%= r.name %>" class="tool-card-link">
+        <div class="tool-card">
+          <h3>#<%= r.name %></h3>
+          <p>Join the conversation</p>
+        </div>
+      </a>
+      <% end %>
+    </div>
+    <% else %>
+    <p class="empty-state">No rooms yet &mdash; create one to get started</p>
+    <% end %>
+  </div>
+<% end %>

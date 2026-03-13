@@ -4,13 +4,17 @@ const http = @import("http.zig");
 const HttpExchange = @import("http_exchange.zig").HttpExchange;
 const Router = @import("router.zig").Router;
 const lua_api = @import("lua_api.zig");
-const IoRequest = @import("io_request.zig").IoRequest;
+const IoEntry = @import("ring.zig").IoEntry;
 const io_request = @import("io_request.zig");
 const ring_api = @import("ring_api.zig");
+const ring = @import("ring.zig");
 const ConnectionPool = @import("connection_pool.zig").ConnectionPool;
+const Connection = @import("handler.zig").Connection;
 const tls = @import("tls.zig");
 const TlsConn = tls.TlsConn;
 const ClientTlsContext = tls.ClientTlsContext;
+const TlsManager = tls.TlsManager;
+const SseRegistry = @import("sse.zig").SseRegistry;
 
 // zig-luajit marks resumeCoroutine as private — call C API directly.
 // Lua is an opaque type that maps 1:1 to lua_State*, so @ptrCast is safe.
@@ -33,7 +37,7 @@ pub const LuaState = struct {
     // Cosocket: pending I/O intent written by C yield functions, read by Zig after LUA_YIELD.
     // Safe because: written by C yield functions during lua_resume, read by submitOutboundIO
     // in the same stack frame. libxev is single-threaded per worker — no concurrent access.
-    pending_io: IoRequest = .{},
+    pending_io: ?IoEntry = null,
 
     // Cosocket: temporary coroutine state (copied to Connection after yield)
     coroutine_ref: i32 = 0,
@@ -46,9 +50,11 @@ pub const LuaState = struct {
     // Used by ring C bridge functions to access the Connection's SQ/CQ.
     current_connection: ?*anyopaque = null,
 
-    // Outbound TLS: client context (one per worker) + fd→TLS mapping (persists across yields)
-    client_tls_ctx: ClientTlsContext,
-    tls_map: std.AutoHashMapUnmanaged(std.posix.socket_t, *TlsConn),
+    // SSE: per-worker registry for broadcast (set by worker.zig)
+    sse_registry: ?*SseRegistry = null,
+
+    // Outbound TLS: per-worker context + fd→TLS mapping (persists across yields)
+    tls_manager: TlsManager,
 
     /// Initialize Lua state with standard libraries
     pub fn init(allocator: std.mem.Allocator) !LuaState {
@@ -106,7 +112,7 @@ pub const LuaState = struct {
             \\end
         ) catch {};
 
-        const client_tls_ctx = ClientTlsContext.init() catch return error.TlsInitFailed;
+        const tls_manager = TlsManager.init(allocator) catch return error.TlsInitFailed;
 
         return LuaState{
             .lua = lua,
@@ -114,8 +120,7 @@ pub const LuaState = struct {
             .cached_thread = cached_thread,
             .cached_thread_ref = cached_thread_ref,
             .pool = ConnectionPool.init(allocator),
-            .client_tls_ctx = client_tls_ctx,
-            .tls_map = .{},
+            .tls_manager = tls_manager,
         };
     }
 
@@ -159,20 +164,19 @@ pub const LuaState = struct {
         try self.lua.callProtected(0, 0, 0); // 0 args, 0 results
     }
 
-    /// Call a Lua handler with HttpExchange using coroutine dispatch.
-    /// Creates a new Lua thread (coroutine), pushes handler + per-request exchange
-    /// userdata onto it, and resumes. Each coroutine gets its own userdata pointing
-    /// to the arena-allocated exchange — no shared singletons.
-    pub fn callLuaHandler(
-        self: *LuaState,
-        lua_ref: i32,
-        exchange: *HttpExchange,
-    ) !HandlerResult {
+    /// Userdata variant for dispatchCoroutine — determines what gets pushed onto the thread stack.
+    pub const UserdataKind = union(enum) {
+        http: *HttpExchange,
+        ws: lua_api.WsContext,
+    };
+
+    /// Generic coroutine dispatch: get/reuse thread, push handler + userdata, resume.
+    /// Used by both HTTP handler dispatch and WebSocket on_message dispatch.
+    pub fn dispatchCoroutine(self: *LuaState, lua_ref: i32, ud_kind: UserdataKind) !HandlerResult {
         // Reuse cached thread if available, otherwise create a new one
         // (cached thread is unavailable only when a previous handler is suspended)
         const thread = if (self.cached_thread_ref != 0) blk: {
             const t = self.cached_thread;
-            // Reset thread stack for reuse (clear any leftover state)
             t.setTop(0);
             break :blk t;
         } else self.lua.newThread();
@@ -184,34 +188,39 @@ pub const LuaState = struct {
             return error.NotAFunction;
         }
 
-        // Create per-request exchange userdata (pointer-in-userdata pattern)
-        // Each coroutine gets its own userdata — no singleton sharing across connections
-        const ud = thread.newUserdata(@sizeOf(*HttpExchange));
-        const ud_ptr = @as(**HttpExchange, @ptrCast(@alignCast(ud)));
-        ud_ptr.* = exchange;
-        _ = thread.getMetatableRegistry("HttpExchange");
-        thread.setMetatable(-2);
+        // Create userdata appropriate to the dispatch kind
+        switch (ud_kind) {
+            .http => |exchange| {
+                const ud = thread.newUserdata(@sizeOf(*HttpExchange));
+                const ud_ptr: **HttpExchange = @ptrCast(@alignCast(ud));
+                ud_ptr.* = exchange;
+                _ = thread.getMetatableRegistry("HttpExchange");
+                thread.setMetatable(-2);
+            },
+            .ws => |ws_ctx| {
+                const ud = thread.newUserdata(@sizeOf(lua_api.WsContext));
+                const ctx_ptr: *lua_api.WsContext = @ptrCast(@alignCast(ud));
+                ctx_ptr.* = ws_ctx;
+                _ = thread.getMetatableRegistry("WsContext");
+                thread.setMetatable(-2);
+            },
+        }
 
-        // Resume the coroutine: thread stack has [handler_fn, exchange_ud]
+        // Resume the coroutine: thread stack has [handler_fn, userdata]
         const status = lua_resume(@ptrCast(thread), 1);
 
         switch (status) {
             0 => {
                 // LUA_OK — handler completed normally
-                // Response body already arena-duped on ctx.body assignment (lua_api.zig newindex)
-
-                // If we used a fresh thread (cached was pinned), pop it and let GC collect
                 if (self.cached_thread_ref == 0) self.lua.pop(1);
                 return .completed;
             },
             1 => {
                 // LUA_YIELD — handler wants outbound I/O
                 if (self.cached_thread_ref != 0) {
-                    // Pin cached thread — it's now owned by the Connection
                     self.coroutine_ref = self.cached_thread_ref;
                     self.cached_thread_ref = 0;
                 } else {
-                    // Fresh thread — pin it in registry
                     self.coroutine_ref = self.lua.ref(Lua.PseudoIndex.Registry);
                 }
                 self.coroutine_thread = thread;
@@ -220,12 +229,45 @@ pub const LuaState = struct {
             else => {
                 if (thread.isString(-1)) {
                     const err_msg = thread.toString(-1) catch "unknown error";
-                    std.log.err("lua handler error path={s} method={s} err=\"{s}\"", .{ exchange.path, exchange.method, err_msg });
+                    // Attempt debug.traceback(msg, 2) for a full stack trace
+                    const dbg_type = thread.getGlobal("debug");
+                    if (dbg_type == .table) {
+                        const tb_type = thread.getField(-1, "traceback");
+                        if (tb_type == .function) {
+                            thread.pushValue(-3); // push original error msg
+                            thread.pushInteger(2); // skip 2 frames
+                            thread.callProtected(2, 1, 0) catch {
+                                std.log.err("coroutine error ref={d} err=\"{s}\"", .{ lua_ref, err_msg });
+                                thread.setTop(0);
+                                if (self.cached_thread_ref == 0) self.lua.pop(1);
+                                return error.Runtime;
+                            };
+                            const tb_msg = thread.toString(-1) catch err_msg;
+                            std.log.err("coroutine error ref={d}\n{s}", .{ lua_ref, tb_msg });
+                            thread.setTop(0);
+                            if (self.cached_thread_ref == 0) self.lua.pop(1);
+                            return error.Runtime;
+                        }
+                        thread.pop(2); // pop non-function + debug table
+                    } else {
+                        thread.pop(1); // pop non-table
+                    }
+                    std.log.err("coroutine error ref={d} err=\"{s}\"", .{ lua_ref, err_msg });
                 }
                 if (self.cached_thread_ref == 0) self.lua.pop(1);
                 return error.Runtime;
             },
         }
+    }
+
+    /// Call a Lua handler with HttpExchange using coroutine dispatch.
+    /// Thin wrapper around dispatchCoroutine with HTTP userdata.
+    pub fn callLuaHandler(
+        self: *LuaState,
+        lua_ref: i32,
+        exchange: *HttpExchange,
+    ) !HandlerResult {
+        return self.dispatchCoroutine(lua_ref, .{ .http = exchange });
     }
 
     /// Resume a yielded handler coroutine after outbound I/O completes.
@@ -283,10 +325,12 @@ pub const LuaState = struct {
             .{ "__keyway_pool_setkeepalive", io_request.keyway_pool_setkeepalive },
             .{ "__keyway_io_udp_connect", io_request.keyway_io_udp_connect },
             .{ "__keyway_io_sslhandshake", io_request.keyway_io_sslhandshake },
+            .{ "__keyway_ws_send", io_request.keyway_ws_send },
             // Ring API: batched I/O
             .{ "__keyway_ring_push", ring_api.keyway_ring_push },
             .{ "__keyway_ring_submit", ring_api.keyway_ring_submit },
             .{ "__keyway_ring_result", ring_api.keyway_ring_result },
+            .{ "__keyway_sse_broadcast", keyway_sse_broadcast },
         };
 
         inline for (funcs) |entry| {
@@ -296,38 +340,82 @@ pub const LuaState = struct {
         }
     }
 
-    /// Ownership transfers to LuaState.
+    /// SSE broadcast C function: __keyway_sse_broadcast(room, data)
+    /// Non-yielding — broadcasts data to all SSE subscribers in a room.
+    fn keyway_sse_broadcast(lua: *Lua) callconv(.c) c_int {
+        const state: *LuaState = blk: {
+            const ud = lua.toUserdata(Lua.PseudoIndex.upvalue(1)) orelse return 0;
+            break :blk @as(*LuaState, @ptrCast(@alignCast(ud)));
+        };
+        const registry = state.sse_registry orelse return 0;
+
+        const room = lua.toString(1) catch return 0;
+        const data = lua.toString(2) catch return 0;
+
+        registry.broadcast(std.mem.span(room), std.mem.span(data));
+        return 0;
+    }
+
+    /// Ownership transfers to TlsManager.
     pub fn registerTls(self: *LuaState, fd: std.posix.socket_t, tls_conn: *TlsConn) !void {
-        try self.tls_map.put(self.allocator, fd, tls_conn);
+        try self.tls_manager.registerTls(fd, tls_conn);
     }
 
     /// Borrow — returns null for plain TCP.
     pub fn getTls(self: *LuaState, fd: std.posix.socket_t) ?*TlsConn {
-        return self.tls_map.get(fd);
+        return self.tls_manager.getTls(fd);
     }
 
     /// Ownership transfers to caller. Used for pool transfer or manual cleanup.
     pub fn detachTls(self: *LuaState, fd: std.posix.socket_t) ?*TlsConn {
-        return if (self.tls_map.fetchRemove(fd)) |kv| kv.value else null;
+        return self.tls_manager.detachTls(fd);
     }
 
     /// Remove and free. Used on close paths.
     pub fn removeTls(self: *LuaState, fd: std.posix.socket_t) void {
-        if (self.tls_map.fetchRemove(fd)) |kv| {
-            tls.freeTlsConn(self.allocator, kv.value);
-        }
+        self.tls_manager.removeTls(fd);
+    }
+
+    // --- Ring API delegation methods ---
+    // These let ring_api.zig access the current Connection's SQ/CQ
+    // without importing handler.zig, sealing the proactor boundary.
+
+    /// Push an IoEntry onto the current Connection's submission ring.
+    /// Returns error.NoActiveRequest if no connection is active.
+    pub fn pushSqEntry(self: *LuaState, entry: ring.IoEntry) error{ RingFull, NoActiveRequest }!void {
+        const conn = self.currentConnection() orelse return error.NoActiveRequest;
+        try conn.sq.push(entry);
+    }
+
+    /// Read a completion entry by index from the current Connection's CQ.
+    /// Returns null if no connection is active or index is out of range.
+    pub fn getCqEntry(self: *LuaState, index: u8) ?ring.CQEntry {
+        const conn = self.currentConnection() orelse return null;
+        if (index >= conn.cq.tail) return null;
+        return conn.cq.get(index);
+    }
+
+    /// Return the number of pending SQ entries, or null if no connection is active.
+    pub fn sqLen(self: *LuaState) ?u8 {
+        const conn = self.currentConnection() orelse return null;
+        return conn.sq.len();
+    }
+
+    /// Return the CQ tail (number of completions), or null if no connection is active.
+    pub fn cqTail(self: *LuaState) ?u8 {
+        const conn = self.currentConnection() orelse return null;
+        return conn.cq.tail;
+    }
+
+    /// Cast current_connection to *Connection. Internal helper.
+    inline fn currentConnection(self: *LuaState) ?*Connection {
+        const ptr = self.current_connection orelse return null;
+        return @ptrCast(@alignCast(ptr));
     }
 
     /// Clean up Lua state
     pub fn deinit(self: *LuaState) void {
-        // Clean up all outbound TLS connections
-        var tls_it = self.tls_map.iterator();
-        while (tls_it.next()) |entry| {
-            tls.freeTlsConn(self.allocator, entry.value_ptr.*);
-        }
-        self.tls_map.deinit(self.allocator);
-        self.client_tls_ctx.deinit();
-
+        self.tls_manager.deinit();
         self.pool.deinit();
         if (self.cached_thread_ref != 0) {
             self.lua.unref(Lua.PseudoIndex.Registry, self.cached_thread_ref);

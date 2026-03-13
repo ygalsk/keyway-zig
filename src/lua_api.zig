@@ -4,13 +4,21 @@ const http = @import("http.zig");
 const HttpExchange = @import("http_exchange.zig").HttpExchange;
 const Router = @import("router.zig").Router;
 const handler = @import("handler.zig");
+const route_loader = @import("route_loader.zig");
+
+// Re-export route table processing (now lives in route_loader.zig)
+pub const processRouteTable = route_loader.processRouteTable;
 
 // === HttpExchange Metatable ===
 
 /// Helper: Get HttpExchange from pointer-in-userdata on Lua stack.
 /// Userdata contains *HttpExchange (a pointer to the arena-allocated exchange).
 fn getExchange(lua: *Lua, index: i32) *HttpExchange {
-    const ud = lua.toUserdata(index) orelse @panic("metatable dispatch: expected HttpExchange userdata");
+    const ud = lua.toUserdata(index) orelse {
+        lua.pushString("metatable dispatch: expected HttpExchange userdata");
+        lua.raiseError();
+        unreachable;
+    };
     return @as(**HttpExchange, @ptrCast(@alignCast(ud))).*;
 }
 
@@ -74,6 +82,28 @@ fn luaExchangeNewIndex(lua: *Lua) callconv(.c) c_int {
             lua.raiseError();
             return 0;
         };
+    } else if (std.mem.eql(u8, key_str, "upgrade")) {
+        const val = lua.toString(3) catch return 0;
+        const val_str = std.mem.span(val);
+        if (std.mem.eql(u8, val_str, "websocket")) {
+            ex.upgrade_websocket = true;
+        } else if (std.mem.eql(u8, val_str, "sse")) {
+            ex.upgrade_sse = true;
+        }
+    } else if (std.mem.eql(u8, key_str, "sse_room")) {
+        const val = lua.toString(3) catch return 0;
+        const val_str = std.mem.span(val);
+        ex.sse_room = ex.allocator.dupe(u8, val_str) catch return 0;
+    } else if (std.mem.eql(u8, key_str, "on_message")) {
+        if (lua.isFunction(3)) {
+            lua.pushValue(3);
+            ex.ws_on_message_ref = lua.ref(Lua.PseudoIndex.Registry);
+        }
+    } else if (std.mem.eql(u8, key_str, "on_close")) {
+        if (lua.isFunction(3)) {
+            lua.pushValue(3);
+            ex.ws_on_close_ref = lua.ref(Lua.PseudoIndex.Registry);
+        }
     }
     // Ignore writes to read-only fields (method, path, params)
     // Headers assignment handled by HeadersProxy
@@ -194,6 +224,46 @@ fn luaHeadersNewIndex(lua: *Lua) callconv(.c) c_int {
     return 0;
 }
 
+// === WsContext (WebSocket message context for on_message callbacks) ===
+
+/// WsContext userdata — holds a pointer to the current message payload.
+/// Created fresh per WS message dispatch.
+pub const WsContext = struct {
+    message: []const u8,
+};
+
+/// Helper: Get WsContext from userdata at given stack index.
+fn getWsContext(lua: *Lua, index: i32) ?*WsContext {
+    const ud = lua.toUserdata(index) orelse return null;
+    return @as(*WsContext, @ptrCast(@alignCast(ud)));
+}
+
+/// Lua metamethod: __index for reading ws.message and ws:send()
+fn luaWsContextIndex(lua: *Lua) callconv(.c) c_int {
+    const key = lua.toString(2) catch {
+        lua.pushNil();
+        return 1;
+    };
+    const key_str = std.mem.span(key);
+
+    if (std.mem.eql(u8, key_str, "message")) {
+        const ws_ctx = getWsContext(lua, 1) orelse {
+            lua.pushNil();
+            return 1;
+        };
+        lua.pushLString(ws_ctx.message);
+    } else if (std.mem.eql(u8, key_str, "send")) {
+        // Return the __keyway_ws_send global (C closure with LuaState upvalue)
+        _ = lua.getGlobal("__keyway_ws_send");
+    } else {
+        lua.pushNil();
+    }
+    return 1;
+}
+
+/// ws:send(data) — Lua wrapper calls __keyway_ws_send(data) which is a C closure with LuaState upvalue.
+/// This is registered via registerCosocketApi in lua_state.zig, same pattern as other cosocket ops.
+
 // === Metatable Registration ===
 
 /// Register HttpExchange metatable with Lua
@@ -217,6 +287,14 @@ pub fn registerHttpExchangeMetatable(lua: *Lua) void {
 
     lua.pushCFunction(luaHeadersNewIndex);
     lua.setField(-2, "__newindex");
+
+    lua.pop(1);
+
+    // WsContext metatable (for WebSocket on_message callbacks)
+    _ = lua.newMetatable("WsContext");
+
+    lua.pushCFunction(luaWsContextIndex);
+    lua.setField(-2, "__index");
 
     lua.pop(1);
 
@@ -253,195 +331,11 @@ pub fn registerKeywayModule(lua: *Lua) void {
         \\    end
         \\    return chain
         \\end
-    ) catch unreachable;
+    ) catch |err| {
+        std.log.err("failed to register middleware wrapper: {}", .{err});
+        return;
+    };
 
     std.log.debug("keyway lua module registered", .{});
 }
 
-// === Declarative Route Table Processing ===
-
-const http_methods = [_][]const u8{ "GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS" };
-
-fn isHttpMethod(key: []const u8) bool {
-    for (http_methods) |m| {
-        if (std.mem.eql(u8, key, m)) return true;
-    }
-    return false;
-}
-
-/// Process keyway.routes table after script load.
-/// Walks the declarative route table and registers routes with the radix router.
-pub fn processRouteTable(lua: *Lua, router: *Router, allocator: std.mem.Allocator) !void {
-    const keyway_type = lua.getGlobal("keyway");
-    if (keyway_type != .table) {
-        lua.pop(1);
-        std.log.err("keyway global is not a table", .{});
-        return error.Runtime;
-    }
-
-    const routes_type = lua.getField(-1, "routes");
-    if (routes_type != .table) {
-        lua.pop(2);
-        std.log.err("keyway.routes is not a table", .{});
-        return error.Runtime;
-    }
-
-    const empty_mw: []const i32 = &.{};
-    try walkTable(lua, router, -1, "", empty_mw, allocator);
-
-    lua.pop(2); // pop routes + keyway
-}
-
-fn walkTable(
-    lua: *Lua,
-    router: *Router,
-    table_idx: i32,
-    path_prefix: []const u8,
-    parent_middleware: []const i32,
-    allocator: std.mem.Allocator,
-) !void {
-    // Convert to absolute index so stack pushes don't invalidate it
-    const abs_idx = if (table_idx > 0) table_idx else lua.getTop() + table_idx + 1;
-
-    // Check for middleware key at this level
-    var middleware: []const i32 = parent_middleware;
-    var owns_middleware = false;
-
-    const mw_type = lua.getField(abs_idx, "middleware");
-    if (mw_type == .table) {
-        middleware = try collectMiddleware(lua, -1, parent_middleware, allocator);
-        owns_middleware = middleware.len > parent_middleware.len;
-    }
-    lua.pop(1); // pop middleware value
-
-    defer if (owns_middleware) {
-        // Unref only the middleware refs collected at THIS level (not parent's)
-        for (middleware[parent_middleware.len..]) |mw_ref| {
-            lua.unref(Lua.PseudoIndex.Registry, mw_ref);
-        }
-        allocator.free(@constCast(middleware));
-    };
-
-    // Iterate table entries
-    lua.pushNil();
-    while (lua.next(abs_idx)) {
-        // Key at -2, value at -1
-        const key_cstr = lua.toString(-2) catch {
-            lua.pop(1); // pop value, keep key for next
-            continue;
-        };
-        const key = std.mem.span(key_cstr);
-
-        // Skip middleware key (already handled above)
-        if (std.mem.eql(u8, key, "middleware")) {
-            lua.pop(1);
-            continue;
-        }
-
-        if (lua.isFunction(-1) and isHttpMethod(key)) {
-            // HTTP method -> handler function
-            try registerRoute(lua, router, key, path_prefix, -1, middleware);
-        } else if (lua.isTable(-1) and key.len > 0 and key[0] == '/') {
-            // Nested path segment -> recurse
-            const full_path = try std.fmt.allocPrint(allocator, "{s}{s}", .{ path_prefix, key });
-            defer allocator.free(full_path);
-            try walkTable(lua, router, -1, full_path, middleware, allocator);
-        } else {
-            std.log.warn("Ignoring unknown route table key: {s}", .{key});
-        }
-
-        lua.pop(1); // pop value, keep key for next iteration
-    }
-}
-
-fn collectMiddleware(
-    lua: *Lua,
-    array_idx: i32,
-    parent_refs: []const i32,
-    allocator: std.mem.Allocator,
-) ![]const i32 {
-    const abs_idx = if (array_idx > 0) array_idx else lua.getTop() + array_idx + 1;
-
-    // Count array elements
-    var count: usize = 0;
-    while (true) : (count += 1) {
-        const t = lua.getTableIndexRaw(abs_idx, @intCast(count + 1));
-        if (t == .nil) {
-            lua.pop(1);
-            break;
-        }
-        lua.pop(1);
-    }
-
-    if (count == 0) return parent_refs;
-
-    // Allocate combined slice: parent refs + new refs
-    const combined = try allocator.alloc(i32, parent_refs.len + count);
-    @memcpy(combined[0..parent_refs.len], parent_refs);
-
-    // Ref each middleware function
-    for (0..count) |i| {
-        _ = lua.getTableIndexRaw(abs_idx, @intCast(i + 1));
-        if (!lua.isFunction(-1)) {
-            // Clean up already-refed entries
-            for (0..i) |j| {
-                lua.unref(Lua.PseudoIndex.Registry, combined[parent_refs.len + j]);
-            }
-            lua.pop(1);
-            allocator.free(combined);
-            std.log.err("middleware[{d}] is not a function", .{i + 1});
-            return error.Runtime;
-        }
-        combined[parent_refs.len + i] = lua.ref(Lua.PseudoIndex.Registry);
-    }
-
-    return combined;
-}
-
-fn registerRoute(
-    lua: *Lua,
-    router: *Router,
-    method: []const u8,
-    path: []const u8,
-    handler_idx: i32,
-    middleware: []const i32,
-) !void {
-    // Convert handler index to absolute (stack will grow when we push things)
-    const abs_handler = if (handler_idx > 0) handler_idx else lua.getTop() + handler_idx + 1;
-
-    if (middleware.len == 0) {
-        // No middleware — ref the handler directly
-        lua.pushValue(abs_handler);
-        const lua_ref = lua.ref(Lua.PseudoIndex.Registry);
-        router.addRoute(method, path, lua_ref) catch {
-            lua.unref(Lua.PseudoIndex.Registry, lua_ref);
-            return error.Runtime;
-        };
-        std.log.debug("route registered method={s} path={s} lua_ref={d}", .{ method, path, lua_ref });
-    } else {
-        // Build middleware chain via __keyway_wrap_chain(handler, middleware_table)
-        _ = lua.getGlobal("__keyway_wrap_chain");
-        lua.pushValue(abs_handler);
-
-        // Build middleware array table
-        lua.createTable(@intCast(middleware.len), 0);
-        for (middleware, 0..) |mw_ref, i| {
-            _ = lua.getTableIndexRaw(Lua.PseudoIndex.Registry, mw_ref);
-            lua.setTableIndexRaw(-2, @intCast(i + 1));
-        }
-
-        // Call __keyway_wrap_chain(handler, mw_table) -> wrapped_fn
-        lua.callProtected(2, 1, 0) catch {
-            std.log.err("Failed to build middleware chain for {s} {s}", .{ method, path });
-            return error.Runtime;
-        };
-
-        // Wrapped function is on top of stack
-        const lua_ref = lua.ref(Lua.PseudoIndex.Registry);
-        router.addRoute(method, path, lua_ref) catch {
-            lua.unref(Lua.PseudoIndex.Registry, lua_ref);
-            return error.Runtime;
-        };
-        std.log.debug("route registered method={s} path={s} lua_ref={d} middleware={d}", .{ method, path, lua_ref, middleware.len });
-    }
-}

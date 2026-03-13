@@ -1,12 +1,13 @@
 const std = @import("std");
+const config = @import("config.zig");
 const c = @cImport({
     @cInclude("openssl/ssl.h");
     @cInclude("openssl/err.h");
     @cInclude("openssl/bio.h");
 });
 
-const ENCRYPT_BUF_SIZE = 20 * 1024; // 20KB for draining wbio ciphertext (handshake, small sends)
-pub const TLS_RECORD_MAX_SIZE = 16384; // Max TLS record plaintext (RFC 8449)
+const ENCRYPT_BUF_SIZE = config.TLS_ENCRYPT_BUF_SIZE;
+pub const TLS_RECORD_MAX_SIZE = config.TLS_RECORD_MAX_SIZE;
 
 /// Per-worker TLS context wrapping SSL_CTX.
 /// One per worker thread — shares config across all connections on that worker.
@@ -64,12 +65,21 @@ pub const TlsContext = struct {
     }
 };
 
+/// Options for creating a client TLS context.
+pub const ClientTlsOpts = struct {
+    verify: bool = true,
+    ca_path: ?[*:0]const u8 = null, // custom CA cert (e.g., Astra SCB ca.crt)
+    cert_path: ?[*:0]const u8 = null, // client certificate for mTLS
+    key_path: ?[*:0]const u8 = null, // client private key for mTLS
+};
+
 /// Per-worker client TLS context for outbound connections.
-/// One per worker — no cert/key, just system CA store for verification.
+/// One per worker — system CA store for verification, or SSL_VERIFY_NONE for insecure mode.
+/// Supports mTLS via optional client certificate + key.
 pub const ClientTlsContext = struct {
     ctx: *c.SSL_CTX,
 
-    pub fn init() !ClientTlsContext {
+    pub fn init(opts: ClientTlsOpts) !ClientTlsContext {
         const method = c.TLS_client_method() orelse return error.TlsMethodFailed;
         const ctx = c.SSL_CTX_new(method) orelse return error.SslCtxNewFailed;
         errdefer c.SSL_CTX_free(ctx);
@@ -79,15 +89,41 @@ pub const ClientTlsContext = struct {
             return error.SetMinProtoFailed;
         }
 
-        // Load system CA store
-        if (c.SSL_CTX_load_verify_locations(ctx, "/etc/pki/tls/certs/ca-bundle.crt", "/etc/pki/tls/certs") != 1) {
-            if (c.SSL_CTX_load_verify_locations(ctx, "/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/certs") != 1) {
-                _ = c.SSL_CTX_set_default_verify_paths(ctx);
+        if (opts.ca_path) |ca| {
+            // Custom CA (e.g., Astra Secure Connect Bundle)
+            if (c.SSL_CTX_load_verify_locations(ctx, ca, null) != 1) {
+                return error.LoadCaFailed;
             }
+            c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_PEER, null);
+        } else if (opts.verify) {
+            // Load system CA store
+            if (c.SSL_CTX_load_verify_locations(ctx, "/etc/pki/tls/certs/ca-bundle.crt", "/etc/pki/tls/certs") != 1) {
+                if (c.SSL_CTX_load_verify_locations(ctx, "/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/certs") != 1) {
+                    _ = c.SSL_CTX_set_default_verify_paths(ctx);
+                }
+            }
+            c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_PEER, null);
+        } else {
+            c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_NONE, null);
         }
 
-        // Enable server certificate verification
-        c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_PEER, null);
+        // Client certificate for mTLS
+        if (opts.cert_path) |cert| {
+            if (c.SSL_CTX_use_certificate_chain_file(ctx, cert) != 1) {
+                return error.LoadClientCertFailed;
+            }
+        }
+        if (opts.key_path) |key| {
+            if (c.SSL_CTX_use_PrivateKey_file(ctx, key, c.SSL_FILETYPE_PEM) != 1) {
+                return error.LoadClientKeyFailed;
+            }
+        }
+        // Verify key matches cert if both provided
+        if (opts.cert_path != null and opts.key_path != null) {
+            if (c.SSL_CTX_check_private_key(ctx) != 1) {
+                return error.KeyCertMismatch;
+            }
+        }
 
         return ClientTlsContext{ .ctx = ctx };
     }
@@ -114,7 +150,12 @@ pub const TlsConn = struct {
     const State = enum { handshaking, established };
 
     pub const HandshakeResult = enum { complete, want_read, failed };
-    pub const DecryptResult = union(enum) { data: usize, want_read, err };
+    pub const DecryptError = struct {
+        ssl_error: c_int,
+        msg: [256]u8 = undefined,
+        msg_len: usize = 0,
+    };
+    pub const DecryptResult = union(enum) { data: usize, want_read, zero_return, err: DecryptError };
 
     pub fn init(allocator: std.mem.Allocator, ssl_ctx: *c.SSL_CTX, mode: Mode) !TlsConn {
         const ssl = c.SSL_new(ssl_ctx) orelse return error.SslNewFailed;
@@ -248,9 +289,35 @@ pub const TlsConn = struct {
     pub fn decrypt(self: *TlsConn, out: []u8) DecryptResult {
         const ret = c.SSL_read(self.ssl, out.ptr, @intCast(out.len));
         if (ret > 0) return .{ .data = @intCast(ret) };
-        const err = c.SSL_get_error(self.ssl, ret);
-        if (err == c.SSL_ERROR_WANT_READ) return .want_read;
-        return .err;
+        const ssl_err = c.SSL_get_error(self.ssl, ret);
+        if (ssl_err == c.SSL_ERROR_WANT_READ) return .want_read;
+        if (ssl_err == c.SSL_ERROR_ZERO_RETURN) {
+            std.log.info("tls decrypt: clean shutdown (SSL_ERROR_ZERO_RETURN)", .{});
+            return .zero_return;
+        }
+
+        // Build error details for caller
+        var de = DecryptError{ .ssl_error = ssl_err };
+
+        // Log and capture the ERR queue
+        var errbuf: [256]u8 = undefined;
+        while (true) {
+            const e = c.ERR_get_error();
+            if (e == 0) break;
+            c.ERR_error_string_n(e, &errbuf, errbuf.len);
+            const msg = std.mem.sliceTo(&errbuf, 0);
+            std.log.err("tls decrypt: SSL_ERROR={d} {s}", .{ ssl_err, msg });
+            // Capture first error message for the caller
+            if (de.msg_len == 0) {
+                @memcpy(de.msg[0..msg.len], msg);
+                de.msg_len = msg.len;
+            }
+        }
+        if (de.msg_len == 0) {
+            std.log.err("tls decrypt: SSL_ERROR={d} (no ERR queue details)", .{ssl_err});
+        }
+
+        return .{ .err = de };
     }
 
     /// Encrypt plaintext for sending. After this call, drainCiphertext()/drainAll()/drainAllAlloc()
@@ -279,3 +346,77 @@ pub fn freeTlsConn(allocator: std.mem.Allocator, tc: *TlsConn) void {
     tc.deinit(allocator);
     allocator.destroy(tc);
 }
+
+/// Per-worker TLS manager — owns the client TLS contexts and fd-to-TlsConn mapping.
+/// Extracted from LuaState to give TLS state a single, focused owner.
+pub const TlsManager = struct {
+    allocator: std.mem.Allocator,
+    client_tls_ctx: ClientTlsContext,
+    insecure_tls_ctx: ClientTlsContext,
+    custom_tls_ctx: ?ClientTlsContext,
+    tls_map: std.AutoHashMapUnmanaged(std.posix.socket_t, *TlsConn),
+
+    pub fn init(allocator: std.mem.Allocator) !TlsManager {
+        const client_tls_ctx = ClientTlsContext.init(.{ .verify = true }) catch return error.TlsInitFailed;
+        const insecure_tls_ctx = ClientTlsContext.init(.{ .verify = false }) catch return error.TlsInitFailed;
+
+        // Custom mTLS context from env vars (e.g., Astra Secure Connect Bundle)
+        const custom_tls_ctx: ?ClientTlsContext = blk: {
+            const ca = std.posix.getenv("CASS_TLS_CA") orelse break :blk null;
+            const cert = std.posix.getenv("CASS_TLS_CERT") orelse break :blk null;
+            const key = std.posix.getenv("CASS_TLS_KEY") orelse break :blk null;
+            const ctx = ClientTlsContext.init(.{
+                .verify = true,
+                .ca_path = @ptrCast(ca.ptr),
+                .cert_path = @ptrCast(cert.ptr),
+                .key_path = @ptrCast(key.ptr),
+            }) catch |err| {
+                std.log.err("custom TLS context init failed (CASS_TLS_*): {}", .{err});
+                break :blk null;
+            };
+            std.log.info("custom mTLS context loaded from CASS_TLS_CA/CERT/KEY", .{});
+            break :blk ctx;
+        };
+
+        return TlsManager{
+            .allocator = allocator,
+            .client_tls_ctx = client_tls_ctx,
+            .insecure_tls_ctx = insecure_tls_ctx,
+            .custom_tls_ctx = custom_tls_ctx,
+            .tls_map = .{},
+        };
+    }
+
+    /// Ownership transfers to TlsManager.
+    pub fn registerTls(self: *TlsManager, fd: std.posix.socket_t, tls_conn: *TlsConn) !void {
+        try self.tls_map.put(self.allocator, fd, tls_conn);
+    }
+
+    /// Borrow — returns null for plain TCP.
+    pub fn getTls(self: *TlsManager, fd: std.posix.socket_t) ?*TlsConn {
+        return self.tls_map.get(fd);
+    }
+
+    /// Ownership transfers to caller. Used for pool transfer or manual cleanup.
+    pub fn detachTls(self: *TlsManager, fd: std.posix.socket_t) ?*TlsConn {
+        return if (self.tls_map.fetchRemove(fd)) |kv| kv.value else null;
+    }
+
+    /// Remove and free. Used on close paths.
+    pub fn removeTls(self: *TlsManager, fd: std.posix.socket_t) void {
+        if (self.tls_map.fetchRemove(fd)) |kv| {
+            freeTlsConn(self.allocator, kv.value);
+        }
+    }
+
+    pub fn deinit(self: *TlsManager) void {
+        var tls_it = self.tls_map.iterator();
+        while (tls_it.next()) |entry| {
+            freeTlsConn(self.allocator, entry.value_ptr.*);
+        }
+        self.tls_map.deinit(self.allocator);
+        self.client_tls_ctx.deinit();
+        self.insecure_tls_ctx.deinit();
+        if (self.custom_tls_ctx) |*ctx| ctx.deinit();
+    }
+};

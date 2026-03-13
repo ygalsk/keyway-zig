@@ -19,6 +19,15 @@ pub const HttpExchange = struct {
     response_headers: std.ArrayList(http.Header),
     response_body: []const u8 = "",
 
+    // === WEBSOCKET UPGRADE ===
+    upgrade_websocket: bool = false,
+    ws_on_message_ref: i32 = 0, // Lua registry ref for on_message callback
+    ws_on_close_ref: i32 = 0, // Lua registry ref for on_close callback
+
+    // === SSE UPGRADE ===
+    upgrade_sse: bool = false,
+    sse_room: []const u8 = "",
+
     // === INTERNAL ===
     allocator: std.mem.Allocator,
 

@@ -5,6 +5,9 @@ const Server = @import("server.zig").Server;
 const Router = @import("router.zig").Router;
 const LuaState = @import("lua_state.zig").LuaState;
 const lua_api = @import("lua_api.zig");
+const sse = @import("sse.zig");
+const SseRegistry = sse.SseRegistry;
+const SseBroadcastBus = sse.SseBroadcastBus;
 
 /// Pin calling thread to specified CPU core (Linux-only)
 /// This is architecturally required for proactor systems to ensure:
@@ -43,6 +46,7 @@ pub const Worker = struct {
         worker_id: usize,
         num_workers: usize,
         bpf_ready: *std.atomic.Value(bool),
+        sse_bus: ?*SseBroadcastBus,
     };
 
     /// Spawn a worker thread
@@ -52,6 +56,7 @@ pub const Worker = struct {
         worker_id: usize,
         num_workers: usize,
         bpf_ready: *std.atomic.Value(bool),
+        sse_bus: ?*SseBroadcastBus,
     ) !Worker {
         const ctx = try allocator.create(Context);
         ctx.* = Context{
@@ -60,6 +65,7 @@ pub const Worker = struct {
             .worker_id = worker_id,
             .num_workers = num_workers,
             .bpf_ready = bpf_ready,
+            .sse_bus = sse_bus,
         };
 
         const thread = try std.Thread.spawn(.{}, workerMain, .{ctx});
@@ -98,9 +104,23 @@ pub const Worker = struct {
         var router = try Router.init(ctx.allocator);
         defer router.deinit();
 
+        // Each worker has its own SSE registry (per-worker, no sharing)
+        var sse_registry = SseRegistry.init(ctx.allocator);
+        defer sse_registry.deinit();
+
+        // Wire SSE bus for cross-worker broadcast
+        if (ctx.sse_bus) |bus| {
+            sse_registry.bus = bus;
+            sse_registry.worker_id = ctx.worker_id;
+            bus.registerWorker(ctx.worker_id, &sse_registry, &loop);
+        }
+
         // Each worker has its own Lua state (one per thread!)
         var lua_state = try LuaState.init(ctx.allocator);
         defer lua_state.deinit();
+
+        // Set SSE registry on LuaState (for broadcast C function)
+        lua_state.sse_registry = &sse_registry;
 
         // Register cosocket API (needs stable *LuaState pointer)
         lua_state.registerCosocketApi();
@@ -126,6 +146,7 @@ pub const Worker = struct {
             @intCast(ctx.num_workers),
             @intCast(ctx.worker_id),
             ctx.bpf_ready,
+            &sse_registry,
         );
         defer server.deinit();
 
@@ -144,6 +165,7 @@ pub const ThreadPool = struct {
     allocator: std.mem.Allocator,
     workers: []Worker,
     bpf_ready: *std.atomic.Value(bool),
+    sse_bus: ?*SseBroadcastBus,
 
     /// Create thread pool with one worker per CPU core
     pub fn init(
@@ -161,15 +183,19 @@ pub const ThreadPool = struct {
         bpf_ready.* = std.atomic.Value(bool).init(false);
         errdefer allocator.destroy(bpf_ready);
 
+        // Create SSE broadcast bus (shared across all workers)
+        const sse_bus = SseBroadcastBus.init(allocator, num_cpus) catch null;
+
         // Spawn workers
         for (workers, 0..) |*worker, i| {
-            worker.* = try Worker.spawn(allocator, config, i, num_cpus, bpf_ready);
+            worker.* = try Worker.spawn(allocator, config, i, num_cpus, bpf_ready, sse_bus);
         }
 
         return ThreadPool{
             .allocator = allocator,
             .workers = workers,
             .bpf_ready = bpf_ready,
+            .sse_bus = sse_bus,
         };
     }
 
@@ -182,6 +208,7 @@ pub const ThreadPool = struct {
 
     /// Cleanup thread pool
     pub fn deinit(self: *ThreadPool) void {
+        if (self.sse_bus) |bus| bus.deinit();
         self.allocator.destroy(self.bpf_ready);
         self.allocator.free(self.workers);
     }

@@ -49,18 +49,31 @@ No Lua state is shared. No cross-thread access. Workers are pinned to CPU cores 
 | Module | Role |
 |---|---|
 | `main.zig` | Entry point, creates `ThreadPool` |
-| `worker.zig` | Per-core thread with pinning, owns xev.Loop + LuaState + Router + Server |
-| `server.zig` | TCP listener, accept loop, SO_REUSEPORT, BPF attachment |
-| `handler.zig` | `Connection` struct — owns socket lifecycle, read/write completions, arena, buffers; `SuspendedState` for cosocket yield/resume |
+| `worker.zig` | Per-core thread with CPU pinning, owns xev.Loop + LuaState + Router + Server |
+| `server.zig` | TCP listener, accept loop, SO_REUSEPORT, BPF attachment, TLS context init |
+| `handler.zig` | `Connection` struct — socket lifecycle, read/write completions, arena, buffers, `SuspendedState` for coroutine yield/resume |
 | `lua_state.zig` | LuaJIT state management, handler dispatch, coroutine lifecycle |
-| `lua_api.zig` | Lua metatables for `ctx` (HttpExchange), headers proxy, params table, route table processing, cosocket API registration |
+| `lua_api.zig` | Lua metatables for `ctx` (HttpExchange), headers proxy, params table, cosocket API registration |
+| `route_loader.zig` | Route table processing from Lua `keyway.routes` declarations |
 | `http_exchange.zig` | `HttpExchange` — the single Lua-visible object binding request/response |
 | `http.zig` | HTTP types (`Request`, `Response`, `Header`), picohttpparser C bindings, response serialization |
 | `router.zig` | Segment-level trie router with `{param}` support, zero-alloc matching |
+| `params.zig` | `ParamArray`, `QueryArray`, `parseQueryString` — inline parameter storage |
 | `buffer.zig` | `LinearBuffer` for single-request I/O |
+| `config.zig` | Centralized tunable constants (buffer sizes, limits, capacities) |
+| `ring.zig` | `IoEntry` tagged union, `SubmissionRing`, `CompletionRing` for batched cosocket I/O |
+| `ring_api.zig` | Lua C API for ring push/submit/result |
+| `cosocket.zig` | Outbound I/O engine: submission ring drain, batch ops, coroutine resume |
 | `io_request.zig` | `IoRequest` — typed outbound I/O descriptor passed from Lua cosocket API to Zig |
 | `connection_pool.zig` | Per-worker cosocket connection pool, keyed by destination, LIFO, lazy expiry |
+| `tls.zig` | `TlsConn`, `TlsContext`, `ClientTlsContext`, `TlsManager` — TLS primitives |
+| `conn_tls.zig` | Inbound TLS handshake/decrypt state machine for accepted connections |
+| `conn_ws.zig` | WebSocket upgrade, frame encoding/decoding, send/recv |
+| `ws.zig` | WebSocket frame parsing (low-level) |
+| `conn_sse.zig` | SSE upgrade, per-connection send, disconnect watch |
+| `sse.zig` | `SseRegistry` (per-worker room→subscribers), `SseBroadcastBus` (cross-worker pub/sub) |
 | `bpf_reuseport.zig` | Classic BPF program generation for SO_REUSEPORT worker affinity (disabled by default) |
+| `log.zig` | Custom log formatting |
 
 ### The Lua Contract
 

@@ -1,53 +1,145 @@
-<div class="page-header">
-  <h1>Webhook: <code><%= hook_id %></code></h1>
+<div class="page-header page-header-hooks">
+  <h1>Webhook: <code><%= hook_id %></code>
+    <span class="count-badge" id="request-count"><%= requests and #requests or 0 %></span>
+  </h1>
 </div>
 
 <div style="margin-bottom: 1.5rem;">
   <label>Catch URL</label>
-  <code class="catch-url">http://localhost:8080/h/<%= hook_id %></code>
+  <div class="copy-row">
+    <code class="catch-url" id="catch-url">http://localhost:8080/h/<%= hook_id %></code>
+    <button class="btn-copy" onclick="copyUrl()" id="copy-btn" aria-label="Copy catch URL to clipboard">Copy</button>
+  </div>
 </div>
 
 <% if error_msg then %>
 <div class="banner-error"><%= error_msg %></div>
 <% end %>
 
-<% if requests and #requests > 0 then %>
-<p class="metric" style="margin-bottom: 1rem;"><%= #requests %> request<%= #requests ~= 1 and "s" or "" %> captured</p>
-<% for _, req in ipairs(requests) do %>
 <div class="card">
-  <div style="display: flex; align-items: baseline; gap: 1rem; margin-bottom: 1rem; flex-wrap: wrap;">
+  <h3 style="margin-bottom: 1rem;">Send Test Request</h3>
+  <form id="test-form" onsubmit="sendTest(event)">
+    <div class="test-row">
+      <div class="form-group test-method">
+        <label for="test-method">Method</label>
+        <select id="test-method" name="method">
+          <option value="GET">GET</option>
+          <option value="POST" selected>POST</option>
+          <option value="PUT">PUT</option>
+          <option value="DELETE">DELETE</option>
+        </select>
+      </div>
+      <div class="form-group" style="flex: 1;">
+        <label for="test-body">Body (optional)</label>
+        <input type="text" id="test-body" name="body" placeholder='{"hello": "world"}'>
+      </div>
+      <button type="submit" class="btn btn-secondary" style="margin-bottom: 0;">Send</button>
+    </div>
+  </form>
+</div>
+
+<h3 style="margin: 1.5rem 0 0.75rem;">Captured Requests</h3>
+<div id="requests-container" aria-live="polite" aria-label="Captured requests">
+<% if requests and #requests > 0 then %>
+<% for _, req in ipairs(requests) do %>
+<details class="request-item">
+  <summary>
     <code class="method-badge method-<%= string.lower(req.method) %>"><%= req.method %></code>
     <code><%= req.path %></code>
     <span class="metric" style="margin-left: auto;"><%= req.timestamp_str or "" %></span>
-  </div>
-
-  <% if req.headers and #req.headers > 0 then %>
-  <h3 style="margin-bottom: 0.5rem;">Headers</h3>
-  <table class="data-table" style="margin-bottom: 1rem;">
-    <tr>
-      <th style="width: 35%;">Name</th>
-      <th>Value</th>
-    </tr>
-    <% for _, h in ipairs(req.headers) do %>
-    <tr>
-      <td><%= h[1] %></td>
-      <td><%= h[2] %></td>
-    </tr>
+  </summary>
+  <div class="request-body">
+    <% if req.headers and #req.headers > 0 then %>
+    <h3 style="margin: 1rem 0 0.5rem;">Headers</h3>
+    <table class="data-table">
+      <tr>
+        <th style="width: 35%;">Name</th>
+        <th>Value</th>
+      </tr>
+      <% for _, h in ipairs(req.headers) do %>
+      <tr>
+        <td><%= h[1] %></td>
+        <td><%= h[2] %></td>
+      </tr>
+      <% end %>
+    </table>
     <% end %>
-  </table>
-  <% end %>
 
-  <h3 style="margin-bottom: 0.5rem;">Body</h3>
-  <% if req.body and req.body ~= "" then %>
-  <% local display_body = #req.body > 500 and (req.body:sub(1, 500) .. "\n... (truncated)") or req.body %>
-  <pre><code><%= display_body %></code></pre>
-  <% else %>
-  <p class="empty-state" style="font-style: italic;">(no body)</p>
-  <% end %>
-</div>
+    <h3 style="margin: 1rem 0 0.5rem;">Body</h3>
+    <% if req.body and req.body ~= "" then %>
+    <% local display_body = #req.body > 500 and (req.body:sub(1, 500) .. "\n... (truncated)") or req.body %>
+    <pre><code><%= display_body %></code></pre>
+    <% else %>
+    <p class="empty-state" style="font-style: italic;">(no body)</p>
+    <% end %>
+  </div>
+</details>
 <% end %>
-<% else %>
-<div class="card">
-  <p class="empty-state">No requests captured yet. Send an HTTP request to the catch URL above.</p>
-</div>
 <% end %>
+</div>
+
+<div class="card" id="empty-state" style="margin-top: 1.5rem;<% if requests and #requests > 0 then %> display:none;<% end %>">
+  <p class="empty-state">No requests captured yet. Send a test request above, or hit the catch URL from anywhere.</p>
+</div>
+
+<script>
+var hookId = '<%= hook_id %>';
+
+function copyUrl() {
+  var url = document.getElementById('catch-url').textContent;
+  copyText(url, document.getElementById('copy-btn'));
+}
+
+function sendTest(e) {
+  e.preventDefault();
+  var method = document.getElementById('test-method').value;
+  var body = document.getElementById('test-body').value;
+  var form = new URLSearchParams();
+  form.append('method', method);
+  form.append('body', body);
+  fetch('/hooks/' + hookId + '/test', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+    body: form.toString(),
+  });
+}
+
+var container = document.getElementById('requests-container');
+var emptyState = document.getElementById('empty-state');
+var countBadge = document.getElementById('request-count');
+
+var es = new EventSource('/hooks/' + hookId + '/events');
+es.onmessage = function(e) {
+  var d = JSON.parse(e.data);
+  emptyState.style.display = 'none';
+
+  var details = document.createElement('details');
+  details.className = 'request-item';
+
+  var methodLower = (d.method || 'GET').toLowerCase();
+  var headersHtml = '';
+  if (d.headers && d.headers.length > 0) {
+    headersHtml = '<h3 style="margin: 1rem 0 0.5rem;">Headers</h3><table class="data-table"><tr><th style="width: 35%;">Name</th><th>Value</th></tr>';
+    for (var i = 0; i < d.headers.length; i++) {
+      headersHtml += '<tr><td>' + escapeHtml(d.headers[i][0] || '') + '</td><td>' + escapeHtml(d.headers[i][1] || '') + '</td></tr>';
+    }
+    headersHtml += '</table>';
+  }
+
+  var bodyDisplay = d.body && d.body !== '' ? '<pre><code>' + escapeHtml(d.body.length > 500 ? d.body.substring(0, 500) + '\n... (truncated)' : d.body) + '</code></pre>' : '<p class="empty-state" style="font-style: italic;">(no body)</p>';
+
+  details.innerHTML = '<summary>'
+    + '<code class="method-badge method-' + methodLower + '">' + escapeHtml(d.method || 'GET') + '</code> '
+    + '<code>' + escapeHtml(d.path || '/') + '</code> '
+    + '<span class="metric" style="margin-left: auto;">' + escapeHtml(d.timestamp_str || '') + '</span>'
+    + '</summary>'
+    + '<div class="request-body">'
+    + headersHtml
+    + '<h3 style="margin: 1rem 0 0.5rem;">Body</h3>'
+    + bodyDisplay
+    + '</div>';
+
+  container.insertBefore(details, container.firstChild);
+  countBadge.textContent = parseInt(countBadge.textContent || '0') + 1;
+};
+</script>

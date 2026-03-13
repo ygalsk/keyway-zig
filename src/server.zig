@@ -5,6 +5,7 @@ const Router = @import("router.zig").Router;
 const LuaState = @import("lua_state.zig").LuaState;
 const bpf_reuseport = @import("bpf_reuseport.zig");
 const TlsContext = @import("tls.zig").TlsContext;
+const SseRegistry = @import("sse.zig").SseRegistry;
 
 // TCP socket configuration
 const DEFAULT_BACKLOG: u31 = 128;
@@ -20,6 +21,7 @@ pub const Server = struct {
     router: *Router,
     lua_state: *LuaState,
     tls_ctx: ?TlsContext,
+    sse_registry: ?*SseRegistry,
 
     /// Server configuration
     pub const Config = struct {
@@ -40,6 +42,7 @@ pub const Server = struct {
         num_workers: u32,
         worker_id: u32,
         bpf_ready: ?*std.atomic.Value(bool),
+        sse_registry: ?*SseRegistry,
     ) !Server {
         // Parse address
         const addr = try std.net.Address.parseIp(config.host, config.port);
@@ -118,6 +121,7 @@ pub const Server = struct {
             .router = router,
             .lua_state = lua_state,
             .tls_ctx = tls_ctx,
+            .sse_registry = sse_registry,
         };
     }
 
@@ -172,6 +176,7 @@ pub const Server = struct {
             client_socket,
             self.router,
             self.lua_state,
+            self.sse_registry,
         ) catch |err| {
             std.log.err("connection init failed err={}", .{err});
             std.posix.close(client_socket);
@@ -221,6 +226,6 @@ test "server init and deinit" {
         .port = 0, // Let OS assign port
     };
 
-    var server = try Server.init(allocator, &loop, config, &router, &lua_state, 1, 0, null);
+    var server = try Server.init(allocator, &loop, config, &router, &lua_state, 1, 0, null, null);
     defer server.deinit();
 }

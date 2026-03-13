@@ -1,21 +1,10 @@
-<div class="page-header">
+<div class="page-header page-header-hooks">
   <h1>Webhook Catcher</h1>
   <p>Generate a unique endpoint URL. Send any HTTP request to it — we'll catch it.</p>
 </div>
 
 <% if error_msg then %>
 <div class="banner-error"><%= error_msg %></div>
-<% end %>
-
-<% if new_id then %>
-<div class="result-card">
-  <h2>Your webhook is ready</h2>
-  <div style="margin-bottom: 1rem;">
-    <label>Send requests here</label>
-    <code class="catch-url">http://localhost:8080/h/<%= new_id %></code>
-  </div>
-  <a href="/hooks/<%= new_id %>">View captured requests →</a>
-</div>
 <% end %>
 
 <div class="card">

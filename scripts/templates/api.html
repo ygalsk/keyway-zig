@@ -1,0 +1,124 @@
+<div class="page-header page-header-api">
+  <h1>JSON API</h1>
+  <p>RESTful todo API with Bearer token auth and Postgres storage</p>
+</div>
+
+<div class="card">
+  <h2>1. Get a Token</h2>
+  <form method="POST" action="/api" id="token-form">
+    <div class="form-group">
+      <label for="token-name">Token Name</label>
+      <input type="text" id="token-name" name="name" placeholder="my-app" required>
+    </div>
+    <button type="submit" class="btn btn-primary">Generate Token</button>
+  </form>
+</div>
+
+<% if token then %>
+<div class="result-card" role="status">
+  <h2><span aria-hidden="true">&#10003;</span> Your API Token</h2>
+  <div class="copy-row" style="margin-top: 0.75rem;">
+    <span class="catch-url" id="api-token"><%= token %></span>
+    <button class="btn-copy" aria-label="Copy API token to clipboard" onclick="copyText(document.getElementById('api-token').textContent, this)">Copy</button>
+  </div>
+  <p class="metric" style="margin-top: 0.5rem;">Use this as <code>Authorization: Bearer &lt;token&gt;</code></p>
+</div>
+<% end %>
+
+<% if error_msg then %>
+<div class="banner-error"><%= error_msg %></div>
+<% end %>
+
+<div class="card">
+  <h2>2. Explore the API</h2>
+  <p class="metric" style="margin-bottom: 1rem;">Enter your token and interact with the todos API.</p>
+
+  <div class="form-group">
+    <label for="bearer-token">Bearer Token</label>
+    <input type="text" id="bearer-token" placeholder="Paste your token here" value="<%= token or '' %>">
+  </div>
+
+  <div class="btn-group" style="margin-bottom: 1rem; flex-wrap: wrap;">
+    <button class="btn btn-secondary" onclick="apiCall('GET', '/api/todos')">List Todos</button>
+    <button class="btn btn-secondary" onclick="createTodo()">Create Todo</button>
+  </div>
+
+  <div id="api-log" style="margin-top: 1rem;"></div>
+</div>
+
+<div class="card">
+  <h2>Endpoints</h2>
+  <table class="data-table">
+    <thead>
+      <tr><th>Method</th><th>Path</th><th>Description</th></tr>
+    </thead>
+    <tbody>
+      <tr>
+        <td><span class="method-badge method-post">POST</span></td>
+        <td><code>/api</code></td>
+        <td>Generate a new API token</td>
+      </tr>
+      <tr>
+        <td><span class="method-badge method-get">GET</span></td>
+        <td><code>/api/todos</code></td>
+        <td>List your todos</td>
+      </tr>
+      <tr>
+        <td><span class="method-badge method-post">POST</span></td>
+        <td><code>/api/todos</code></td>
+        <td>Create a todo (JSON body: <code>{"title":"..."}</code>)</td>
+      </tr>
+      <tr>
+        <td><span class="method-badge method-put">PUT</span></td>
+        <td><code>/api/todos/{id}</code></td>
+        <td>Update a todo (JSON body: <code>{"done":true}</code>)</td>
+      </tr>
+      <tr>
+        <td><span class="method-badge method-delete">DELETE</span></td>
+        <td><code>/api/todos/{id}</code></td>
+        <td>Delete a todo</td>
+      </tr>
+    </tbody>
+  </table>
+</div>
+
+<script>
+function getToken() {
+  return document.getElementById('bearer-token').value.trim();
+}
+
+function appendLog(method, path, status, body) {
+  var log = document.getElementById('api-log');
+  var cls = (status >= 200 && status < 300) ? 'terminal-response' : 'terminal-response terminal-error';
+  var entry = document.createElement('div');
+  entry.className = cls;
+  var bodyStr = typeof body === 'object' ? JSON.stringify(body, null, 2) : body;
+  entry.innerHTML = '<span class="terminal-prompt">' + method + ' ' + path + '</span> '
+    + '<span class="terminal-result">' + status + '</span>'
+    + '<pre style="margin-top:0.5rem;border:none;padding:0;background:none;"><code>' + bodyStr + '</code></pre>';
+  log.insertBefore(entry, log.firstChild);
+}
+
+function apiCall(method, path, body) {
+  var opts = {
+    method: method,
+    headers: { 'Authorization': 'Bearer ' + getToken() }
+  };
+  if (body) {
+    opts.headers['Content-Type'] = 'application/json';
+    opts.body = JSON.stringify(body);
+  }
+  fetch(path, opts).then(function(res) {
+    return res.json().then(function(data) {
+      appendLog(method, path, res.status, data);
+    });
+  }).catch(function(err) {
+    appendLog(method, path, 0, 'Network error: ' + err);
+  });
+}
+
+function createTodo() {
+  var title = prompt('Todo title:');
+  if (title) apiCall('POST', '/api/todos', { title: title });
+}
+</script>

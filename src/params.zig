@@ -1,0 +1,153 @@
+const std = @import("std");
+const config = @import("config.zig");
+
+pub const MAX_ROUTE_PARAMS = config.MAX_ROUTE_PARAMS;
+pub const MAX_QUERY_PARAMS = config.MAX_QUERY_PARAMS;
+
+/// Lightweight param storage - replaces HashMap for route params
+/// O(n) lookup but n ≤ 4, cache-friendly, zero allocations
+pub const ParamArray = struct {
+    items: [MAX_ROUTE_PARAMS]Param = undefined,
+    len: usize = 0,
+
+    const Param = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
+    pub fn put(self: *ParamArray, key: []const u8, value: []const u8) error{TooManyParams}!void {
+        if (self.len >= MAX_ROUTE_PARAMS) return error.TooManyParams;
+        self.items[self.len] = .{ .key = key, .value = value };
+        self.len += 1;
+    }
+
+    pub fn get(self: *const ParamArray, key: []const u8) ?[]const u8 {
+        for (self.items[0..self.len]) |param| {
+            if (std.mem.eql(u8, param.key, key)) return param.value;
+        }
+        return null;
+    }
+
+    pub fn clear(self: *ParamArray) void {
+        self.len = 0;
+    }
+};
+
+/// Lightweight query param storage - same pattern as ParamArray
+pub const QueryArray = struct {
+    items: [MAX_QUERY_PARAMS]Entry = undefined,
+    len: usize = 0,
+
+    const Entry = struct {
+        key: []const u8,
+        value: []const u8,
+    };
+
+    pub fn put(self: *QueryArray, key: []const u8, value: []const u8) error{TooManyParams}!void {
+        if (self.len >= MAX_QUERY_PARAMS) return error.TooManyParams;
+        self.items[self.len] = .{ .key = key, .value = value };
+        self.len += 1;
+    }
+
+    pub fn get(self: *const QueryArray, key: []const u8) ?[]const u8 {
+        for (self.items[0..self.len]) |entry| {
+            if (std.mem.eql(u8, entry.key, key)) return entry.value;
+        }
+        return null;
+    }
+
+    pub fn clear(self: *QueryArray) void {
+        self.len = 0;
+    }
+};
+
+/// Parse a query string (everything after '?') into a QueryArray.
+/// Splits on '&', then each pair on '='. Values are zero-copy slices.
+/// Does NOT perform percent-decoding; callers get raw slices.
+pub fn parseQueryString(raw: []const u8, out: *QueryArray) void {
+    var pairs = std.mem.splitScalar(u8, raw, '&');
+    while (pairs.next()) |pair| {
+        if (pair.len == 0) continue;
+        if (std.mem.indexOfScalar(u8, pair, '=')) |eq| {
+            out.put(pair[0..eq], pair[eq + 1 ..]) catch {
+                std.log.warn("query string exceeds {d} params, truncating", .{MAX_QUERY_PARAMS});
+                return;
+            };
+        } else {
+            out.put(pair, "") catch {
+                std.log.warn("query string exceeds {d} params, truncating", .{MAX_QUERY_PARAMS});
+                return;
+            };
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tests
+// ---------------------------------------------------------------------------
+
+test "ParamArray put and get" {
+    var p = ParamArray{};
+    try p.put("id", "42");
+    try p.put("name", "alice");
+
+    try std.testing.expectEqualStrings("42", p.get("id").?);
+    try std.testing.expectEqualStrings("alice", p.get("name").?);
+    try std.testing.expect(p.get("missing") == null);
+}
+
+test "ParamArray clear resets length" {
+    var p = ParamArray{};
+    try p.put("a", "1");
+    p.clear();
+    try std.testing.expectEqual(@as(usize, 0), p.len);
+    try std.testing.expect(p.get("a") == null);
+}
+
+test "ParamArray rejects overflow" {
+    var p = ParamArray{};
+    for (0..MAX_ROUTE_PARAMS) |i| {
+        const key: []const u8 = switch (i) {
+            0 => "a",
+            1 => "b",
+            2 => "c",
+            3 => "d",
+            else => unreachable,
+        };
+        try p.put(key, "v");
+    }
+    try std.testing.expectError(error.TooManyParams, p.put("overflow", "v"));
+}
+
+test "parseQueryString normal input" {
+    var q = QueryArray{};
+    parseQueryString("foo=bar&baz=qux", &q);
+
+    try std.testing.expectEqual(@as(usize, 2), q.len);
+    try std.testing.expectEqualStrings("bar", q.get("foo").?);
+    try std.testing.expectEqualStrings("qux", q.get("baz").?);
+}
+
+test "parseQueryString empty input" {
+    var q = QueryArray{};
+    parseQueryString("", &q);
+    try std.testing.expectEqual(@as(usize, 0), q.len);
+}
+
+test "parseQueryString key without value" {
+    var q = QueryArray{};
+    parseQueryString("flag&key=val", &q);
+
+    try std.testing.expectEqual(@as(usize, 2), q.len);
+    try std.testing.expectEqualStrings("", q.get("flag").?);
+    try std.testing.expectEqualStrings("val", q.get("key").?);
+}
+
+test "parseQueryString truncates on overflow" {
+    var q = QueryArray{};
+    // MAX_QUERY_PARAMS is 4, so 5 params should truncate
+    parseQueryString("a=1&b=2&c=3&d=4&e=5", &q);
+    try std.testing.expectEqual(@as(usize, MAX_QUERY_PARAMS), q.len);
+    // The 5th param should not be present
+    try std.testing.expect(q.get("e") == null);
+}

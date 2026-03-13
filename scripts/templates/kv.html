@@ -1,92 +1,71 @@
-<div class="page-header">
+<div class="page-header page-header-kv">
   <h1>KV Store</h1>
   <p>Store and retrieve key-value pairs backed by Redis</p>
 </div>
 
+<% if error_msg then %>
+<div class="banner-error"><%= error_msg %></div>
+<% end %>
+
 <% if result then %>
-<div class="result-card">
-  <h2>Result</h2>
-  <% if result.action == "get" then %>
-    <% if result.value then %>
-    <table class="data-table">
-      <tr>
-        <th>Key</th>
-        <th>Value</th>
-      </tr>
-      <tr>
-        <td><%= result.key %></td>
-        <td><%= result.value %></td>
-      </tr>
-    </table>
-    <% else %>
-    <p class="empty-state">Key "<%= result.key %>" not found</p>
-    <% end %>
-  <% elseif result.action == "set" then %>
-    <p class="metric">SET <span style="color: var(--accent);"><%= result.key %></span> = <%= result.display_value %></p>
+<div class="terminal-response">
+  <span class="terminal-prompt">&gt;</span>
+  <% if result.action == "set" then %>
+  SET <span style="color: var(--accent);"><%= result.key %></span> "<%= result.display_value %>" <span class="terminal-result">OK</span>
+  <% elseif result.action == "get" then %>
+  GET <span style="color: var(--accent);"><%= result.key %></span> <span class="terminal-result"><%= result.value and ('"' .. result.value .. '"') or "(nil)" %></span>
   <% elseif result.action == "del" then %>
-    <p class="metric">DEL <span style="color: var(--accent);"><%= result.key %></span> — <% if result.count and result.count > 0 then %>removed<% else %>key did not exist<% end %></p>
+  DEL <span style="color: var(--accent);"><%= result.key %></span> <span class="terminal-result"><%= (result.count and result.count > 0) and "(integer) 1" or "(integer) 0" %></span>
   <% end %>
 </div>
 <% end %>
 
 <div class="card">
-  <h2>Set a Key</h2>
-  <form method="POST" action="/kv">
-    <input type="hidden" name="action" value="set">
-    <div class="form-group">
-      <label for="set-key">Key</label>
-      <input type="text" id="set-key" name="key" placeholder="my-key" required>
+  <h2>Command</h2>
+  <form method="POST" action="/kv" id="kv-form">
+    <div class="command-bar">
+      <div class="form-group cmd-op">
+        <label for="kv-action">Operation</label>
+        <select id="kv-action" name="action" onchange="toggleValue()">
+          <option value="set">SET</option>
+          <option value="get">GET</option>
+          <option value="del">DEL</option>
+        </select>
+      </div>
+      <div class="form-group cmd-key">
+        <label for="kv-key">Key</label>
+        <input type="text" id="kv-key" name="key" placeholder="my-key" required>
+      </div>
+      <div class="form-group cmd-value" id="value-group">
+        <label for="kv-value">Value</label>
+        <input type="text" id="kv-value" name="value" placeholder="my-value">
+      </div>
+      <button type="submit" class="btn btn-primary" aria-label="Run KV command" style="margin-bottom: 0;">Run</button>
     </div>
-    <div class="form-group">
-      <label for="set-value">Value</label>
-      <input type="text" id="set-value" name="value" placeholder="my-value" required>
-    </div>
-    <button type="submit" class="btn btn-primary">SET</button>
   </form>
 </div>
 
-<div class="flex-row">
-  <div class="card">
-    <h2>Get a Key</h2>
-    <form method="POST" action="/kv">
-      <input type="hidden" name="action" value="get">
-      <div class="form-group">
-        <label for="get-key">Key</label>
-        <input type="text" id="get-key" name="key" placeholder="my-key" required>
-      </div>
-      <button type="submit" class="btn btn-primary">GET</button>
-    </form>
-  </div>
-
-  <div class="card">
-    <h2>Delete a Key</h2>
-    <form method="POST" action="/kv">
-      <input type="hidden" name="action" value="del">
-      <div class="form-group">
-        <label for="del-key">Key</label>
-        <input type="text" id="del-key" name="key" placeholder="my-key" required>
-      </div>
-      <button type="submit" class="btn btn-danger">DEL</button>
-    </form>
-  </div>
-</div>
-
 <div class="card">
-  <h2>All Keys</h2>
+  <h2>All Keys <% if keys and #keys > 0 then %><span class="count-badge"><%= #keys %></span><% end %></h2>
   <% if keys and #keys > 0 then %>
-  <table class="data-table">
-    <tr>
-      <th>#</th>
-      <th>Key</th>
-    </tr>
-    <% for i, k in ipairs(keys) do %>
-    <tr>
-      <td><%= i %></td>
-      <td><%= k %></td>
-    </tr>
+  <div class="keys-list">
+    <% for _, k in ipairs(keys) do %>
+    <form method="POST" action="/kv" style="display:inline;">
+      <input type="hidden" name="action" value="get">
+      <input type="hidden" name="key" value="<%= k %>">
+      <button type="submit" class="key-btn"><%= k %></button>
+    </form>
     <% end %>
-  </table>
+  </div>
   <% else %>
   <p class="empty-state">No keys stored yet</p>
   <% end %>
 </div>
+
+<script>
+function toggleValue() {
+  var action = document.getElementById('kv-action').value;
+  var group = document.getElementById('value-group');
+  group.style.display = action === 'set' ? '' : 'none';
+}
+</script>
