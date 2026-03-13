@@ -24,7 +24,7 @@ pub const LinearBuffer = struct {
     }
 
     /// Get slice available for writing
-    pub fn writeSlice(self: *LinearBuffer) []u8 {
+    pub inline fn writeSlice(self: *LinearBuffer) []u8 {
         return self.data[self.write_pos..];
     }
 
@@ -34,7 +34,7 @@ pub const LinearBuffer = struct {
     }
 
     /// Get slice available for reading
-    pub fn readSlice(self: *LinearBuffer) []const u8 {
+    pub inline fn readSlice(self: *LinearBuffer) []const u8 {
         return self.data[self.read_pos..self.write_pos];
     }
 
@@ -50,12 +50,12 @@ pub const LinearBuffer = struct {
     }
 
     /// Get available space for writing
-    pub fn availableWrite(self: *LinearBuffer) usize {
+    pub inline fn availableWrite(self: *LinearBuffer) usize {
         return self.data.len - self.write_pos;
     }
 
     /// Get available data for reading
-    pub fn availableRead(self: *LinearBuffer) usize {
+    pub inline fn availableRead(self: *LinearBuffer) usize {
         return self.write_pos - self.read_pos;
     }
 

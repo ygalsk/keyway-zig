@@ -1,10 +1,20 @@
+//! Lua metatable strategy and pointer-in-userdata pattern.
+//!
+//! Three metatables: HttpExchange (ctx), HttpExchange.Headers (ctx.headers), WsContext (ws).
+//! Userdata contains a pointer (*HttpExchange or *WsContext), not the struct itself.
+//! Fresh userdata per request/message — no singleton sharing across connections.
+//!
+//! Read path:  ctx.field → __index metamethod → reads from HttpExchange
+//! Write path: ctx.field = val → __newindex → sets on HttpExchange (status, body, headers)
+
 const std = @import("std");
 const Lua = @import("luajit").Lua;
 const http = @import("http.zig");
 const HttpExchange = @import("http_exchange.zig").HttpExchange;
 const Router = @import("router.zig").Router;
-const handler = @import("handler.zig");
+const params = @import("params.zig");
 const route_loader = @import("route_loader.zig");
+const castUserdata = @import("helpers.zig").castUserdata;
 
 // Re-export route table processing (now lives in route_loader.zig)
 pub const processRouteTable = route_loader.processRouteTable;
@@ -19,13 +29,13 @@ fn getExchange(lua: *Lua, index: i32) *HttpExchange {
         lua.raiseError();
         unreachable;
     };
-    return @as(**HttpExchange, @ptrCast(@alignCast(ud))).*;
+    return castUserdata(*HttpExchange, @as(?*anyopaque, ud)).*;
 }
 
 /// Helper: Get HeadersProxy from userdata at given stack index.
 inline fn getProxy(lua: *Lua, index: i32) ?*HeadersProxy {
     const ud = lua.toUserdata(index) orelse return null;
-    return @as(*HeadersProxy, @ptrCast(@alignCast(ud)));
+    return castUserdata(HeadersProxy, @as(?*anyopaque, ud));
 }
 
 /// Lua metamethod: __index for reading ctx.field
@@ -114,10 +124,10 @@ fn luaExchangeNewIndex(lua: *Lua) callconv(.c) c_int {
 
 /// Push params as a fresh Lua table: {id = "123", name = "foo"}
 /// Creates a new table per request (max 4 entries — negligible cost).
-fn pushParamsTable(lua: *Lua, params: *const handler.ParamArray) void {
-    lua.createTable(0, @intCast(params.len));
+fn pushParamsTable(lua: *Lua, url_params: *const params.ParamArray) void {
+    lua.createTable(0, @intCast(url_params.len));
 
-    for (params.items[0..params.len]) |p| {
+    for (url_params.items[0..url_params.len]) |p| {
         lua.pushLString(p.key);
         lua.pushLString(p.value);
         lua.setTable(-3);
@@ -128,7 +138,7 @@ fn pushParamsTable(lua: *Lua, params: *const handler.ParamArray) void {
 
 /// Push query params as a fresh Lua table: {foo = "bar", page = "2"}
 /// Creates a new table per request (max 4 entries — negligible cost).
-fn pushQueryTable(lua: *Lua, query: *const handler.QueryArray) void {
+fn pushQueryTable(lua: *Lua, query: *const params.QueryArray) void {
     lua.createTable(0, @intCast(query.len));
 
     for (query.items[0..query.len]) |p| {
@@ -165,7 +175,7 @@ pub const HeadersProxy = struct {
 /// Creates a new proxy per request — no singleton sharing across connections.
 fn pushHeadersProxy(lua: *Lua, exchange: *HttpExchange) void {
     const proxy_ud = lua.newUserdata(@sizeOf(HeadersProxy));
-    const proxy = @as(*HeadersProxy, @ptrCast(@alignCast(proxy_ud)));
+    const proxy = castUserdata(HeadersProxy, @as(?*anyopaque, proxy_ud));
     proxy.* = .{ .exchange = exchange };
 
     _ = lua.getMetatableRegistry("HttpExchange.Headers");
@@ -235,7 +245,7 @@ pub const WsContext = struct {
 /// Helper: Get WsContext from userdata at given stack index.
 fn getWsContext(lua: *Lua, index: i32) ?*WsContext {
     const ud = lua.toUserdata(index) orelse return null;
-    return @as(*WsContext, @ptrCast(@alignCast(ud)));
+    return castUserdata(WsContext, @as(?*anyopaque, ud));
 }
 
 /// Lua metamethod: __index for reading ws.message and ws:send()
@@ -266,38 +276,30 @@ fn luaWsContextIndex(lua: *Lua) callconv(.c) c_int {
 
 // === Metatable Registration ===
 
+/// Register a Lua metatable with optional __index and __newindex metamethods.
+fn registerMetatable(
+    lua: *Lua,
+    name: [:0]const u8,
+    index_fn: ?*const fn (*Lua) callconv(.c) c_int,
+    newindex_fn: ?*const fn (*Lua) callconv(.c) c_int,
+) void {
+    _ = lua.newMetatable(name);
+    if (index_fn) |f| {
+        lua.pushCFunction(f);
+        lua.setField(-2, "__index");
+    }
+    if (newindex_fn) |f| {
+        lua.pushCFunction(f);
+        lua.setField(-2, "__newindex");
+    }
+    lua.pop(1);
+}
+
 /// Register HttpExchange metatable with Lua
 pub fn registerHttpExchangeMetatable(lua: *Lua) void {
-    // Main exchange metatable
-    _ = lua.newMetatable("HttpExchange");
-
-    lua.pushCFunction(luaExchangeIndex);
-    lua.setField(-2, "__index");
-
-    lua.pushCFunction(luaExchangeNewIndex);
-    lua.setField(-2, "__newindex");
-
-    lua.pop(1);
-
-    // Headers proxy metatable
-    _ = lua.newMetatable("HttpExchange.Headers");
-
-    lua.pushCFunction(luaHeadersIndex);
-    lua.setField(-2, "__index");
-
-    lua.pushCFunction(luaHeadersNewIndex);
-    lua.setField(-2, "__newindex");
-
-    lua.pop(1);
-
-    // WsContext metatable (for WebSocket on_message callbacks)
-    _ = lua.newMetatable("WsContext");
-
-    lua.pushCFunction(luaWsContextIndex);
-    lua.setField(-2, "__index");
-
-    lua.pop(1);
-
+    registerMetatable(lua, "HttpExchange", luaExchangeIndex, luaExchangeNewIndex);
+    registerMetatable(lua, "HttpExchange.Headers", luaHeadersIndex, luaHeadersNewIndex);
+    registerMetatable(lua, "WsContext", luaWsContextIndex, null);
     std.log.debug("HttpExchange metatables registered", .{});
 }
 

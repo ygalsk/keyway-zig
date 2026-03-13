@@ -96,6 +96,26 @@ pub const Worker = struct {
         std.log.debug("Worker {d} pinned to core {d}", .{ ctx.worker_id, ctx.worker_id });
         std.log.info("Worker {d} starting...", .{ctx.worker_id});
 
+        // === Worker Initialization Sequence ===
+        // 1. Pin thread to CPU core (NUMA locality, cache affinity)
+        // 2. Create xev event loop (per-core, no sharing)
+        // 3. Create Router (per-worker, lua_ref values are Lua-state-specific)
+        // 4. Create SseRegistry (per-worker subscriber tracking)
+        // 5. Wire SSE broadcast bus (cross-worker pub/sub, if enabled)
+        // 6. Create LuaState (Lua VM + std libs + metatables + cached thread)
+        // 7. Set SSE registry on LuaState (for broadcast C function)
+        // 8. Register cosocket API (C closures with *LuaState upvalue)
+        // 9. Set worker globals (keyway.worker_id)
+        // 10. Load Lua script + process route table
+        // 11. Create Server (socket, bind, listen, TLS context)
+        // 12. Start accept loop → run event loop
+        //
+        // Invariants:
+        // - CPU pinning MUST happen before any allocations (NUMA locality)
+        // - registerCosocketApi needs stable *LuaState pointer (after init)
+        // - setWorkerGlobals must precede loadScript (scripts may read worker_id)
+        // - processRouteTable must follow loadScript (reads keyway.routes)
+
         // Each worker has its own event loop
         var loop = try xev.Loop.init(.{});
         defer loop.deinit();
@@ -167,15 +187,18 @@ pub const ThreadPool = struct {
     bpf_ready: *std.atomic.Value(bool),
     sse_bus: ?*SseBroadcastBus,
 
-    /// Create thread pool with one worker per CPU core
+    /// Create thread pool with the given number of workers.
+    /// Pass worker_count=0 to auto-detect (one worker per CPU core).
     pub fn init(
         allocator: std.mem.Allocator,
         config: Server.Config,
+        worker_count: u16,
     ) !ThreadPool {
         const num_cpus = try std.Thread.getCpuCount();
-        std.log.info("Detected {d} CPU cores, spawning {d} workers", .{ num_cpus, num_cpus });
+        const num_workers: usize = if (worker_count > 0) @intCast(worker_count) else num_cpus;
+        std.log.info("Detected {d} CPU cores, spawning {d} workers", .{ num_cpus, num_workers });
 
-        const workers = try allocator.alloc(Worker, num_cpus);
+        const workers = try allocator.alloc(Worker, num_workers);
         errdefer allocator.free(workers);
 
         // Create BPF synchronization flag
@@ -184,11 +207,11 @@ pub const ThreadPool = struct {
         errdefer allocator.destroy(bpf_ready);
 
         // Create SSE broadcast bus (shared across all workers)
-        const sse_bus = SseBroadcastBus.init(allocator, num_cpus) catch null;
+        const sse_bus = SseBroadcastBus.init(allocator, num_workers) catch null;
 
         // Spawn workers
         for (workers, 0..) |*worker, i| {
-            worker.* = try Worker.spawn(allocator, config, i, num_cpus, bpf_ready, sse_bus);
+            worker.* = try Worker.spawn(allocator, config, i, num_workers, bpf_ready, sse_bus);
         }
 
         return ThreadPool{

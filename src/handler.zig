@@ -1,3 +1,12 @@
+//! Connection lifecycle and proactor boundary.
+//!
+//! Each Connection owns a socket, read/write buffers, an arena allocator,
+//! and per-request state (params, query, I/O rings). The proactor contract:
+//! Lua sets state on HttpExchange, Zig submits all I/O via libxev.
+//!
+//! Lifecycle: accept → startRead → onRead → sendResponse → onWrite → (keep-alive or close)
+//! Protocol upgrades (WS, SSE) and cosocket yields branch from sendResponse.
+
 const std = @import("std");
 const xev = @import("xev");
 const log = @import("log.zig");
@@ -19,24 +28,24 @@ const SseRegistry = @import("sse.zig").SseRegistry;
 const config = @import("config.zig");
 const params = @import("params.zig");
 const conn_tls = @import("conn_tls.zig");
-pub const conn_sse = @import("conn_sse.zig");
-pub const conn_ws = @import("conn_ws.zig");
-pub const cosocket = @import("cosocket.zig");
+const castUserdata = @import("helpers.zig").castUserdata;
+const conn_sse = @import("conn_sse.zig");
+const conn_ws = @import("conn_ws.zig");
+const cosocket = @import("cosocket.zig");
 
-// Re-exports for backward compatibility
-pub const ParamArray = params.ParamArray;
-pub const QueryArray = params.QueryArray;
-pub const MAX_ROUTE_PARAMS = params.MAX_ROUTE_PARAMS;
+const ParamArray = params.ParamArray;
+const QueryArray = params.QueryArray;
 const parseQueryString = params.parseQueryString;
-pub const SuspendedState = cosocket.SuspendedState;
+const SuspendedState = cosocket.SuspendedState;
 
 const READ_BUFFER_SIZE = config.READ_BUFFER_SIZE;
-const WRITE_BUFFER_SIZE = config.WRITE_BUFFER_SIZE;
 const CIPHERTEXT_BUFFER_SIZE = config.CIPHERTEXT_BUFFER_SIZE;
 const LARGE_RESPONSE_THRESHOLD = config.LARGE_RESPONSE_THRESHOLD;
 
 /// Connection handler - manages HTTP request/response lifecycle
 pub const Connection = struct {
+    pub const State = enum { reading, processing, writing, websocket, sse, closing };
+
     base_allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     loop: *xev.Loop,
@@ -50,8 +59,6 @@ pub const Connection = struct {
 
     // Buffers (allocated from base_allocator, persist across requests)
     read_buffer: LinearBuffer,
-    write_buffer: []u8,
-    write_pos: usize,
 
     // Inline param/query storage (reused across requests, zero allocations, cache-friendly)
     param_cache: ParamArray,
@@ -85,8 +92,8 @@ pub const Connection = struct {
     sse_writing: bool = false,
     sse_disconnect_completion: xev.Completion = undefined,
 
-    // Close guard: prevents double-free when two async error paths race
-    is_closing: bool = false,
+    // Connection state machine
+    state: State = .reading,
 
     // TLS: non-null when connection is TLS-encrypted
     tls_conn: ?TlsConn = null,
@@ -105,9 +112,6 @@ pub const Connection = struct {
         errdefer allocator.destroy(conn);
 
         // Allocate buffers from base allocator (persist across requests)
-        const write_buf = try allocator.alloc(u8, WRITE_BUFFER_SIZE);
-        errdefer allocator.free(write_buf);
-
         const read_buf = try LinearBuffer.init(allocator, READ_BUFFER_SIZE);
         errdefer allocator.free(read_buf.data);
 
@@ -126,8 +130,6 @@ pub const Connection = struct {
             .read_completion = undefined,
             .write_completion = undefined,
             .read_buffer = read_buf,
-            .write_buffer = write_buf,
-            .write_pos = 0,
             .param_cache = ParamArray{},
             .query_cache = QueryArray{},
             .sse_registry = sse_registry,
@@ -164,7 +166,6 @@ pub const Connection = struct {
         std.posix.close(self.socket);
         self.arena.deinit();
         // param_cache/query_cache are inline structs, no deinit needed
-        self.base_allocator.free(self.write_buffer);
         self.base_allocator.free(self.read_buffer.data);
         allocator.destroy(self);
     }
@@ -206,7 +207,7 @@ pub const Connection = struct {
         _ = loop;
         _ = completion;
 
-        const self: *Connection = @ptrCast(@alignCast(userdata.?));
+        const self = castUserdata(Connection, userdata);
 
         const bytes_read = result.recv catch |err| {
             if (err != error.EOF) {
@@ -253,26 +254,79 @@ pub const Connection = struct {
         log.accessLog(self.request_method, self.request_path, status, dur_us);
     }
 
-    pub fn sendResponse(self: *Connection) !void {
-        self.request_start_ns = std.time.nanoTimestamp();
-
-        // Parse HTTP request using picohttpparser
+    fn parseHttpRequest(self: *Connection) ?http.Request {
         const request_data = self.read_buffer.readSlice();
-        const alloc = self.arena.allocator();
-
-        var parser = http.Parser.init(alloc);
-        const request = parser.parseRequest(request_data) catch |err| {
+        var parser = http.Parser.init(self.arena.allocator());
+        return parser.parseRequest(request_data) catch |err| {
             if (err == error.Incomplete) {
                 self.startRead();
-                return;
+            } else {
+                std.log.err("[fd={d}] http parse failed err={}", .{ self.socket, err });
+                self.send400BadRequest();
             }
-            std.log.err("[fd={d}] http parse failed err={}", .{ self.socket, err });
-            self.send400BadRequest();
+            return null;
+        };
+    }
+
+    fn dispatchToHandler(self: *Connection, ref: i32, exchange: *HttpExchange, request: *const http.Request, clean_path: []const u8) !void {
+        self.lua_state.current_connection = self;
+        const handler_result = self.lua_state.callLuaHandler(ref, exchange) catch |err| {
+            self.lua_state.current_connection = null;
+            std.log.err("[fd={d}] lua handler error {s} {s} err={}", .{ self.socket, request.method, clean_path, err });
+            self.logAccess(500);
+            self.send500InternalError();
             return;
         };
-        // headers are arena-allocated, freed on arena reset in onWrite
 
-        // Strip query string from path for routing, parse query params
+        switch (handler_result) {
+            .completed => {
+                self.lua_state.current_connection = null;
+
+                if (exchange.upgrade_websocket) {
+                    conn_ws.handleWsUpgrade(self, exchange, request) catch {
+                        self.logAccess(400);
+                        self.send400BadRequest();
+                        return;
+                    };
+                    return;
+                }
+
+                if (exchange.upgrade_sse) {
+                    conn_sse.handleSseUpgrade(self, exchange);
+                    return;
+                }
+
+                self.logAccess(exchange.status);
+                try self.writeResponse(exchange);
+            },
+            .yielded => {
+                self.suspended = .{
+                    .completion = undefined,
+                    .exchange = exchange,
+                    .recv_buf = null,
+                    .coroutine_ref = self.lua_state.coroutine_ref,
+                    .coroutine_thread = @ptrCast(self.lua_state.coroutine_thread.?),
+                    .outbound_fd = 0,
+                    .pending_op = .none,
+                };
+                self.lua_state.coroutine_ref = 0;
+                self.lua_state.coroutine_thread = null;
+                cosocket.dispatchIo(self);
+            },
+        }
+    }
+
+    pub fn send404NotFound(self: *Connection) void {
+        self.sendRawResponse("HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found");
+    }
+
+    pub fn sendResponse(self: *Connection) !void {
+        self.state = .processing;
+        self.request_start_ns = std.time.nanoTimestamp();
+
+        const request = self.parseHttpRequest() orelse return;
+        const alloc = self.arena.allocator();
+
         const query_pos = std.mem.indexOfScalar(u8, request.path, '?');
         const clean_path = if (query_pos) |qi| request.path[0..qi] else request.path;
 
@@ -285,7 +339,6 @@ pub const Connection = struct {
             parseQueryString(request.path[qi + 1 ..], &self.query_cache);
         }
 
-        // Clear param cache and match route (using clean path without query string)
         self.param_cache.clear();
         const lua_ref = self.router.match(request.method, clean_path, &self.param_cache) catch {
             self.send400BadRequest();
@@ -293,79 +346,25 @@ pub const Connection = struct {
         };
 
         if (lua_ref) |ref| {
-            // Arena-allocate exchange (must persist across yields)
-            const exchange_ptr = try alloc.create(HttpExchange);
-            exchange_ptr.* = try HttpExchange.init(alloc, &request, &self.param_cache, &self.query_cache, clean_path);
-
-            self.lua_state.current_connection = self;
-            const handler_result = self.lua_state.callLuaHandler(ref, exchange_ptr) catch |err| {
-                self.lua_state.current_connection = null;
-                std.log.err("[fd={d}] lua handler error {s} {s} err={}", .{ self.socket, request.method, clean_path, err });
-                self.logAccess(500);
-                self.send500InternalError();
-                return;
-            };
-
-            switch (handler_result) {
-                .completed => {
-                    self.lua_state.current_connection = null;
-
-                    // Check for WebSocket upgrade
-                    if (exchange_ptr.upgrade_websocket) {
-                        conn_ws.handleWsUpgrade(self, exchange_ptr, &request) catch {
-                            self.logAccess(400);
-                            self.send400BadRequest();
-                            return;
-                        };
-                        return;
-                    }
-
-                    // Check for SSE upgrade
-                    if (exchange_ptr.upgrade_sse) {
-                        conn_sse.handleSseUpgrade(self, exchange_ptr);
-                        return;
-                    }
-
-                    self.logAccess(exchange_ptr.status);
-                    try self.writeResponse(exchange_ptr);
-                },
-                .yielded => {
-                    // Handler wants outbound I/O — bundle coroutine state
-                    self.suspended = .{
-                        .completion = undefined,
-                        .exchange = exchange_ptr,
-                        .recv_buf = null,
-                        .coroutine_ref = self.lua_state.coroutine_ref,
-                        .coroutine_thread = @ptrCast(self.lua_state.coroutine_thread.?),
-                        .outbound_fd = 0,
-                        .pending_op = .none,
-                    };
-                    self.lua_state.coroutine_ref = 0;
-                    self.lua_state.coroutine_thread = null;
-                    cosocket.dispatchIo(self);
-                },
-            }
+            const exchange = try alloc.create(HttpExchange);
+            exchange.* = try HttpExchange.init(alloc, &request, &self.param_cache, &self.query_cache, clean_path);
+            try self.dispatchToHandler(ref, exchange, &request, clean_path);
         } else {
-            // No route matched — 404
             self.logAccess(404);
-            var resp = http.Response.init(alloc);
-            resp.status = 404;
-            const body404 = try alloc.alloc(u8, 9);
-            @memcpy(body404, "Not Found");
-            resp.body = body404;
-            try self.writeResponseDirect(&resp);
+            self.send404NotFound();
         }
     }
 
     /// Serialize response from exchange and submit write
-    pub fn writeResponse(self: *Connection, exchange_ptr: *HttpExchange) !void {
-        var response = exchange_ptr.toResponse();
+    pub fn writeResponse(self: *Connection, exchange: *HttpExchange) !void {
+        var response = exchange.toResponse();
         defer response.deinit();
         try self.writeResponseDirect(&response);
     }
 
     /// Serialize a Response and submit the write completion
     pub fn writeResponseDirect(self: *Connection, response: *http.Response) !void {
+        self.state = .writing;
         const alloc = self.arena.allocator();
         // Pre-size to avoid repeated ArrayList growth in arena (old buffers can't be freed)
         const estimated = response.body.len + 512;
@@ -407,29 +406,10 @@ pub const Connection = struct {
     }
 
     fn sendRawResponse(self: *Connection, text: []const u8) void {
-        if (self.tls_conn) |*tc| {
-            tc.encrypt(text) catch {
-                self.close();
-                return;
-            };
-            // Error responses are small, drainAll into encrypt_buf is fine
-            const total = tc.drainAll();
-            self.write_completion = .{
-                .op = .{ .send = .{ .fd = self.socket, .buffer = .{ .slice = tc.encrypt_buf[0..total] } } },
-                .userdata = self,
-                .callback = onWrite,
-            };
-            self.loop.add(&self.write_completion);
-            return;
+        self.state = .writing;
+        if (!self.submitTlsAwareSend(text, onWrite, true)) {
+            self.close();
         }
-        @memcpy(self.write_buffer[0..text.len], text);
-        self.write_pos = text.len;
-        self.write_completion = .{
-            .op = .{ .send = .{ .fd = self.socket, .buffer = .{ .slice = self.write_buffer[0..self.write_pos] } } },
-            .userdata = self,
-            .callback = onWrite,
-        };
-        self.loop.add(&self.write_completion);
     }
 
     pub fn send400BadRequest(self: *Connection) void {
@@ -449,7 +429,7 @@ pub const Connection = struct {
         _ = loop;
         _ = completion;
 
-        const self: *Connection = @ptrCast(@alignCast(userdata.?));
+        const self = castUserdata(Connection, userdata);
 
         const bytes_written = result.send catch |err| {
             std.log.err("[fd={d}] send failed err={}", .{ self.socket, err });
@@ -520,6 +500,8 @@ pub const Connection = struct {
         // Reset ciphertext buffer but NOT tls_conn — TLS session persists across keep-alive
         if (self.ciphertext_buffer) |*cb| cb.reset();
 
+        self.state = .reading;
+
         // If there's leftover data in the buffer (HTTP pipelining), process it now
         if (self.read_buffer.availableRead() > 0) {
             self.sendResponse() catch |err| {
@@ -535,8 +517,8 @@ pub const Connection = struct {
     }
 
     pub fn close(self: *Connection) void {
-        if (self.is_closing) return;
-        self.is_closing = true;
+        if (self.state == .closing) return;
+        self.state = .closing;
         self.deinit(self.base_allocator);
     }
 };

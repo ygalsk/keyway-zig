@@ -1,3 +1,11 @@
+//! Submission/completion rings for batched cosocket I/O.
+//!
+//! Modeled after io_uring: Lua pushes IoEntry variants into the submission ring,
+//! yields, and Zig drains the ring into xev operations. Completions land in the
+//! completion ring (indexed by submission order). Lua reads results via ring_api.
+//!
+//! Fixed-size (RING_DEPTH=16), per-connection, inline, reset per request.
+
 const std = @import("std");
 const config = @import("config.zig");
 const TlsMode = @import("io_request.zig").TlsMode;
@@ -50,20 +58,20 @@ pub const SubmissionRing = struct {
 
     pub const MAX_DEPTH = config.RING_DEPTH;
 
-    pub fn push(self: *SubmissionRing, entry: IoEntry) error{RingFull}!void {
+    pub inline fn push(self: *SubmissionRing, entry: IoEntry) error{RingFull}!void {
         if (self.len() >= MAX_DEPTH) return error.RingFull;
         self.entries[self.tail % MAX_DEPTH] = entry;
         self.tail +%= 1;
     }
 
-    pub fn pop(self: *SubmissionRing) ?*const IoEntry {
+    pub inline fn pop(self: *SubmissionRing) ?*const IoEntry {
         if (self.head == self.tail) return null;
         const idx = self.head % MAX_DEPTH;
         self.head +%= 1;
         return &self.entries[idx];
     }
 
-    pub fn len(self: *const SubmissionRing) u8 {
+    pub inline fn len(self: *const SubmissionRing) u8 {
         return self.tail -% self.head;
     }
 
@@ -81,13 +89,13 @@ pub const CompletionRing = struct {
 
     pub const MAX_DEPTH = config.RING_DEPTH;
 
-    pub fn push(self: *CompletionRing, entry: CQEntry) void {
+    pub inline fn push(self: *CompletionRing, entry: CQEntry) void {
         std.debug.assert(self.tail < MAX_DEPTH);
         self.entries[self.tail] = entry;
         self.tail += 1;
     }
 
-    pub fn get(self: *const CompletionRing, index: u8) CQEntry {
+    pub inline fn get(self: *const CompletionRing, index: u8) CQEntry {
         std.debug.assert(index < self.tail);
         return self.entries[index];
     }

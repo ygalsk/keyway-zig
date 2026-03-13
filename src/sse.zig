@@ -3,7 +3,7 @@ const xev = @import("xev");
 const config = @import("config.zig");
 const handler_mod = @import("handler.zig");
 const Connection = handler_mod.Connection;
-const conn_sse = handler_mod.conn_sse;
+const conn_sse = @import("conn_sse.zig");
 
 /// Per-worker registry mapping room names to lists of SSE connections.
 /// No cross-thread sharing — each worker has its own SseRegistry.

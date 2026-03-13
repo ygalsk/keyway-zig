@@ -3,6 +3,10 @@ const std = @import("std");
 /// Per-worker identity, set once at thread start via worker.zig
 pub threadlocal var worker_id: u16 = 0;
 
+/// Runtime log level filter. Messages above this severity are suppressed.
+/// Set once at startup from CLI/env config; defaults to .info.
+pub var runtime_log_level: std.log.Level = .info;
+
 /// Format an epoch timestamp as RFC 3339 (e.g. 2026-03-11T14:30:00Z)
 fn writeTimestamp(writer: anytype) void {
     const ts: u64 = @intCast(@max(0, std.time.timestamp()));
@@ -30,6 +34,9 @@ pub fn logFn(
     comptime format: []const u8,
     args: anytype,
 ) void {
+    // Runtime log level filter: skip messages less severe than configured level
+    if (@intFromEnum(level) > @intFromEnum(runtime_log_level)) return;
+
     const level_str = comptime level.asText();
     const scope_str = if (comptime scope != .default) @tagName(scope) else "";
 

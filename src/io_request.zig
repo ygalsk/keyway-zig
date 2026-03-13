@@ -1,6 +1,7 @@
 const std = @import("std");
 const Lua = @import("luajit").Lua;
 const LuaState = @import("lua_state.zig").LuaState;
+const castUserdata = @import("helpers.zig").castUserdata;
 const IoEntry = @import("ring.zig").IoEntry;
 const tls_mod = @import("tls.zig");
 const TlsConn = tls_mod.TlsConn;
@@ -10,6 +11,97 @@ extern "c" fn lua_yield(L: *anyopaque, nresults: c_int) c_int;
 /// TLS context selector — which SSL_CTX to use for a handshake.
 pub const TlsMode = enum { verify, insecure, custom };
 
+/// Helper: extract a required string argument from the Lua stack, raising a Lua error on failure.
+pub inline fn requireString(lua: *Lua, idx: i32, err_msg: [:0]const u8) []const u8 {
+    return std.mem.span(lua.toString(idx) catch {
+        lua.pushString(err_msg);
+        lua.raiseError();
+        unreachable;
+    });
+}
+
+/// Parse TLS mode from a Lua argument: boolean (backward compat) or string ("verify","insecure","custom").
+/// Returns .verify as the default.
+pub fn parseTlsMode(lua: *Lua, arg_index: i32) TlsMode {
+    if (lua.isString(arg_index)) {
+        const mode_str = std.mem.span(lua.toString(arg_index) catch return TlsMode.verify);
+        if (std.mem.eql(u8, mode_str, "custom")) return TlsMode.custom;
+        if (std.mem.eql(u8, mode_str, "insecure")) return TlsMode.insecure;
+        return TlsMode.verify;
+    } else if (lua.isBoolean(arg_index) and lua.toBoolean(arg_index)) {
+        return TlsMode.insecure;
+    }
+    return TlsMode.verify;
+}
+
+/// Parse a Lua stack into an IoEntry based on an op string.
+/// `arg_offset` is the stack index of the first argument after the op string.
+/// For direct io_request calls, this is 1. For ring_push where arg1=op, this is 2.
+/// Uses `std.meta.stringToEnum` (comptime `@typeInfo` lookup) for O(1) dispatch
+/// and exhaustive switch — adding a new Op variant is a compile error until handled here.
+pub fn parseIoEntry(lua: *Lua, op: []const u8, arg_offset: i32) IoEntry {
+    const tag = std.meta.stringToEnum(IoEntry.Op, op) orelse {
+        lua.pushString("unknown io op");
+        lua.raiseError();
+        unreachable;
+    };
+
+    return switch (tag) {
+        .connect => .{ .connect = .{
+            .host = requireString(lua, arg_offset, "connect: host must be a string"),
+            .port = @intCast(lua.toInteger(arg_offset + 1)),
+        } },
+        .pool_connect => .{ .pool_connect = .{
+            .pool_name = requireString(lua, arg_offset, "pool_connect: pool_name must be a string"),
+            .host = requireString(lua, arg_offset + 1, "pool_connect: host must be a string"),
+            .port = @intCast(lua.toInteger(arg_offset + 2)),
+        } },
+        .udp_connect => .{ .udp_connect = .{
+            .host = requireString(lua, arg_offset, "udp_connect: host must be a string"),
+            .port = @intCast(lua.toInteger(arg_offset + 1)),
+            .timeout_ms = @intCast(lua.toInteger(arg_offset + 2)),
+        } },
+        .send => .{ .send = .{
+            .fd = @intCast(lua.toInteger(arg_offset)),
+            .data = lua.toLString(arg_offset + 1) catch {
+                lua.pushString("send: data must be a string");
+                lua.raiseError();
+                unreachable;
+            },
+        } },
+        .recv => blk: {
+            const max_len: usize = @intCast(lua.toInteger(arg_offset + 1));
+            break :blk .{ .recv = .{
+                .fd = @intCast(lua.toInteger(arg_offset)),
+                .max_len = if (max_len == 0) 4096 else max_len,
+            } };
+        },
+        .close => .{ .close = .{
+            .fd = @intCast(lua.toInteger(arg_offset)),
+        } },
+        .setkeepalive => .{ .setkeepalive = .{
+            .fd = @intCast(lua.toInteger(arg_offset)),
+            .pool_name = requireString(lua, arg_offset + 1, "setkeepalive: pool_name must be a string"),
+            .timeout_ms = @intCast(lua.toInteger(arg_offset + 2)),
+            .pool_size = @intCast(lua.toInteger(arg_offset + 3)),
+            .reuse_count = @intCast(lua.toInteger(arg_offset + 4)),
+        } },
+        .tls_handshake => .{ .tls_handshake = .{
+            .fd = @intCast(lua.toInteger(arg_offset)),
+            .sni_host = if (lua.isString(arg_offset + 1))
+                if (lua.toString(arg_offset + 1)) |s| std.mem.span(s) else |_| null
+            else
+                null,
+            .tls_mode = parseTlsMode(lua, arg_offset + 2),
+        } },
+        .none => {
+            lua.pushString("unknown io op");
+            lua.raiseError();
+            unreachable;
+        },
+    };
+}
+
 /// Helper: extract *LuaState from closure upvalue(1)
 inline fn getState(lua: *Lua) *LuaState {
     const ptr = lua.toUserdata(Lua.PseudoIndex.upvalue(1)) orelse {
@@ -17,7 +109,7 @@ inline fn getState(lua: *Lua) *LuaState {
         lua.raiseError();
         unreachable;
     };
-    return @as(*LuaState, @ptrCast(@alignCast(ptr)));
+    return castUserdata(LuaState, @as(?*anyopaque, ptr));
 }
 
 /// __keyway_io_connect(host, port) → yields, resumes with fd or nil,err
@@ -182,15 +274,7 @@ pub fn keyway_io_sslhandshake(lua: *Lua) callconv(.c) c_int {
         null;
 
     // Parse TLS mode from arg 3: boolean (backward compat) or string
-    const tls_mode: TlsMode = if (lua.isString(3)) blk: {
-        const mode_str = std.mem.span(lua.toString(3) catch break :blk TlsMode.verify);
-        if (std.mem.eql(u8, mode_str, "custom")) break :blk TlsMode.custom;
-        if (std.mem.eql(u8, mode_str, "insecure")) break :blk TlsMode.insecure;
-        break :blk TlsMode.verify;
-    } else if (lua.isBoolean(3) and lua.toBoolean(3))
-        TlsMode.insecure
-    else
-        TlsMode.verify;
+    const tls_mode = parseTlsMode(lua, 3);
 
     state.pending_io = .{ .tls_handshake = .{
         .fd = @intCast(fd_raw),

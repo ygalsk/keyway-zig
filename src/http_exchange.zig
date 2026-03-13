@@ -1,6 +1,6 @@
 const std = @import("std");
 const http = @import("http.zig");
-const handler = @import("handler.zig");
+const params_mod = @import("params.zig");
 
 /// HttpExchange - The ONLY object Lua touches
 /// Represents a complete HTTP request/response exchange
@@ -10,8 +10,8 @@ pub const HttpExchange = struct {
     method: []const u8,
     path: []const u8,
     headers: []http.Header,
-    params: *const handler.ParamArray,
-    query: *const handler.QueryArray,
+    params: *const params_mod.ParamArray,
+    query: *const params_mod.QueryArray,
     body: []const u8,
 
     // === RESPONSE (write-only from Lua) ===
@@ -36,8 +36,8 @@ pub const HttpExchange = struct {
     pub fn init(
         allocator: std.mem.Allocator,
         request: *const http.Request,
-        params: *const handler.ParamArray,
-        query: *const handler.QueryArray,
+        params: *const params_mod.ParamArray,
+        query: *const params_mod.QueryArray,
         clean_path: []const u8,
     ) !HttpExchange {
         return .{

@@ -1,3 +1,11 @@
+//! Per-worker Lua state aggregation and initialization.
+//!
+//! Each worker thread owns one LuaState containing: the Lua VM, cached coroutine thread,
+//! cosocket pending I/O staging, connection pool, TLS manager, and SSE registry pointer.
+//!
+//! Init order: Lua VM → std libs → keyway module → cached thread → package paths → TLS manager.
+//! After init: registerCosocketApi → setWorkerGlobals → loadScript → processRouteTable.
+
 const std = @import("std");
 const Lua = @import("luajit").Lua;
 const http = @import("http.zig");
@@ -11,6 +19,7 @@ const ring = @import("ring.zig");
 const ConnectionPool = @import("connection_pool.zig").ConnectionPool;
 const Connection = @import("handler.zig").Connection;
 const tls = @import("tls.zig");
+const castUserdata = @import("helpers.zig").castUserdata;
 const TlsConn = tls.TlsConn;
 const ClientTlsContext = tls.ClientTlsContext;
 const TlsManager = tls.TlsManager;
@@ -110,7 +119,9 @@ pub const LuaState = struct {
             \\        .. "/usr/local/lib/lua/5.1/?.so;"
             \\        .. package.cpath
             \\end
-        ) catch {};
+        ) catch |err| {
+            std.log.warn("failed to configure Lua package paths: {}", .{err});
+        };
 
         const tls_manager = TlsManager.init(allocator) catch return error.TlsInitFailed;
 
@@ -192,15 +203,13 @@ pub const LuaState = struct {
         switch (ud_kind) {
             .http => |exchange| {
                 const ud = thread.newUserdata(@sizeOf(*HttpExchange));
-                const ud_ptr: **HttpExchange = @ptrCast(@alignCast(ud));
-                ud_ptr.* = exchange;
+                castUserdata(*HttpExchange, @as(?*anyopaque, ud)).* = exchange;
                 _ = thread.getMetatableRegistry("HttpExchange");
                 thread.setMetatable(-2);
             },
             .ws => |ws_ctx| {
                 const ud = thread.newUserdata(@sizeOf(lua_api.WsContext));
-                const ctx_ptr: *lua_api.WsContext = @ptrCast(@alignCast(ud));
-                ctx_ptr.* = ws_ctx;
+                castUserdata(lua_api.WsContext, @as(?*anyopaque, ud)).* = ws_ctx;
                 _ = thread.getMetatableRegistry("WsContext");
                 thread.setMetatable(-2);
             },
@@ -345,7 +354,7 @@ pub const LuaState = struct {
     fn keyway_sse_broadcast(lua: *Lua) callconv(.c) c_int {
         const state: *LuaState = blk: {
             const ud = lua.toUserdata(Lua.PseudoIndex.upvalue(1)) orelse return 0;
-            break :blk @as(*LuaState, @ptrCast(@alignCast(ud)));
+            break :blk castUserdata(LuaState, @as(?*anyopaque, ud));
         };
         const registry = state.sse_registry orelse return 0;
 
@@ -471,7 +480,7 @@ test "lua function call" {
 
 test "coroutine dispatch - non-yielding handler" {
     const allocator = std.testing.allocator;
-    const handler = @import("handler.zig");
+    const params_mod = @import("params.zig");
 
     var router = try Router.init(allocator);
     defer router.deinit();
@@ -493,9 +502,9 @@ test "coroutine dispatch - non-yielding handler" {
     try state.processRouteTable(&router);
 
     // Look up the route to get the lua_ref
-    var params = handler.ParamArray{};
-    var query = handler.QueryArray{};
-    const lua_ref = router.match("GET", "/test", &params);
+    var url_params = params_mod.ParamArray{};
+    var query = params_mod.QueryArray{};
+    const lua_ref = router.match("GET", "/test", &url_params);
     try std.testing.expect(lua_ref != null);
 
     // Build a minimal HttpExchange
@@ -506,7 +515,7 @@ test "coroutine dispatch - non-yielding handler" {
         .method = "GET",
         .path = "/test",
         .headers = &[_]http.Header{},
-        .params = &params,
+        .params = &url_params,
         .query = &query,
         .body = "",
         .status = 200,
@@ -547,7 +556,7 @@ test "lua package library and require" {
 
 test "middleware execution order" {
     const allocator = std.testing.allocator;
-    const handler_mod = @import("handler.zig");
+    const params_mod = @import("params.zig");
 
     var router = try Router.init(allocator);
     defer router.deinit();
@@ -585,9 +594,9 @@ test "middleware execution order" {
     );
     try state.processRouteTable(&router);
 
-    var params = handler_mod.ParamArray{};
-    var query = handler_mod.QueryArray{};
-    const lua_ref = router.match("GET", "/test", &params);
+    var url_params = params_mod.ParamArray{};
+    var query = params_mod.QueryArray{};
+    const lua_ref = router.match("GET", "/test", &url_params);
     try std.testing.expect(lua_ref != null);
 
     var response_headers = try std.ArrayList(http.Header).initCapacity(allocator, 4);
@@ -597,7 +606,7 @@ test "middleware execution order" {
         .method = "GET",
         .path = "/test",
         .headers = &[_]http.Header{},
-        .params = &params,
+        .params = &url_params,
         .query = &query,
         .body = "",
         .status = 200,
@@ -616,7 +625,7 @@ test "middleware execution order" {
 
 test "middleware short-circuit" {
     const allocator = std.testing.allocator;
-    const handler_mod = @import("handler.zig");
+    const params_mod = @import("params.zig");
 
     var router = try Router.init(allocator);
     defer router.deinit();
@@ -643,9 +652,9 @@ test "middleware short-circuit" {
     );
     try state.processRouteTable(&router);
 
-    var params = handler_mod.ParamArray{};
-    var query = handler_mod.QueryArray{};
-    const lua_ref = router.match("GET", "/secret", &params);
+    var url_params = params_mod.ParamArray{};
+    var query = params_mod.QueryArray{};
+    const lua_ref = router.match("GET", "/secret", &url_params);
     try std.testing.expect(lua_ref != null);
 
     var response_headers = try std.ArrayList(http.Header).initCapacity(allocator, 4);
@@ -655,7 +664,7 @@ test "middleware short-circuit" {
         .method = "GET",
         .path = "/secret",
         .headers = &[_]http.Header{},
-        .params = &params,
+        .params = &url_params,
         .query = &query,
         .body = "",
         .status = 200,
@@ -674,7 +683,7 @@ test "middleware short-circuit" {
 
 test "security: request body with lua code is not executed" {
     const allocator = std.testing.allocator;
-    const handler = @import("handler.zig");
+    const params_mod = @import("params.zig");
 
     var router = try Router.init(allocator);
     defer router.deinit();
@@ -695,9 +704,9 @@ test "security: request body with lua code is not executed" {
     );
     try state.processRouteTable(&router);
 
-    var params = handler.ParamArray{};
-    var query = handler.QueryArray{};
-    const lua_ref = router.match("POST", "/echo", &params);
+    var url_params = params_mod.ParamArray{};
+    var query = params_mod.QueryArray{};
+    const lua_ref = router.match("POST", "/echo", &url_params);
     try std.testing.expect(lua_ref != null);
 
     var response_headers = try std.ArrayList(http.Header).initCapacity(allocator, 4);
@@ -707,7 +716,7 @@ test "security: request body with lua code is not executed" {
         .method = "POST",
         .path = "/echo",
         .headers = &[_]http.Header{},
-        .params = &params,
+        .params = &url_params,
         .query = &query,
         .body = "os.execute('touch /tmp/pwned')",
         .status = 200,
@@ -727,7 +736,7 @@ test "security: request body with lua code is not executed" {
 
 test "security: param with lua code is literal string" {
     const allocator = std.testing.allocator;
-    const handler = @import("handler.zig");
+    const params_mod = @import("params.zig");
 
     var router = try Router.init(allocator);
     defer router.deinit();
@@ -748,9 +757,9 @@ test "security: param with lua code is literal string" {
     );
     try state.processRouteTable(&router);
 
-    var params = handler.ParamArray{};
-    var query = handler.QueryArray{};
-    const lua_ref = router.match("GET", "/h/os.execute('id')", &params);
+    var url_params = params_mod.ParamArray{};
+    var query = params_mod.QueryArray{};
+    const lua_ref = router.match("GET", "/h/os.execute('id')", &url_params);
     try std.testing.expect(lua_ref != null);
 
     var response_headers = try std.ArrayList(http.Header).initCapacity(allocator, 4);
@@ -760,7 +769,7 @@ test "security: param with lua code is literal string" {
         .method = "GET",
         .path = "/h/os.execute('id')",
         .headers = &[_]http.Header{},
-        .params = &params,
+        .params = &url_params,
         .query = &query,
         .body = "",
         .status = 200,
@@ -779,7 +788,7 @@ test "security: param with lua code is literal string" {
 
 test "security: ctx.method and ctx.path are read-only" {
     const allocator = std.testing.allocator;
-    const handler = @import("handler.zig");
+    const params_mod = @import("params.zig");
 
     var router = try Router.init(allocator);
     defer router.deinit();
@@ -802,9 +811,9 @@ test "security: ctx.method and ctx.path are read-only" {
     );
     try state.processRouteTable(&router);
 
-    var params = handler.ParamArray{};
-    var query = handler.QueryArray{};
-    const lua_ref = router.match("GET", "/test", &params);
+    var url_params = params_mod.ParamArray{};
+    var query = params_mod.QueryArray{};
+    const lua_ref = router.match("GET", "/test", &url_params);
     try std.testing.expect(lua_ref != null);
 
     var response_headers = try std.ArrayList(http.Header).initCapacity(allocator, 4);
@@ -814,7 +823,7 @@ test "security: ctx.method and ctx.path are read-only" {
         .method = "GET",
         .path = "/test",
         .headers = &[_]http.Header{},
-        .params = &params,
+        .params = &url_params,
         .query = &query,
         .body = "",
         .status = 200,

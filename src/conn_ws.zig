@@ -4,8 +4,10 @@ const http = @import("http.zig");
 const ws = @import("ws.zig");
 const handler_mod = @import("handler.zig");
 const Connection = handler_mod.Connection;
-const cosocket = handler_mod.cosocket;
+const cosocket = @import("cosocket.zig");
+const params = @import("params.zig");
 const HttpExchange = @import("http_exchange.zig").HttpExchange;
+const castUserdata = @import("helpers.zig").castUserdata;
 const Lua = @import("luajit").Lua;
 const lua_api = @import("lua_api.zig");
 const tls_mod = @import("tls.zig");
@@ -19,7 +21,7 @@ pub const WsState = struct {
 };
 
 /// Validate upgrade request, build 101 response, store WsState, send it.
-pub fn handleWsUpgrade(conn: *Connection, exchange_ptr: *HttpExchange, request: *const http.Request) !void {
+pub fn handleWsUpgrade(conn: *Connection, exchange: *HttpExchange, request: *const http.Request) !void {
     // Validate Sec-WebSocket-Key header
     const sec_key = http.Parser.getHeader(request, "Sec-WebSocket-Key") orelse {
         return error.MissingWebSocketKey;
@@ -46,12 +48,12 @@ pub fn handleWsUpgrade(conn: *Connection, exchange_ptr: *HttpExchange, request: 
 
     // Store WsState on connection (copy refs from exchange)
     conn.ws_state = .{
-        .on_message_ref = exchange_ptr.ws_on_message_ref,
-        .on_close_ref = exchange_ptr.ws_on_close_ref,
+        .on_message_ref = exchange.ws_on_message_ref,
+        .on_close_ref = exchange.ws_on_close_ref,
     };
     // Clear exchange refs so they aren't double-freed
-    exchange_ptr.ws_on_message_ref = 0;
-    exchange_ptr.ws_on_close_ref = 0;
+    exchange.ws_on_message_ref = 0;
+    exchange.ws_on_close_ref = 0;
 
     conn.logAccess(101);
 
@@ -97,11 +99,11 @@ fn onWsRead(
     _ = loop;
     _ = completion;
 
-    const conn: *Connection = @ptrCast(@alignCast(userdata.?));
+    const self = castUserdata(Connection, userdata);
 
     const bytes_read = result.recv catch |err| {
         std.log.err("ws recv failed err={} eof={}", .{ err, @intFromBool(err == error.EOF) });
-        conn.close();
+        self.close();
         return .disarm;
     };
 
@@ -109,51 +111,51 @@ fn onWsRead(
 
     if (bytes_read == 0) {
         std.log.debug("ws: recv 0 bytes, closing", .{});
-        conn.close();
+        self.close();
         return .disarm;
     }
 
     // TLS path: decrypt before processing
-    if (conn.tls_conn) |*tc| {
-        var cb = &conn.ciphertext_buffer.?;
+    if (self.tls_conn) |*tc| {
+        var cb = &self.ciphertext_buffer.?;
         cb.commitWrite(bytes_read);
         const ct_slice = cb.readSlice();
         std.log.debug("ws: TLS feeding {d} ciphertext bytes", .{ct_slice.len});
         tc.feedCiphertext(ct_slice);
         cb.reset();
 
-        const out = conn.read_buffer.writeSlice();
+        const out = self.read_buffer.writeSlice();
         if (out.len == 0) {
             std.log.err("ws: read_buffer full, closing", .{});
-            conn.close();
+            self.close();
             return .disarm;
         }
         switch (tc.decrypt(out)) {
             .data => |n| {
                 std.log.debug("ws: TLS decrypted {d} plaintext bytes", .{n});
-                conn.read_buffer.commitWrite(n);
+                self.read_buffer.commitWrite(n);
             },
             .want_read => {
                 std.log.debug("ws: TLS wants more data", .{});
-                startWsRead(conn);
+                startWsRead(self);
                 return .disarm;
             },
             .zero_return => {
                 std.log.info("ws: TLS clean shutdown", .{});
-                conn.close();
+                self.close();
                 return .disarm;
             },
             .err => {
                 std.log.err("ws: TLS decrypt error", .{});
-                conn.close();
+                self.close();
                 return .disarm;
             },
         }
     } else {
-        conn.read_buffer.commitWrite(bytes_read);
+        self.read_buffer.commitWrite(bytes_read);
     }
 
-    processWsFrames(conn);
+    processWsFrames(self);
     return .disarm;
 }
 
@@ -272,8 +274,8 @@ fn dispatchWsMessage(conn: *Connection, payload: []const u8) void {
                 .method = "WS",
                 .path = "",
                 .headers = &[_]http.Header{},
-                .params = &handler_mod.ParamArray{},
-                .query = &handler_mod.QueryArray{},
+                .params = &params.ParamArray{},
+                .query = &params.QueryArray{},
                 .body = "",
                 .response_headers = response_headers,
                 .allocator = alloc,
@@ -346,18 +348,18 @@ fn onWsSendComplete(
     _ = loop;
     _ = completion;
 
-    const conn: *Connection = @ptrCast(@alignCast(userdata.?));
+    const self = castUserdata(Connection, userdata);
 
     _ = result.send catch {
-        conn.close();
+        self.close();
         return .disarm;
     };
 
     // Resume coroutine with success
-    const s = &conn.suspended.?;
+    const s = &self.suspended.?;
     const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
     thread.pushInteger(1);
-    wsDispatchResume(conn, thread, 1);
+    wsDispatchResume(self, thread, 1);
     return .disarm;
 }
 
@@ -423,12 +425,12 @@ fn onWsControlSent(
 ) xev.CallbackAction {
     _ = loop;
     _ = completion;
-    const conn: *Connection = @ptrCast(@alignCast(userdata.?));
+    const self = castUserdata(Connection, userdata);
     _ = result.send catch {
-        conn.close();
+        self.close();
         return .disarm;
     };
-    processWsFrames(conn);
+    processWsFrames(self);
     return .disarm;
 }
 
@@ -452,8 +454,8 @@ fn onWsCloseSent(
     _ = loop;
     _ = completion;
     _ = result;
-    const conn: *Connection = @ptrCast(@alignCast(userdata.?));
-    conn.close();
+    const self = castUserdata(Connection, userdata);
+    self.close();
     return .disarm;
 }
 

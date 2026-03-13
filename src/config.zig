@@ -30,3 +30,25 @@ pub const TLS_RECORD_MAX_SIZE = 16384;
 
 /// Max workers for SSE broadcast bus.
 pub const SSE_MAX_WORKERS = 128;
+
+/// TCP listen backlog depth.
+pub const DEFAULT_BACKLOG: u31 = 128;
+
+/// Maximum HTTP request headers (picohttpparser limit).
+pub const MAX_HEADERS: usize = 100;
+
+comptime {
+    // RING_DEPTH must be a power of 2 (ring buffer wrapping requires it)
+    if (RING_DEPTH == 0 or (RING_DEPTH & (RING_DEPTH - 1)) != 0)
+        @compileError("RING_DEPTH must be a power of 2");
+    // Buffer sizes must be at least 4096 for reasonable HTTP operation
+    if (READ_BUFFER_SIZE < 4096)
+        @compileError("READ_BUFFER_SIZE must be >= 4096");
+    if (WRITE_BUFFER_SIZE < 4096)
+        @compileError("WRITE_BUFFER_SIZE must be >= 4096");
+    // Param limits sanity check
+    if (MAX_ROUTE_PARAMS > 8)
+        @compileError("MAX_ROUTE_PARAMS must be <= 8");
+    if (MAX_QUERY_PARAMS > 8)
+        @compileError("MAX_QUERY_PARAMS must be <= 8");
+}

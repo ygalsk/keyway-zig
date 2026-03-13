@@ -1,5 +1,5 @@
 const std = @import("std");
-const handler = @import("handler.zig");
+const params = @import("params.zig");
 
 /// Radix tree node for efficient route matching
 /// O(path_length) lookup instead of O(n) linear search
@@ -100,8 +100,8 @@ pub const Router = struct {
                 param_count += 1;
             }
         }
-        if (param_count > handler.MAX_ROUTE_PARAMS) {
-            std.log.err("route has too many params pattern={s} count={d} max={d}", .{ pattern, param_count, handler.MAX_ROUTE_PARAMS });
+        if (param_count > params.MAX_ROUTE_PARAMS) {
+            std.log.err("route has too many params pattern={s} count={d} max={d}", .{ pattern, param_count, params.MAX_ROUTE_PARAMS });
             return error.TooManyParams;
         }
 
@@ -155,11 +155,11 @@ pub const Router = struct {
     /// Returns lua_ref if match found, null otherwise
     /// params_out is an inline ParamArray that will be populated with parameters
     /// This function does ZERO allocations
-    pub fn match(
+    pub inline fn match(
         self: *Router,
         method: []const u8,
         path: []const u8,
-        params_out: *handler.ParamArray,
+        params_out: *params.ParamArray,
     ) error{TooManyParams}!?i32 {
         var node = self.root;
         var start: usize = 1; // Skip leading '/'
@@ -214,12 +214,12 @@ test "radix router: simple static route" {
 
     try router.addRoute("GET", "/users", 1);
 
-    var params = handler.ParamArray{};
+    var p = params.ParamArray{};
 
-    const result = try router.match("GET", "/users", &params);
+    const result = try router.match("GET", "/users", &p);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(@as(i32, 1), result.?);
-    try std.testing.expectEqual(@as(usize, 0), params.len);
+    try std.testing.expectEqual(@as(usize, 0), p.len);
 }
 
 test "radix router: parameterized route" {
@@ -230,14 +230,14 @@ test "radix router: parameterized route" {
 
     try router.addRoute("GET", "/users/{id}", 2);
 
-    var params = handler.ParamArray{};
+    var p = params.ParamArray{};
 
-    const result = try router.match("GET", "/users/123", &params);
+    const result = try router.match("GET", "/users/123", &p);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(@as(i32, 2), result.?);
-    try std.testing.expectEqual(@as(usize, 1), params.len);
+    try std.testing.expectEqual(@as(usize, 1), p.len);
 
-    const id = params.get("id").?;
+    const id = p.get("id").?;
     try std.testing.expectEqualStrings("123", id);
 }
 
@@ -249,15 +249,15 @@ test "radix router: multiple params" {
 
     try router.addRoute("GET", "/posts/{post_id}/comments/{id}", 3);
 
-    var params = handler.ParamArray{};
+    var p = params.ParamArray{};
 
-    const result = try router.match("GET", "/posts/42/comments/7", &params);
+    const result = try router.match("GET", "/posts/42/comments/7", &p);
     try std.testing.expect(result != null);
     try std.testing.expectEqual(@as(i32, 3), result.?);
-    try std.testing.expectEqual(@as(usize, 2), params.len);
+    try std.testing.expectEqual(@as(usize, 2), p.len);
 
-    try std.testing.expectEqualStrings("42", params.get("post_id").?);
-    try std.testing.expectEqualStrings("7", params.get("id").?);
+    try std.testing.expectEqualStrings("42", p.get("post_id").?);
+    try std.testing.expectEqualStrings("7", p.get("id").?);
 }
 
 test "radix router: method mismatch" {
@@ -268,9 +268,9 @@ test "radix router: method mismatch" {
 
     try router.addRoute("POST", "/users", 4);
 
-    var params = handler.ParamArray{};
+    var p = params.ParamArray{};
 
-    const result = try router.match("GET", "/users", &params);
+    const result = try router.match("GET", "/users", &p);
     try std.testing.expect(result == null);
 }
 
@@ -284,23 +284,23 @@ test "radix router: shared prefix" {
     try router.addRoute("GET", "/users/{id}", 2);
     try router.addRoute("GET", "/users/{id}/posts", 3);
 
-    var params = handler.ParamArray{};
+    var p = params.ParamArray{};
 
     // Test /users
-    const r1 = try router.match("GET", "/users", &params);
+    const r1 = try router.match("GET", "/users", &p);
     try std.testing.expectEqual(@as(i32, 1), r1.?);
-    params.clear();
+    p.clear();
 
     // Test /users/123
-    const r2 = try router.match("GET", "/users/123", &params);
+    const r2 = try router.match("GET", "/users/123", &p);
     try std.testing.expectEqual(@as(i32, 2), r2.?);
-    try std.testing.expectEqualStrings("123", params.get("id").?);
-    params.clear();
+    try std.testing.expectEqualStrings("123", p.get("id").?);
+    p.clear();
 
     // Test /users/456/posts
-    const r3 = try router.match("GET", "/users/456/posts", &params);
+    const r3 = try router.match("GET", "/users/456/posts", &p);
     try std.testing.expectEqual(@as(i32, 3), r3.?);
-    try std.testing.expectEqualStrings("456", params.get("id").?);
+    try std.testing.expectEqualStrings("456", p.get("id").?);
 }
 
 test "radix router: no match" {
@@ -311,9 +311,9 @@ test "radix router: no match" {
 
     try router.addRoute("GET", "/users", 1);
 
-    var params = handler.ParamArray{};
+    var p = params.ParamArray{};
 
-    const result = try router.match("GET", "/posts", &params);
+    const result = try router.match("GET", "/posts", &p);
     try std.testing.expect(result == null);
 }
 
@@ -325,23 +325,23 @@ test "security: path traversal in param is literal string" {
 
     try router.addRoute("GET", "/h/{id}", 1);
 
-    var params = handler.ParamArray{};
+    var p = params.ParamArray{};
 
     // ".." is captured as a literal param value, not interpreted as directory traversal
-    const r1 = try router.match("GET", "/h/..", &params);
+    const r1 = try router.match("GET", "/h/..", &p);
     try std.testing.expect(r1 != null);
-    try std.testing.expectEqualStrings("..", params.get("id").?);
-    params.clear();
+    try std.testing.expectEqualStrings("..", p.get("id").?);
+    p.clear();
 
     // Extra segments beyond the route pattern → no match
-    const r2 = try router.match("GET", "/h/../../etc/passwd", &params);
+    const r2 = try router.match("GET", "/h/../../etc/passwd", &p);
     try std.testing.expect(r2 == null);
-    params.clear();
+    p.clear();
 
     // URL-encoded traversal is a literal string (picohttpparser doesn't decode)
-    const r3 = try router.match("GET", "/h/..%2F..%2Fetc%2Fpasswd", &params);
+    const r3 = try router.match("GET", "/h/..%2F..%2Fetc%2Fpasswd", &p);
     try std.testing.expect(r3 != null);
-    try std.testing.expectEqualStrings("..%2F..%2Fetc%2Fpasswd", params.get("id").?);
+    try std.testing.expectEqualStrings("..%2F..%2Fetc%2Fpasswd", p.get("id").?);
 }
 
 test "security: traversal does not escape route tree" {
@@ -352,14 +352,14 @@ test "security: traversal does not escape route tree" {
 
     try router.addRoute("GET", "/hooks/{id}", 1);
 
-    var params = handler.ParamArray{};
+    var p = params.ParamArray{};
 
     // 3 segments vs 2-segment route → no match
-    const r1 = try router.match("GET", "/hooks/../kv", &params);
+    const r1 = try router.match("GET", "/hooks/../kv", &p);
     try std.testing.expect(r1 == null);
-    params.clear();
+    p.clear();
 
     // 4 segments vs 2-segment route → no match
-    const r2 = try router.match("GET", "/hooks/foo/../../", &params);
+    const r2 = try router.match("GET", "/hooks/foo/../../", &p);
     try std.testing.expect(r2 == null);
 }

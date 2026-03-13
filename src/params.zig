@@ -4,62 +4,41 @@ const config = @import("config.zig");
 pub const MAX_ROUTE_PARAMS = config.MAX_ROUTE_PARAMS;
 pub const MAX_QUERY_PARAMS = config.MAX_QUERY_PARAMS;
 
-/// Lightweight param storage - replaces HashMap for route params
-/// O(n) lookup but n ≤ 4, cache-friendly, zero allocations
-pub const ParamArray = struct {
-    items: [MAX_ROUTE_PARAMS]Param = undefined,
-    len: usize = 0,
+/// Generic inline key-value map with fixed capacity.
+/// O(n) lookup but n is small, cache-friendly, zero allocations.
+pub fn InlineMap(comptime max: usize) type {
+    return struct {
+        const Self = @This();
 
-    const Param = struct {
-        key: []const u8,
-        value: []const u8,
-    };
+        items: [max]Entry = undefined,
+        len: usize = 0,
 
-    pub fn put(self: *ParamArray, key: []const u8, value: []const u8) error{TooManyParams}!void {
-        if (self.len >= MAX_ROUTE_PARAMS) return error.TooManyParams;
-        self.items[self.len] = .{ .key = key, .value = value };
-        self.len += 1;
-    }
+        pub const Entry = struct {
+            key: []const u8,
+            value: []const u8,
+        };
 
-    pub fn get(self: *const ParamArray, key: []const u8) ?[]const u8 {
-        for (self.items[0..self.len]) |param| {
-            if (std.mem.eql(u8, param.key, key)) return param.value;
+        pub fn put(self: *Self, key: []const u8, value: []const u8) error{TooManyParams}!void {
+            if (self.len >= max) return error.TooManyParams;
+            self.items[self.len] = .{ .key = key, .value = value };
+            self.len += 1;
         }
-        return null;
-    }
 
-    pub fn clear(self: *ParamArray) void {
-        self.len = 0;
-    }
-};
-
-/// Lightweight query param storage - same pattern as ParamArray
-pub const QueryArray = struct {
-    items: [MAX_QUERY_PARAMS]Entry = undefined,
-    len: usize = 0,
-
-    const Entry = struct {
-        key: []const u8,
-        value: []const u8,
-    };
-
-    pub fn put(self: *QueryArray, key: []const u8, value: []const u8) error{TooManyParams}!void {
-        if (self.len >= MAX_QUERY_PARAMS) return error.TooManyParams;
-        self.items[self.len] = .{ .key = key, .value = value };
-        self.len += 1;
-    }
-
-    pub fn get(self: *const QueryArray, key: []const u8) ?[]const u8 {
-        for (self.items[0..self.len]) |entry| {
-            if (std.mem.eql(u8, entry.key, key)) return entry.value;
+        pub inline fn get(self: *const Self, key: []const u8) ?[]const u8 {
+            for (self.items[0..self.len]) |entry| {
+                if (std.mem.eql(u8, entry.key, key)) return entry.value;
+            }
+            return null;
         }
-        return null;
-    }
 
-    pub fn clear(self: *QueryArray) void {
-        self.len = 0;
-    }
-};
+        pub fn clear(self: *Self) void {
+            self.len = 0;
+        }
+    };
+}
+
+pub const ParamArray = InlineMap(MAX_ROUTE_PARAMS);
+pub const QueryArray = InlineMap(MAX_QUERY_PARAMS);
 
 /// Parse a query string (everything after '?') into a QueryArray.
 /// Splits on '&', then each pair on '='. Values are zero-copy slices.

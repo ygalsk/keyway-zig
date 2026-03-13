@@ -5,10 +5,12 @@ const Router = @import("router.zig").Router;
 const LuaState = @import("lua_state.zig").LuaState;
 const bpf_reuseport = @import("bpf_reuseport.zig");
 const TlsContext = @import("tls.zig").TlsContext;
+const castUserdata = @import("helpers.zig").castUserdata;
 const SseRegistry = @import("sse.zig").SseRegistry;
+const tuning = @import("config.zig");
 
 // TCP socket configuration
-const DEFAULT_BACKLOG: u31 = 128;
+const DEFAULT_BACKLOG = tuning.DEFAULT_BACKLOG;
 
 /// TCP Server - Deep module with simple interface
 /// Handles socket creation, binding, listening, and accepting connections
@@ -73,7 +75,7 @@ pub const Server = struct {
         );
 
         // BPF affinity requires ordered startup:
-        // Worker 0 must attach BPF → bind → listen BEFORE other workers bind.
+        // Worker 0 must attach BPF -> bind -> listen BEFORE other workers bind.
         // The kernel requires BPF to be attached before bind() on the first socket
         // (see kernel selftest tools/testing/selftests/net/reuseport_bpf.c).
         if (config.enable_bpf_affinity and num_workers > 1) {
@@ -111,6 +113,10 @@ pub const Server = struct {
             try TlsContext.init(config.tls_cert_path.?, config.tls_key_path.?)
         else
             null;
+
+        if (tls_ctx == null and (config.tls_cert_path != null or config.tls_key_path != null)) {
+            std.log.warn("TLS disabled: both --tls-cert and --tls-key are required", .{});
+        }
 
         return Server{
             .allocator = allocator,
@@ -151,7 +157,7 @@ pub const Server = struct {
     ) xev.CallbackAction {
         _ = completion;
 
-        const self: *Server = @ptrCast(@alignCast(userdata.?));
+        const self = castUserdata(Server, userdata);
 
         const client_socket = result.accept catch |err| {
             std.log.err("accept failed err={}", .{err});

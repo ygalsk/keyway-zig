@@ -2,6 +2,7 @@ const std = @import("std");
 const xev = @import("xev");
 const handler = @import("handler.zig");
 const Connection = handler.Connection;
+const castUserdata = @import("helpers.zig").castUserdata;
 const HttpExchange = @import("http_exchange.zig").HttpExchange;
 
 /// SSE connection state — set after successful SSE upgrade.
@@ -11,8 +12,8 @@ pub const SseState = struct {
 };
 
 /// Handle SSE upgrade: send headers, set state, subscribe to registry.
-pub fn handleSseUpgrade(self: *Connection, exchange_ptr: *HttpExchange) void {
-    const room = exchange_ptr.sse_room;
+pub fn handleSseUpgrade(self: *Connection, exchange: *HttpExchange) void {
+    const room = exchange.sse_room;
     if (room.len == 0) {
         self.logAccess(400);
         self.send400BadRequest();
@@ -68,7 +69,7 @@ fn onSseDisconnect(
 ) xev.CallbackAction {
     _ = loop;
     _ = completion;
-    const self: *Connection = @ptrCast(@alignCast(userdata.?));
+    const self = castUserdata(Connection, userdata);
     const bytes = result.recv catch {
         self.close();
         return .disarm;
@@ -81,7 +82,7 @@ fn onSseDisconnect(
 
 /// Queue an SSE event for sending. Called by SseRegistry.broadcast.
 pub fn submitSseSend(self: *Connection, data: []const u8) void {
-    if (self.is_closing) return;
+    if (self.state == .closing) return;
 
     // Dupe data into base_allocator (caller's data is temporary)
     const duped = self.base_allocator.dupe(u8, data) catch return;
@@ -126,7 +127,7 @@ fn onSseSendComplete(
 ) xev.CallbackAction {
     _ = loop;
     _ = completion;
-    const self: *Connection = @ptrCast(@alignCast(userdata.?));
+    const self = castUserdata(Connection, userdata);
     _ = result.send catch {
         self.close();
         return .disarm;
@@ -146,7 +147,7 @@ fn onWrite(
 ) xev.CallbackAction {
     _ = loop;
     _ = completion;
-    const self: *Connection = @ptrCast(@alignCast(userdata.?));
+    const self = castUserdata(Connection, userdata);
     _ = result.send catch {
         self.close();
         return .disarm;

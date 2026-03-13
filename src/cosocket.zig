@@ -1,3 +1,18 @@
+//! Outbound I/O engine — yield/resume bridge between Lua coroutines and libxev.
+//!
+//! Flow:
+//!   Lua handler yields  →  dispatchIo()  →  submitOutboundIO() or drainSubmissionRing()
+//!       ↓                                         ↓
+//!   xev async op        ←  onOutbound/onBatchComplete callback
+//!       ↓
+//!   dispatchResume()    →  lua_resume(thread, nresults)
+//!       ↓
+//!   completed?          →  completeHandler() → serialize response → write
+//!   yielded again?      →  dispatchIo() (loop)
+//!
+//! Single-shot path: one pending_io at a time (connect, send, recv, close).
+//! Batch path: submission ring drained, multiple xev ops in flight, resume on last completion.
+
 const std = @import("std");
 const xev = @import("xev");
 const http = @import("http.zig");
@@ -13,6 +28,7 @@ const Lua = @import("luajit").Lua;
 
 const handler_mod = @import("handler.zig");
 const Connection = handler_mod.Connection;
+const castUserdata = @import("helpers.zig").castUserdata;
 
 /// Cosocket suspend state — bundled so one `= null` replaces seven resets.
 /// Non-null means a handler is yielded waiting on outbound I/O.
@@ -61,9 +77,184 @@ pub fn dispatchIo(conn: *Connection) void {
     }
 }
 
-/// Read pending_io from LuaState, create socket / submit xev operation
-fn submitOutboundIO(self: *Connection) void {
+fn createTcpSocket(self: *Connection, host: []const u8, port: u16, comptime err_prefix: [:0]const u8) ?struct { sock: std.posix.socket_t, addr: std.net.Address } {
+    const sock = std.posix.socket(
+        std.posix.AF.INET,
+        std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
+        0,
+    ) catch {
+        resumeWithError(self, err_prefix ++ "socket creation failed");
+        return null;
+    };
+    const addr = std.net.Address.parseIp4(host, port) catch {
+        std.posix.close(sock);
+        resumeWithError(self, err_prefix ++ "invalid address");
+        return null;
+    };
+    return .{ .sock = sock, .addr = addr };
+}
+
+fn submitConnect(self: *Connection, c: anytype, pending_op: IoEntry.Op) void {
     const s = &self.suspended.?;
+    s.pending_op = pending_op;
+    const result = createTcpSocket(self, c.host, c.port, "connect: ") orelse return;
+    s.outbound_fd = result.sock;
+    s.completion = .{
+        .op = .{ .connect = .{ .socket = result.sock, .addr = result.addr } },
+        .userdata = self,
+        .callback = onOutboundComplete,
+    };
+    self.loop.add(&s.completion);
+}
+
+fn submitUdpConnect(self: *Connection, c: anytype) void {
+    const s = &self.suspended.?;
+    s.pending_op = .udp_connect;
+    const sock = std.posix.socket(
+        std.posix.AF.INET,
+        std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC,
+        0,
+    ) catch {
+        resumeWithError(self, "udp_connect: socket creation failed");
+        return;
+    };
+    if (c.timeout_ms > 0) {
+        const tv = std.posix.timeval{
+            .sec = @intCast(c.timeout_ms / 1000),
+            .usec = @intCast((c.timeout_ms % 1000) * 1000),
+        };
+        _ = std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
+    }
+    s.outbound_fd = sock;
+    const addr = std.net.Address.parseIp4(c.host, c.port) catch {
+        std.posix.close(sock);
+        s.outbound_fd = 0;
+        resumeWithError(self, "udp_connect: invalid address");
+        return;
+    };
+    s.completion = .{
+        .op = .{ .connect = .{ .socket = sock, .addr = addr } },
+        .userdata = self,
+        .callback = onOutboundComplete,
+    };
+    self.loop.add(&s.completion);
+}
+
+fn submitSend(self: *Connection, snd: anytype) void {
+    const s = &self.suspended.?;
+    const data = self.arena.allocator().dupe(u8, snd.data) catch {
+        resumeWithError(self, "send: arena alloc failed");
+        return;
+    };
+    if (self.lua_state.getTls(snd.fd)) |tls_conn| {
+        const ciphertext = tlsEncryptAlloc(tls_conn, data, self.arena.allocator()) orelse {
+            resumeWithError(self, "send: tls encrypt failed");
+            return;
+        };
+        s.completion = .{
+            .op = .{ .send = .{ .fd = snd.fd, .buffer = .{ .slice = ciphertext } } },
+            .userdata = self,
+            .callback = onOutboundComplete,
+        };
+    } else {
+        s.completion = .{
+            .op = .{ .send = .{ .fd = snd.fd, .buffer = .{ .slice = data } } },
+            .userdata = self,
+            .callback = onOutboundComplete,
+        };
+    }
+    self.loop.add(&s.completion);
+}
+
+fn submitRecv(self: *Connection, r: anytype) void {
+    const s = &self.suspended.?;
+    // Check if BoringSSL already has buffered plaintext before issuing kernel recv
+    if (self.lua_state.getTls(r.fd)) |tls_conn| {
+        if (tls_conn.hasPending()) {
+            var plaintext_buf: [tls_mod.TLS_RECORD_MAX_SIZE]u8 = undefined;
+            switch (tls_conn.decrypt(&plaintext_buf)) {
+                .data => |n| {
+                    const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
+                    thread.pushLString(plaintext_buf[0..n]);
+                    dispatchResume(self, thread, 1, s.exchange);
+                    return;
+                },
+                .want_read => {},
+                .zero_return => {
+                    resumeWithError(self, "recv: tls connection closed");
+                    return;
+                },
+                .err => |de| {
+                    resumeWithTlsError(self, "recv", de);
+                    return;
+                },
+            }
+        }
+    }
+    const buf = self.arena.allocator().alloc(u8, r.max_len) catch {
+        resumeWithError(self, "recv: alloc failed");
+        return;
+    };
+    s.recv_buf = buf;
+    s.completion = .{
+        .op = .{ .recv = .{ .fd = r.fd, .buffer = .{ .slice = buf } } },
+        .userdata = self,
+        .callback = onOutboundComplete,
+    };
+    self.loop.add(&s.completion);
+}
+
+fn submitClose(self: *Connection, c: anytype) void {
+    const s = &self.suspended.?;
+    self.lua_state.removeTls(c.fd);
+    s.completion = .{
+        .op = .{ .close = .{ .fd = c.fd } },
+        .userdata = self,
+        .callback = onOutboundComplete,
+    };
+    self.loop.add(&s.completion);
+}
+
+fn submitTlsHandshake(self: *Connection, th: anytype) void {
+    const s = &self.suspended.?;
+    s.pending_op = .tls_handshake;
+    const tls_conn = self.base_allocator.create(TlsConn) catch {
+        resumeWithError(self, "sslhandshake: alloc failed");
+        return;
+    };
+    tls_conn.* = TlsConn.init(self.base_allocator, selectClientTlsCtx(self.lua_state, th.tls_mode), .client) catch {
+        self.base_allocator.destroy(tls_conn);
+        resumeWithError(self, "sslhandshake: tls init failed");
+        return;
+    };
+    if (th.sni_host) |host| {
+        const host_z = self.arena.allocator().dupeZ(u8, host) catch {
+            tls_mod.freeTlsConn(self.base_allocator, tls_conn);
+            resumeWithError(self, "sslhandshake: alloc failed");
+            return;
+        };
+        tls_conn.setSni(host_z);
+    }
+    s.outbound_tls = tls_conn;
+    _ = tls_conn.handshake();
+    const total = tls_conn.drainAll();
+    if (total == 0) {
+        tls_mod.freeTlsConn(self.base_allocator, tls_conn);
+        s.outbound_tls = null;
+        resumeWithError(self, "sslhandshake: no handshake data produced");
+        return;
+    }
+    s.completion = .{
+        .op = .{ .send = .{ .fd = th.fd, .buffer = .{ .slice = tls_conn.encrypt_buf[0..total] } } },
+        .userdata = self,
+        .callback = onTlsOutboundHandshakeSend,
+    };
+    s.outbound_fd = th.fd;
+    self.loop.add(&s.completion);
+}
+
+/// Read pending_io from LuaState, dispatch to per-op handler
+fn submitOutboundIO(self: *Connection) void {
     const pending = self.lua_state.pending_io orelse {
         resumeWithError(self, "no pending I/O operation");
         return;
@@ -71,222 +262,15 @@ fn submitOutboundIO(self: *Connection) void {
     self.lua_state.pending_io = null;
 
     switch (pending) {
-        .connect => |c| {
-            s.pending_op = .connect;
-            const sock = std.posix.socket(
-                std.posix.AF.INET,
-                std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
-                0,
-            ) catch {
-                resumeWithError(self, "socket creation failed");
-                return;
-            };
-            s.outbound_fd = sock;
-
-            const addr = std.net.Address.parseIp4(c.host, c.port) catch {
-                std.posix.close(sock);
-                s.outbound_fd = 0;
-                resumeWithError(self, "connect: invalid address");
-                return;
-            };
-
-            s.completion = .{
-                .op = .{ .connect = .{ .socket = sock, .addr = addr } },
-                .userdata = self,
-                .callback = onOutboundComplete,
-            };
-            self.loop.add(&s.completion);
-        },
-        .pool_connect => |c| {
-            s.pending_op = .pool_connect;
-            const sock = std.posix.socket(
-                std.posix.AF.INET,
-                std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
-                0,
-            ) catch {
-                resumeWithError(self, "socket creation failed");
-                return;
-            };
-            s.outbound_fd = sock;
-
-            const addr = std.net.Address.parseIp4(c.host, c.port) catch {
-                std.posix.close(sock);
-                s.outbound_fd = 0;
-                resumeWithError(self, "connect: invalid address");
-                return;
-            };
-
-            s.completion = .{
-                .op = .{ .connect = .{ .socket = sock, .addr = addr } },
-                .userdata = self,
-                .callback = onOutboundComplete,
-            };
-            self.loop.add(&s.completion);
-        },
-        .udp_connect => |c| {
-            s.pending_op = .udp_connect;
-            const sock = std.posix.socket(
-                std.posix.AF.INET,
-                std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC,
-                0,
-            ) catch {
-                resumeWithError(self, "udp_connect: socket creation failed");
-                return;
-            };
-            // Set receive timeout once on the socket
-            if (c.timeout_ms > 0) {
-                const tv = std.posix.timeval{
-                    .sec = @intCast(c.timeout_ms / 1000),
-                    .usec = @intCast((c.timeout_ms % 1000) * 1000),
-                };
-                _ = std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
-            }
-
-            s.outbound_fd = sock;
-
-            const addr = std.net.Address.parseIp4(c.host, c.port) catch {
-                std.posix.close(sock);
-                s.outbound_fd = 0;
-                resumeWithError(self, "udp_connect: invalid address");
-                return;
-            };
-
-            s.completion = .{
-                .op = .{ .connect = .{ .socket = sock, .addr = addr } },
-                .userdata = self,
-                .callback = onOutboundComplete,
-            };
-            self.loop.add(&s.completion);
-        },
-        .send => |snd| {
-            // Arena-dupe send_data before async submission — Lua string may be GC'd across yield
-            const data = self.arena.allocator().dupe(u8, snd.data) catch {
-                resumeWithError(self, "send: arena alloc failed");
-                return;
-            };
-            // TLS-aware send: encrypt if fd has TLS state
-            if (self.lua_state.getTls(snd.fd)) |tls_conn| {
-                const ciphertext = tlsEncryptAlloc(tls_conn, data, self.arena.allocator()) orelse {
-                    resumeWithError(self, "send: tls encrypt failed");
-                    return;
-                };
-                s.completion = .{
-                    .op = .{ .send = .{ .fd = snd.fd, .buffer = .{ .slice = ciphertext } } },
-                    .userdata = self,
-                    .callback = onOutboundComplete,
-                };
-                self.loop.add(&s.completion);
-            } else {
-                s.completion = .{
-                    .op = .{ .send = .{ .fd = snd.fd, .buffer = .{ .slice = data } } },
-                    .userdata = self,
-                    .callback = onOutboundComplete,
-                };
-                self.loop.add(&s.completion);
-            }
-        },
-        .recv => |r| {
-            // If fd has TLS state, check if BoringSSL already has buffered plaintext
-            // from a previous feedCiphertext call. Without this check, the kernel recv
-            // blocks because postgres has nothing more to send — the data is already
-            // inside BoringSSL's internal buffers.
-            if (self.lua_state.getTls(r.fd)) |tls_conn| {
-                if (tls_conn.hasPending()) {
-                    var plaintext_buf: [tls_mod.TLS_RECORD_MAX_SIZE]u8 = undefined;
-                    switch (tls_conn.decrypt(&plaintext_buf)) {
-                        .data => |n| {
-                            const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
-                            thread.pushLString(plaintext_buf[0..n]);
-                            dispatchResume(self, thread, 1, s.exchange);
-                            return;
-                        },
-                        .want_read => {}, // Fall through to kernel recv
-                        .zero_return => {
-                            resumeWithError(self, "recv: tls connection closed");
-                            return;
-                        },
-                        .err => |de| {
-                            resumeWithTlsError(self, "recv", de);
-                            return;
-                        },
-                    }
-                }
-            }
-
-            const buf = self.arena.allocator().alloc(u8, r.max_len) catch {
-                resumeWithError(self, "recv: alloc failed");
-                return;
-            };
-            s.recv_buf = buf;
-
-            s.completion = .{
-                .op = .{ .recv = .{ .fd = r.fd, .buffer = .{ .slice = buf } } },
-                .userdata = self,
-                .callback = onOutboundComplete,
-            };
-            self.loop.add(&s.completion);
-        },
-        .close => |c| {
-            // Clean up TLS state for this fd if present
-            self.lua_state.removeTls(c.fd);
-            s.completion = .{
-                .op = .{ .close = .{ .fd = c.fd } },
-                .userdata = self,
-                .callback = onOutboundComplete,
-            };
-            self.loop.add(&s.completion);
-        },
-        .tls_handshake => |th| {
-            s.pending_op = .tls_handshake;
-            // Allocate TlsConn from base_allocator (outlives request)
-            const tls_conn = self.base_allocator.create(TlsConn) catch {
-                resumeWithError(self, "sslhandshake: alloc failed");
-                return;
-            };
-            tls_conn.* = TlsConn.init(self.base_allocator, selectClientTlsCtx(self.lua_state, th.tls_mode), .client) catch {
-                self.base_allocator.destroy(tls_conn);
-                resumeWithError(self, "sslhandshake: tls init failed");
-                return;
-            };
-
-            // Set SNI if host provided
-            if (th.sni_host) |host| {
-                const host_z = self.arena.allocator().dupeZ(u8, host) catch {
-                    tls_mod.freeTlsConn(self.base_allocator, tls_conn);
-                    resumeWithError(self, "sslhandshake: alloc failed");
-                    return;
-                };
-                tls_conn.setSni(host_z);
-            }
-
-            s.outbound_tls = tls_conn;
-
-            // Kick off handshake — produces ClientHello in wbio
-            _ = tls_conn.handshake();
-
-            // Drain wbio and send ClientHello
-            const total = tls_conn.drainAll();
-            if (total == 0) {
-                tls_mod.freeTlsConn(self.base_allocator, tls_conn);
-                s.outbound_tls = null;
-                resumeWithError(self, "sslhandshake: no handshake data produced");
-                return;
-            }
-
-            s.completion = .{
-                .op = .{ .send = .{ .fd = th.fd, .buffer = .{ .slice = tls_conn.encrypt_buf[0..total] } } },
-                .userdata = self,
-                .callback = onTlsOutboundHandshakeSend,
-            };
-            s.outbound_fd = th.fd;
-            self.loop.add(&s.completion);
-        },
-        .setkeepalive => {
-            resumeWithError(self, "setkeepalive: not valid as pending I/O");
-        },
-        .none => {
-            resumeWithError(self, "no pending I/O operation");
-        },
+        .connect => |c| submitConnect(self, c, .connect),
+        .pool_connect => |c| submitConnect(self, c, .pool_connect),
+        .udp_connect => |c| submitUdpConnect(self, c),
+        .send => |snd| submitSend(self, snd),
+        .recv => |r| submitRecv(self, r),
+        .close => |c| submitClose(self, c),
+        .tls_handshake => |th| submitTlsHandshake(self, th),
+        .setkeepalive => resumeWithError(self, "setkeepalive: not valid as pending I/O"),
+        .none => resumeWithError(self, "no pending I/O operation"),
     }
 }
 
@@ -299,10 +283,10 @@ fn onOutboundComplete(
 ) xev.CallbackAction {
     _ = loop;
 
-    const self: *Connection = @ptrCast(@alignCast(userdata.?));
+    const self = castUserdata(Connection, userdata);
     const s = &self.suspended.?;
     const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
-    const exchange_ptr = s.exchange;
+    const exchange = s.exchange;
 
     // Determine what completed based on the op that was submitted
     const op = completion.op;
@@ -316,7 +300,7 @@ fn onOutboundComplete(
             thread.pushString("connection refused");
             nresults = 2;
             s.pending_op = .none;
-            dispatchResume(self, thread, nresults, exchange_ptr);
+            dispatchResume(self, thread, nresults, exchange);
             return .disarm;
         };
         if (s.pending_op == .pool_connect) {
@@ -335,7 +319,7 @@ fn onOutboundComplete(
             thread.pushNil();
             thread.pushString("send failed");
             nresults = 2;
-            dispatchResume(self, thread, nresults, exchange_ptr);
+            dispatchResume(self, thread, nresults, exchange);
             return .disarm;
         };
         thread.pushInteger(@intCast(bytes_sent));
@@ -345,7 +329,7 @@ fn onOutboundComplete(
             thread.pushString("recv failed");
             nresults = 2;
             s.recv_buf = null;
-            dispatchResume(self, thread, nresults, exchange_ptr);
+            dispatchResume(self, thread, nresults, exchange);
             return .disarm;
         };
         if (s.recv_buf) |buf| {
@@ -372,7 +356,7 @@ fn onOutboundComplete(
                         thread.pushString("recv: tls connection closed");
                         nresults = 2;
                         s.recv_buf = null;
-                        dispatchResume(self, thread, nresults, exchange_ptr);
+                        dispatchResume(self, thread, nresults, exchange);
                         return .disarm;
                     },
                     .err => |de| {
@@ -380,7 +364,7 @@ fn onOutboundComplete(
                         thread.pushString(tlsErrorMsg("recv", de));
                         nresults = 2;
                         s.recv_buf = null;
-                        dispatchResume(self, thread, nresults, exchange_ptr);
+                        dispatchResume(self, thread, nresults, exchange);
                         return .disarm;
                     },
                 }
@@ -396,7 +380,7 @@ fn onOutboundComplete(
             thread.pushNil();
             thread.pushString("close failed");
             nresults = 2;
-            dispatchResume(self, thread, nresults, exchange_ptr);
+            dispatchResume(self, thread, nresults, exchange);
             return .disarm;
         };
         s.outbound_fd = 0; // fd is now closed; prevent completeHandler double-close
@@ -407,7 +391,7 @@ fn onOutboundComplete(
         nresults = 2;
     }
 
-    dispatchResume(self, thread, nresults, exchange_ptr);
+    dispatchResume(self, thread, nresults, exchange);
     return .disarm;
 }
 
@@ -421,7 +405,7 @@ fn onTlsOutboundHandshakeSend(
     _ = loop;
     _ = completion;
 
-    const self: *Connection = @ptrCast(@alignCast(userdata.?));
+    const self = castUserdata(Connection, userdata);
     const s = &self.suspended.?;
     const tls_conn = s.outbound_tls orelse {
         resumeWithError(self, "sslhandshake: missing tls state");
@@ -455,7 +439,7 @@ fn onTlsOutboundHandshakeRecv(
     _ = loop;
     _ = completion;
 
-    const self: *Connection = @ptrCast(@alignCast(userdata.?));
+    const self = castUserdata(Connection, userdata);
     const s = &self.suspended.?;
     const tls_conn = s.outbound_tls orelse {
         resumeWithError(self, "sslhandshake: missing tls state");
@@ -553,9 +537,9 @@ fn cleanupOutboundTls(self: *Connection) void {
 }
 
 /// Resume coroutine and dispatch based on result
-pub fn dispatchResume(self: *Connection, thread: *Lua, nresults: c_int, exchange_ptr: *HttpExchange) void {
+pub fn dispatchResume(self: *Connection, thread: *Lua, nresults: c_int, exchange: *HttpExchange) void {
     self.lua_state.current_connection = self;
-    const resume_result = self.lua_state.resumeHandler(@ptrCast(thread), nresults, exchange_ptr) catch {
+    const resume_result = self.lua_state.resumeHandler(@ptrCast(thread), nresults, exchange) catch {
         self.lua_state.current_connection = null;
         self.send500InternalError();
         return;
@@ -843,7 +827,7 @@ fn onBatchComplete(
 ) xev.CallbackAction {
     _ = loop;
 
-    const self: *Connection = @ptrCast(@alignCast(userdata.?));
+    const self = castUserdata(Connection, userdata);
 
     // Determine which SQE index this completion corresponds to
     const base = @intFromPtr(&self.batch_completions[0]);
@@ -959,11 +943,11 @@ pub fn completeHandler(self: *Connection) void {
     // Safety net: close leaked outbound fd
     if (s.outbound_fd != 0) std.posix.close(s.outbound_fd);
 
-    const exchange_ptr = s.exchange;
+    const exchange = s.exchange;
     self.suspended = null;
 
-    self.logAccess(exchange_ptr.status);
-    self.writeResponse(exchange_ptr) catch {
+    self.logAccess(exchange.status);
+    self.writeResponse(exchange) catch {
         self.send500InternalError();
     };
 }
@@ -984,4 +968,28 @@ fn resumeWithTlsError(self: *Connection, comptime prefix: []const u8, de: TlsCon
     thread.pushNil();
     thread.pushString(tlsErrorMsg(prefix, de));
     dispatchResume(self, thread, 2, s.exchange);
+}
+
+test "tlsErrorMsg includes detail suffix when msg_len > 0" {
+    const de = TlsConn.DecryptError{ .ssl_error = 1, .msg_len = 5 };
+    const msg = tlsErrorMsg("recv", de);
+    try std.testing.expectEqualStrings("recv: tls decrypt failed (see server log for SSL details)", msg);
+}
+
+test "tlsErrorMsg returns base message when msg_len == 0" {
+    const de = TlsConn.DecryptError{ .ssl_error = 1, .msg_len = 0 };
+    const msg = tlsErrorMsg("recv", de);
+    try std.testing.expectEqualStrings("recv: tls decrypt failed", msg);
+}
+
+test "tlsErrorMsg works with different prefixes" {
+    const de_with = TlsConn.DecryptError{ .ssl_error = 1, .msg_len = 1 };
+    try std.testing.expectEqualStrings("send: tls decrypt failed (see server log for SSL details)", tlsErrorMsg("send", de_with));
+
+    const de_without = TlsConn.DecryptError{ .ssl_error = 1, .msg_len = 0 };
+    try std.testing.expectEqualStrings("send: tls decrypt failed", tlsErrorMsg("send", de_without));
+}
+
+test "SuspendedState has expected default for outbound_tls" {
+    try std.testing.expect(@sizeOf(SuspendedState) > 0);
 }

@@ -6,6 +6,7 @@ const TlsContext = tls_mod.TlsContext;
 const LinearBuffer = @import("buffer.zig").LinearBuffer;
 const handler = @import("handler.zig");
 const Connection = handler.Connection;
+const castUserdata = @import("helpers.zig").castUserdata;
 const config = @import("config.zig");
 
 const CIPHERTEXT_BUFFER_SIZE = config.CIPHERTEXT_BUFFER_SIZE;
@@ -92,7 +93,7 @@ pub fn onTlsHandshakeWrite(
     _ = loop;
     _ = completion;
 
-    const self: *Connection = @ptrCast(@alignCast(userdata.?));
+    const self = castUserdata(Connection, userdata);
     _ = result.send catch {
         self.close();
         return .disarm;
