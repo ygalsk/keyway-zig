@@ -32,6 +32,7 @@ const castUserdata = @import("helpers.zig").castUserdata;
 const conn_sse = @import("conn_sse.zig");
 const conn_ws = @import("conn_ws.zig");
 const cosocket = @import("cosocket.zig");
+const error_response = @import("error_response.zig");
 
 const ParamArray = params.ParamArray;
 const QueryArray = params.QueryArray;
@@ -261,8 +262,7 @@ pub const Connection = struct {
             if (err == error.Incomplete) {
                 self.startRead();
             } else {
-                std.log.err("[fd={d}] http parse failed err={}", .{ self.socket, err });
-                self.send400BadRequest();
+                error_response.sendError(self, .client_error, "http parse failed");
             }
             return null;
         };
@@ -272,9 +272,10 @@ pub const Connection = struct {
         self.lua_state.current_connection = self;
         const handler_result = self.lua_state.callLuaHandler(ref, exchange) catch |err| {
             self.lua_state.current_connection = null;
+            // Log the detailed Lua error separately (not exposed to client)
             std.log.err("[fd={d}] lua handler error {s} {s} err={}", .{ self.socket, request.method, clean_path, err });
             self.logAccess(500);
-            self.send500InternalError();
+            error_response.sendError(self, .server_error, "lua handler error");
             return;
         };
 
@@ -285,7 +286,7 @@ pub const Connection = struct {
                 if (exchange.upgrade_websocket) {
                     conn_ws.handleWsUpgrade(self, exchange, request) catch {
                         self.logAccess(400);
-                        self.send400BadRequest();
+                        error_response.sendError(self, .client_error, "websocket upgrade failed");
                         return;
                     };
                     return;
@@ -317,7 +318,7 @@ pub const Connection = struct {
     }
 
     pub fn send404NotFound(self: *Connection) void {
-        self.sendRawResponse("HTTP/1.1 404 Not Found\r\nContent-Length: 9\r\n\r\nNot Found");
+        error_response.sendErrorStatus(self, 404, "route not found");
     }
 
     pub fn sendResponse(self: *Connection) !void {
@@ -341,7 +342,7 @@ pub const Connection = struct {
 
         self.param_cache.clear();
         const lua_ref = self.router.match(request.method, clean_path, &self.param_cache) catch {
-            self.send400BadRequest();
+            error_response.sendError(self, .client_error, "route match error");
             return;
         };
 
@@ -405,7 +406,7 @@ pub const Connection = struct {
         return true;
     }
 
-    fn sendRawResponse(self: *Connection, text: []const u8) void {
+    pub fn sendRawResponse(self: *Connection, text: []const u8) void {
         self.state = .writing;
         if (!self.submitTlsAwareSend(text, onWrite, true)) {
             self.close();
@@ -413,11 +414,11 @@ pub const Connection = struct {
     }
 
     pub fn send400BadRequest(self: *Connection) void {
-        self.sendRawResponse("HTTP/1.1 400 Bad Request\r\nContent-Length: 11\r\n\r\nBad Request");
+        error_response.sendError(self, .client_error, "bad request");
     }
 
     pub fn send500InternalError(self: *Connection) void {
-        self.sendRawResponse("HTTP/1.1 500 Internal Server Error\r\nContent-Length: 21\r\n\r\nInternal Server Error");
+        error_response.sendError(self, .server_error, "internal error");
     }
 
     fn onWrite(
