@@ -102,11 +102,8 @@ pub const Connection = struct {
 
     // SSE: non-null when connection has been upgraded to SSE
     sse_state: ?conn_sse.SseState = null,
+    // SSE registry pointer: injected at init, copied into SseState at upgrade time
     sse_registry: ?*SseRegistry = null,
-    sse_send_queue: std.ArrayListUnmanaged([]const u8) = .{},
-    sse_drain_index: usize = 0,
-    sse_writing: bool = false,
-    sse_disconnect_completion: xev.Completion = undefined,
 
     // Body size tracking: accumulated bytes for streaming body enforcement
     body_bytes_received: u64 = 0,
@@ -186,7 +183,7 @@ pub const Connection = struct {
             if (wss.on_close_ref != 0) self.lua_state.lua.unref(Lua.PseudoIndex.Registry, wss.on_close_ref);
         }
         // Clean up SSE state
-        conn_sse.deinitSse(self);
+        if (self.sse_state) |*ss| ss.deinit(self);
         // Clean up TLS resources
         if (self.tls_conn) |*tc| tc.deinit(self.base_allocator);
         if (self.ciphertext_buffer) |*cb| cb.deinit();
