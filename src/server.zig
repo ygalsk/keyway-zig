@@ -28,7 +28,6 @@ pub const Server = struct {
     metrics: *WorkerMetrics,
     all_worker_metrics: []const *WorkerMetrics = &.{},
     draining: bool = false,
-    active_connections: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     /// Server configuration
     pub const Config = struct {
@@ -191,7 +190,6 @@ pub const Server = struct {
         };
 
         // Track active connections (for health endpoint and drain logging)
-        _ = self.active_connections.fetchAdd(1, .monotonic);
         self.metrics.incrementActiveConnections();
 
         // Create connection handler
@@ -231,14 +229,6 @@ pub const Server = struct {
     /// Stop accepting new connections (called on drain signal).
     pub fn stopAccepting(self: *Server) void {
         self.draining = true;
-    }
-
-    /// Close idle keep-alive connections (no in-flight request).
-    /// Currently a no-op; connections check draining flag in post-write path.
-    pub fn closeIdleConnections(_: *Server) void {
-        // Idle keep-alive connections will close after their current request
-        // completes, because handleHttpPostWrite checks server.draining.
-        // There's no connection list to iterate — xev tracks armed completions.
     }
 
     /// Force-close all connections by closing the listen socket.

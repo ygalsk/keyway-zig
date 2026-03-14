@@ -42,19 +42,12 @@ pub const WorkerMetrics = struct {
         _ = self.latency_sum_us.fetchAdd(latency_us, .monotonic);
         _ = self.latency_count.fetchAdd(1, .monotonic);
 
-        // Update min via cmpxchg loop
-        while (true) {
-            const current_min = self.latency_min_us.load(.monotonic);
-            if (latency_us >= current_min) break;
-            if (self.latency_min_us.cmpxchgWeak(current_min, latency_us, .monotonic, .monotonic) == null) break;
-        }
+        // Update min/max — single-writer per worker, no cmpxchg needed
+        const current_min = self.latency_min_us.load(.monotonic);
+        if (latency_us < current_min) self.latency_min_us.store(latency_us, .monotonic);
 
-        // Update max via cmpxchg loop
-        while (true) {
-            const current_max = self.latency_max_us.load(.monotonic);
-            if (latency_us <= current_max) break;
-            if (self.latency_max_us.cmpxchgWeak(current_max, latency_us, .monotonic, .monotonic) == null) break;
-        }
+        const current_max = self.latency_max_us.load(.monotonic);
+        if (latency_us > current_max) self.latency_max_us.store(latency_us, .monotonic);
     }
 
     /// Increment active connection count (called on accept).

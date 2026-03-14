@@ -35,31 +35,17 @@ pub fn onSendComplete(
 
     const self = castUserdata(Connection, userdata);
 
-    // Timeout: clean up TLS handshake state without resuming coroutine.
-    // Decrement pending_completions (incremented by submitTlsHandshake in cosocket_ops).
-    if (self.timed_out) {
-        self.cs.pending_completions -= 1;
-        cleanup(self);
-        if (self.cs.suspended) |*s| {
-            if (s.coroutine_ref != 0) {
-                self.lua_state.lua.unref(Lua.PseudoIndex.Registry, s.coroutine_ref);
-                s.coroutine_ref = 0;
-            }
-            self.cs.suspended = null;
-        }
-        self.maybeFinishClose();
-        return .disarm;
-    }
+    if (self.timed_out) return handleTimeoutCleanup(self);
 
     const s = &self.cs.suspended.?;
     const tls_conn = s.outbound_tls orelse {
+        self.cs.pending_completions -= 1;
         cosocket.resumeWithError(self, .upstream_error, "sslhandshake: missing tls state");
         return .disarm;
     };
 
     _ = result.send catch {
-        cleanup(self);
-        cosocket.resumeWithError(self, .upstream_error, "sslhandshake: send failed");
+        failHandshake(self, "sslhandshake: send failed");
         return .disarm;
     };
 
@@ -68,6 +54,8 @@ pub fn onSendComplete(
         return .disarm;
     }
 
+    // Handshake continues — re-submit recv using the same completion slot
+    // (no pending_completions change, we're reusing the existing slot)
     submitRecv(self);
     return .disarm;
 }
@@ -85,36 +73,22 @@ pub fn onRecvComplete(
 
     const self = castUserdata(Connection, userdata);
 
-    // Timeout: clean up TLS handshake state without resuming coroutine.
-    if (self.timed_out) {
-        self.cs.pending_completions -= 1;
-        cleanup(self);
-        if (self.cs.suspended) |*s| {
-            if (s.coroutine_ref != 0) {
-                self.lua_state.lua.unref(Lua.PseudoIndex.Registry, s.coroutine_ref);
-                s.coroutine_ref = 0;
-            }
-            self.cs.suspended = null;
-        }
-        self.maybeFinishClose();
-        return .disarm;
-    }
+    if (self.timed_out) return handleTimeoutCleanup(self);
 
     const s = &self.cs.suspended.?;
     const tls_conn = s.outbound_tls orelse {
+        self.cs.pending_completions -= 1;
         cosocket.resumeWithError(self, .upstream_error, "sslhandshake: missing tls state");
         return .disarm;
     };
 
     const bytes_read = result.recv catch {
-        cleanup(self);
-        cosocket.resumeWithError(self, .upstream_error, "sslhandshake: recv failed");
+        failHandshake(self, "sslhandshake: recv failed");
         return .disarm;
     };
 
     if (bytes_read == 0) {
-        cleanup(self);
-        cosocket.resumeWithError(self, .upstream_error, "sslhandshake: connection closed");
+        failHandshake(self, "sslhandshake: connection closed");
         return .disarm;
     }
 
@@ -140,10 +114,7 @@ pub fn onRecvComplete(
     switch (hs_result) {
         .complete => finish(self, tls_conn),
         .want_read => submitRecv(self),
-        .failed => {
-            cleanup(self);
-            cosocket.resumeWithError(self, .upstream_error, "sslhandshake: handshake failed");
-        },
+        .failed => failHandshake(self, "sslhandshake: handshake failed"),
     }
     return .disarm;
 }
@@ -152,13 +123,13 @@ pub fn onRecvComplete(
 fn finish(self: *Connection, tls_conn: *TlsConn) void {
     const s = &self.cs.suspended.?;
     self.lua_state.registerTls(s.outbound_fd, tls_conn) catch {
-        cleanup(self);
-        cosocket.resumeWithError(self, .upstream_error, "sslhandshake: map put failed");
+        failHandshake(self, "sslhandshake: map put failed");
         return;
     };
     s.outbound_tls = null;
     s.outbound_fd = 0;
     s.pending_op = .none;
+    self.cs.pending_completions -= 1;
     const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
     thread.pushInteger(1);
     cosocket.dispatchResume(self, thread, 1, s.exchange);
@@ -169,8 +140,7 @@ fn submitRecv(self: *Connection) void {
     const s = &self.cs.suspended.?;
     const buf = s.recv_buf orelse blk: {
         const b = self.arena.allocator().alloc(u8, tls_mod.TLS_RECORD_MAX_SIZE) catch {
-            cleanup(self);
-            cosocket.resumeWithError(self, .upstream_error, "sslhandshake: alloc failed");
+            failHandshake(self, "sslhandshake: alloc failed");
             return;
         };
         s.recv_buf = b;
@@ -182,6 +152,28 @@ fn submitRecv(self: *Connection) void {
         .callback = onRecvComplete,
     };
     self.loop.add(&s.completion);
+}
+
+/// Timeout cleanup: release TLS state and coroutine ref without resuming.
+fn handleTimeoutCleanup(self: *Connection) xev.CallbackAction {
+    self.cs.pending_completions -= 1;
+    cleanup(self);
+    if (self.cs.suspended) |*s| {
+        if (s.coroutine_ref != 0) {
+            self.lua_state.lua.unref(Lua.PseudoIndex.Registry, s.coroutine_ref);
+            s.coroutine_ref = 0;
+        }
+        self.cs.suspended = null;
+    }
+    self.maybeFinishClose();
+    return .disarm;
+}
+
+/// Clean up TLS resources and resume coroutine with error.
+fn failHandshake(self: *Connection, msg: [:0]const u8) void {
+    cleanup(self);
+    self.cs.pending_completions -= 1;
+    cosocket.resumeWithError(self, .upstream_error, msg);
 }
 
 /// Clean up TLS resources on handshake failure.

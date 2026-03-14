@@ -93,7 +93,7 @@ No verbs (`send()`, `write()`). Only state assignment. Routes are registered via
 
 ### Lua Handler Scripts
 
-Handlers live in `scripts/handlers.lua`, loaded by each worker independently. The file configures LuaJIT optimizations and registers routes.
+The entry point is `keyway.lua` (configurable via `--script`), loaded by each worker independently. The file configures LuaJIT optimizations and registers routes. Core stdlib modules (`keyway.socket`, `keyway.ring`, `keyway.dns`, `keyway.form`, `keyway.response`, `keyway.crypto`, `keyway.http`, `keyway.db_socket`) are embedded in the binary via `@embedFile` and registered as `package.preload` entries — always available without disk I/O.
 
 ## Design Rules (from MANIFEST.md)
 

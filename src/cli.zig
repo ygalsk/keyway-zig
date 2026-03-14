@@ -6,7 +6,7 @@ pub const Config = struct {
     host: []const u8 = "0.0.0.0",
     port: u16 = 8080,
     workers: u16 = 0,
-    script: []const u8 = "scripts/handlers.lua",
+    script: []const u8 = "keyway.lua",
     tls_cert_path: ?[]const u8 = null,
     tls_key_path: ?[]const u8 = null,
     log_level: std.log.Level = .info,
@@ -140,7 +140,7 @@ pub fn printHelp() void {
         \\  --host <addr>       Listen address (default: 0.0.0.0, env: KEYWAY_HOST)
         \\  --port <port>       Listen port (default: 8080, env: KEYWAY_PORT)
         \\  --workers <n>       Worker thread count, 0 = auto-detect (default: 0, env: KEYWAY_WORKERS)
-        \\  --script <path>     Lua handler script (default: scripts/handlers.lua, env: KEYWAY_SCRIPT)
+        \\  --script <path>     Lua handler script (default: keyway.lua, env: KEYWAY_SCRIPT)
         \\  --tls-cert <path>   TLS certificate file (env: KEYWAY_TLS_CERT)
         \\  --tls-key <path>    TLS private key file (env: KEYWAY_TLS_KEY)
         \\  --log-level <level> Log level: err, warn, info, debug (default: info, env: KEYWAY_LOG_LEVEL)
@@ -164,7 +164,7 @@ test "default config values" {
     try std.testing.expectEqualStrings("0.0.0.0", c.host);
     try std.testing.expectEqual(@as(u16, 8080), c.port);
     try std.testing.expectEqual(@as(u16, 0), c.workers);
-    try std.testing.expectEqualStrings("scripts/handlers.lua", c.script);
+    try std.testing.expectEqualStrings("keyway.lua", c.script);
     try std.testing.expectEqual(@as(?[]const u8, null), c.tls_cert_path);
     try std.testing.expectEqual(@as(?[]const u8, null), c.tls_key_path);
     try std.testing.expectEqual(std.log.Level.info, c.log_level);

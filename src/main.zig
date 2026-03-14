@@ -75,9 +75,11 @@ pub fn main() !void {
     shutdown.registerSignalHandlers(&coordinator);
 
     // Create thread pool — workers receive coordinator for drain integration
-    var pool = try ThreadPool.init(allocator, server_config, cli_config.workers, &coordinator);
+    var pool = try ThreadPool.init(allocator, server_config, cli_config.workers, &coordinator, cli_config.script);
     defer pool.deinit();
 
+    // Block until all workers have bound sockets and are accepting connections
+    pool.waitUntilReady();
     std.log.info("Keyway - Ready on {s}:{d} (press Ctrl+C to stop)", .{ server_config.host, server_config.port });
 
     // Wait for all workers (runs until Ctrl+C)

@@ -43,11 +43,13 @@ const cosocket_tls = @import("cosocket_tls.zig");
 /// Classify an error by xev operation tag. Used by both single-shot interpret functions
 /// and the batch completion path to ensure identical error categorization.
 pub fn classifyOpError(op_tag: anytype) struct { category: ErrorCategory, msg: [:0]const u8 } {
-    if (op_tag == .connect) return .{ .category = .upstream_error, .msg = "connection refused" };
-    if (op_tag == .send) return .{ .category = .upstream_error, .msg = "send failed" };
-    if (op_tag == .recv) return .{ .category = .upstream_error, .msg = "recv failed" };
-    if (op_tag == .close) return .{ .category = .upstream_error, .msg = "close failed" };
-    return .{ .category = .server_error, .msg = "unknown op" };
+    return switch (op_tag) {
+        .connect => .{ .category = .upstream_error, .msg = "connection refused" },
+        .send => .{ .category = .upstream_error, .msg = "send failed" },
+        .recv => .{ .category = .upstream_error, .msg = "recv failed" },
+        .close => .{ .category = .upstream_error, .msg = "close failed" },
+        else => .{ .category = .server_error, .msg = "unknown op" },
+    };
 }
 
 // ============================================================================

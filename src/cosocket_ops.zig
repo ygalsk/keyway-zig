@@ -127,12 +127,15 @@ pub fn interpretRecv(
                     return .{ .nresults = 1 };
                 },
                 .want_read => {
-                    // Need more ciphertext — re-submit recv without resuming Lua
+                    // Need more ciphertext — re-submit recv without resuming Lua.
+                    // Re-increment pending_completions because onOutboundComplete
+                    // already decremented it before calling interpretRecv.
                     s.completion = .{
                         .op = .{ .recv = .{ .fd = fd, .buffer = .{ .slice = buf } } },
                         .userdata = self,
                         .callback = cosocket.onOutboundComplete,
                     };
+                    self.cs.pending_completions += 1;
                     self.loop.add(&s.completion);
                     return .{ .nresults = 0, .done = false };
                 },

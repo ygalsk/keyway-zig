@@ -54,6 +54,8 @@ pub const Worker = struct {
         coordinator: ?*ShutdownCoordinator,
         metrics: *WorkerMetrics,
         all_metrics_ptrs: []const *WorkerMetrics,
+        ready_count: *std.atomic.Value(usize),
+        script_path: []const u8,
     };
 
     /// Spawn a worker thread
@@ -67,6 +69,8 @@ pub const Worker = struct {
         coordinator: ?*ShutdownCoordinator,
         worker_metrics: *WorkerMetrics,
         all_metrics_ptrs: []const *WorkerMetrics,
+        ready_count: *std.atomic.Value(usize),
+        script_path: []const u8,
     ) !Worker {
         const ctx = try allocator.create(Context);
         ctx.* = Context{
@@ -79,6 +83,8 @@ pub const Worker = struct {
             .coordinator = coordinator,
             .metrics = worker_metrics,
             .all_metrics_ptrs = all_metrics_ptrs,
+            .ready_count = ready_count,
+            .script_path = script_path,
         };
 
         const thread = try std.Thread.spawn(.{}, workerMain, .{ctx});
@@ -162,7 +168,7 @@ pub const Worker = struct {
         lua_state.setWorkerGlobals(ctx.worker_id);
 
         // Load Lua handlers and process declarative route table
-        try lua_state.loadScript("scripts/handlers.lua");
+        try lua_state.loadScript(ctx.script_path);
         try lua_state.processRouteTable(&router);
 
         if (router.isEmpty()) {
@@ -201,10 +207,13 @@ pub const Worker = struct {
             async_watcher.wait(&loop, &shutdown_completion, ShutdownContext, shutdown_ctx, onShutdownSignal);
         }
 
-        std.log.info("Worker {d} ready on port {d}", .{ ctx.worker_id, ctx.config.port });
-
         // Start accepting connections
         try server.start();
+
+        std.log.info("Worker {d} ready on port {d}", .{ ctx.worker_id, ctx.config.port });
+
+        // Signal readiness to main thread
+        _ = ctx.ready_count.fetchAdd(1, .release);
 
         // Run event loop
         try loop.run(.until_done);
@@ -236,9 +245,8 @@ fn onShutdownSignal(
 
     std.log.info("Shutting down...", .{});
     ctx.server.stopAccepting();
-    ctx.server.closeIdleConnections();
 
-    const active = ctx.server.active_connections.load(.monotonic);
+    const active = ctx.server.metrics.active_connections.load(.monotonic);
     std.log.info("Draining {d} active connections (deadline {d}ms)", .{ active, config.DRAIN_DEADLINE_MS });
 
     if (active == 0) {
@@ -262,7 +270,7 @@ fn onDrainDeadline(
 ) xev.CallbackAction {
     if (userdata) |ud| {
         const server: *Server = @ptrCast(@alignCast(ud));
-        const remaining = server.active_connections.load(.monotonic);
+        const remaining = server.metrics.active_connections.load(.monotonic);
         if (remaining > 0) {
             std.log.info("Drain deadline expired — force-closing {d} connections", .{remaining});
             server.forceCloseAll();
@@ -281,6 +289,7 @@ pub const ThreadPool = struct {
     coordinator: ?*ShutdownCoordinator = null,
     worker_metrics: []WorkerMetrics,
     all_metrics_ptrs: []*WorkerMetrics,
+    ready_count: *std.atomic.Value(usize),
 
     /// Create thread pool with the given number of workers.
     /// Pass worker_count=0 to auto-detect (one worker per CPU core).
@@ -289,6 +298,7 @@ pub const ThreadPool = struct {
         server_config: Server.Config,
         worker_count: u16,
         coordinator: ?*ShutdownCoordinator,
+        script_path: []const u8,
     ) !ThreadPool {
         const num_cpus = try std.Thread.getCpuCount();
         const num_workers: usize = if (worker_count > 0) @intCast(worker_count) else num_cpus;
@@ -309,6 +319,11 @@ pub const ThreadPool = struct {
         bpf_ready.* = std.atomic.Value(bool).init(false);
         errdefer allocator.destroy(bpf_ready);
 
+        // Create worker readiness counter (workers increment after bind+listen)
+        const ready_count = try allocator.create(std.atomic.Value(usize));
+        ready_count.* = std.atomic.Value(usize).init(0);
+        errdefer allocator.destroy(ready_count);
+
         // Create SSE broadcast bus (shared across all workers)
         const sse_bus = SseBroadcastBus.init(allocator, num_workers) catch null;
 
@@ -320,7 +335,7 @@ pub const ThreadPool = struct {
 
         // Spawn workers
         for (workers, 0..) |*worker, i| {
-            worker.* = try Worker.spawn(allocator, server_config, i, num_workers, bpf_ready, sse_bus, coordinator, &worker_metrics[i], all_metrics_ptrs);
+            worker.* = try Worker.spawn(allocator, server_config, i, num_workers, bpf_ready, sse_bus, coordinator, &worker_metrics[i], all_metrics_ptrs, ready_count, script_path);
         }
 
         return ThreadPool{
@@ -331,7 +346,15 @@ pub const ThreadPool = struct {
             .coordinator = coordinator,
             .worker_metrics = worker_metrics,
             .all_metrics_ptrs = all_metrics_ptrs,
+            .ready_count = ready_count,
         };
+    }
+
+    /// Block until all workers have bound their sockets and are accepting connections.
+    pub fn waitUntilReady(self: *ThreadPool) void {
+        while (self.ready_count.load(.acquire) < self.workers.len) {
+            std.atomic.spinLoopHint();
+        }
     }
 
     /// Wait for all workers to finish
@@ -345,6 +368,7 @@ pub const ThreadPool = struct {
     pub fn deinit(self: *ThreadPool) void {
         if (self.sse_bus) |bus| bus.deinit();
         self.allocator.destroy(self.bpf_ready);
+        self.allocator.destroy(self.ready_count);
         self.allocator.free(self.all_metrics_ptrs);
         self.allocator.free(self.worker_metrics);
         self.allocator.free(self.workers);

@@ -135,6 +135,10 @@ pub const Connection = struct {
     timer_completion: xev.Completion = .{},
     timer_cancel_completion: xev.Completion = .{},
     timed_out: bool = false,
+    timer_armed: bool = false,
+    // In-flight timer completions (timer + timer_remove). Guards maybeFinishClose
+    // so Connection outlives all armed timer CQEs — prevents use-after-free.
+    pending_timer_ops: u8 = 0,
 
     // Connection state machine
     state: State = .reading,
@@ -216,17 +220,39 @@ pub const Connection = struct {
     /// Start the per-request deadline timer. Fires onRequestTimeout after REQUEST_TIMEOUT_MS.
     /// Called after successful route match, before Lua dispatch.
     fn startRequestTimer(self: *Connection) void {
+        self.timer_armed = true;
+        self.pending_timer_ops += 1;
         self.loop.timer(&self.timer_completion, config.REQUEST_TIMEOUT_MS, self, onRequestTimeout);
     }
 
     /// Cancel the per-request deadline timer on normal response completion.
     /// Safe to call if timer already fired or was never started.
     fn cancelRequestTimer(self: *Connection) void {
+        if (!self.timer_armed) return; // no timer to cancel (e.g. health endpoint)
         if (self.timed_out) return; // already fired, nothing to cancel
+        self.timer_armed = false;
+        self.pending_timer_ops += 1;
         self.timer_cancel_completion = .{
             .op = .{ .timer_remove = .{ .timer = &self.timer_completion } },
+            .userdata = self,
+            .callback = onTimerCancelComplete,
         };
         self.loop.add(&self.timer_cancel_completion);
+    }
+
+    fn onTimerCancelComplete(
+        userdata: ?*anyopaque,
+        loop: *xev.Loop,
+        completion: *xev.Completion,
+        result: xev.Result,
+    ) xev.CallbackAction {
+        _ = loop;
+        _ = completion;
+        _ = result;
+        const self = castUserdata(Connection, userdata);
+        self.pending_timer_ops -= 1;
+        self.maybeFinishClose();
+        return .disarm;
     }
 
     /// xev callback: request deadline exceeded.
@@ -243,8 +269,22 @@ pub const Connection = struct {
     ) xev.CallbackAction {
         _ = loop;
         _ = completion;
-        _ = result;
         const self = castUserdata(Connection, userdata);
+        // When cancelRequestTimer submits a timer_remove, io_uring delivers
+        // ECANCELED to this callback. Ignore it — the request already completed.
+        // Without this check, a cancelled timer would corrupt the connection by
+        // sending a 504 while the next keep-alive request is in progress.
+        const trigger = result.timer catch {
+            self.pending_timer_ops -= 1;
+            self.maybeFinishClose();
+            return .disarm;
+        };
+        self.pending_timer_ops -= 1;
+        if (trigger == .cancel) {
+            self.maybeFinishClose();
+            return .disarm;
+        }
+        self.timer_armed = false;
         // Guard: already closing or in a long-lived protocol
         if (self.state == .closing) return .disarm;
         // WebSocket and SSE connections are exempt from request timeout
@@ -588,19 +628,8 @@ pub const Connection = struct {
         };
 
         // Build HTTP response with Content-Type: application/json
-        const status_line: []const u8 = if (http_status == 200) "HTTP/1.1 200 OK\r\n" else "HTTP/1.1 503 Service Unavailable\r\n";
-        const content_length_str = std.fmt.allocPrint(alloc, "Content-Length: {d}\r\n", .{json.len}) catch {
-            error_response.sendError(self, .server_error, "health endpoint allocation failed");
-            return;
-        };
-
-        const response_text = std.mem.concat(alloc, u8, &.{
-            status_line,
-            "Content-Type: application/json\r\n",
-            content_length_str,
-            "\r\n",
-            json,
-        }) catch {
+        const status_line: []const u8 = if (http_status == 200) "HTTP/1.1 200 OK" else "HTTP/1.1 503 Service Unavailable";
+        const response_text = std.fmt.allocPrint(alloc, "{s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ status_line, json.len, json }) catch {
             error_response.sendError(self, .server_error, "health endpoint allocation failed");
             return;
         };
@@ -707,6 +736,7 @@ pub const Connection = struct {
         // Reset body tracking and timeout flag for next request on keep-alive
         self.http_state.body_bytes_received = 0;
         self.timed_out = false;
+        self.timer_armed = false;
 
         self.state = .reading;
 
@@ -728,8 +758,7 @@ pub const Connection = struct {
     pub fn close(self: *Connection) void {
         if (self.state == .closing) return;
         self.state = .closing;
-        // Decrement active connection counters
-        _ = self.server.active_connections.fetchSub(1, .monotonic);
+        // Decrement active connection counter
         self.server.metrics.decrementActiveConnections();
         // Deferred deinit: only free when all armed cosocket completions have fired.
         // Normal HTTP connections have pending_completions == 0 (no cosocket I/O),
@@ -741,7 +770,7 @@ pub const Connection = struct {
     /// completions have fired. Called at every point where pending_completions
     /// is decremented to ensure Connection outlives in-flight xev callbacks.
     pub fn maybeFinishClose(self: *Connection) void {
-        if (self.state == .closing and self.cs.pending_completions == 0) {
+        if (self.state == .closing and self.cs.pending_completions == 0 and self.pending_timer_ops == 0) {
             self.deinit(self.base_allocator);
         }
     }

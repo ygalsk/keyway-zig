@@ -3,7 +3,7 @@
 //! Each worker thread owns one LuaState containing: the Lua VM, cached coroutine thread,
 //! cosocket pending I/O staging, connection pool, TLS manager, and SSE registry pointer.
 //!
-//! Init order: Lua VM → std libs → keyway module → cached thread → package paths → TLS manager.
+//! Init order: Lua VM → std libs → keyway module → embedded stdlib → cached thread → package paths → TLS manager.
 //! After init: registerCosocketApi → setWorkerGlobals → loadScript → processRouteTable.
 
 const std = @import("std");
@@ -28,6 +28,21 @@ const SseRegistry = @import("sse.zig").SseRegistry;
 // zig-luajit marks resumeCoroutine as private — call C API directly.
 // Lua is an opaque type that maps 1:1 to lua_State*, so @ptrCast is safe.
 extern "c" fn lua_resume(L: *anyopaque, narg: c_int) c_int;
+
+// Embedded stdlib modules — compiled into the binary at build time.
+// Registered as package.preload["keyway.*"] so require() resolves without disk I/O.
+// scripts/keyway/stdlib.zig uses @embedFile for sibling .lua files, imported via build.zig.
+const stdlib = @import("stdlib");
+const embedded_modules = .{
+    .{ "keyway.socket", stdlib.socket },
+    .{ "keyway.ring", stdlib.ring },
+    .{ "keyway.dns", stdlib.dns },
+    .{ "keyway.db_socket", stdlib.db_socket },
+    .{ "keyway.form", stdlib.form },
+    .{ "keyway.response", stdlib.response },
+    .{ "keyway.crypto", stdlib.crypto },
+    .{ "keyway.http", stdlib.http },
+};
 
 /// Lua state manager - Deep module with simple interface
 /// Manages a single long-lived Lua state for the server
@@ -86,13 +101,15 @@ pub const LuaState = struct {
         // Register keyway module (must be done before creating userdata)
         lua_api.registerKeywayModule(lua);
 
+        // Embed stdlib modules as package.preload entries (always available, no disk I/O)
+        registerEmbeddedModules(lua);
+
         // Create reusable coroutine thread (avoids lua_newThread per request)
         const cached_thread = lua.newThread();
         const cached_thread_ref = lua.ref(Lua.PseudoIndex.Registry);
 
-        // Add scripts/?.lua, scripts/?/init.lua, and LuaRocks paths to package.path
-        // so require("keyway.socket") resolves to scripts/keyway/socket.lua
-        // and require("pgmoon") finds ~/.luarocks/share/lua/5.1/pgmoon/init.lua
+        // Configure package.path for app-local requires and LuaRocks.
+        // Stdlib modules are preloaded (above), so no scripts/ prefix needed.
         // KEYWAY_LUA_PATH / KEYWAY_LUA_CPATH override defaults if set.
         lua.doString(
             \\local custom_path = os.getenv("KEYWAY_LUA_PATH")
@@ -101,7 +118,7 @@ pub const LuaState = struct {
             \\    package.path = custom_path .. ";" .. package.path
             \\else
             \\    local home = os.getenv("HOME") or ""
-            \\    package.path = "scripts/?.lua;scripts/?/init.lua;"
+            \\    package.path = "./?.lua;./?/init.lua;"
             \\        .. home .. "/.luarocks/share/lua/5.1/?.lua;"
             \\        .. home .. "/.luarocks/share/lua/5.1/?/init.lua;"
             \\        .. "/usr/share/lua/5.1/?.lua;"
@@ -422,6 +439,24 @@ pub const LuaState = struct {
         return @ptrCast(@alignCast(ptr));
     }
 
+    /// Register embedded stdlib modules as package.preload entries.
+    /// Each module source is compiled into the binary via @embedFile and loaded as
+    /// a chunk (function) — require("keyway.X") returns it without touching disk.
+    fn registerEmbeddedModules(lua: *Lua) void {
+        // Get package.preload table
+        _ = lua.getGlobal("package");
+        _ = lua.getField(-1, "preload");
+
+        inline for (embedded_modules) |mod| {
+            // loadBuffer compiles the source into a Lua chunk (function).
+            // These are embedded at build time so syntax errors are bugs, not user errors.
+            lua.loadBuffer(mod[1], mod[0]) catch unreachable;
+            lua.setField(-2, mod[0]); // package.preload[name] = chunk
+        }
+
+        lua.pop(2); // pop preload + package
+    }
+
     /// Clean up Lua state
     pub fn deinit(self: *LuaState) void {
         self.tls_manager.deinit();
@@ -552,6 +587,23 @@ test "lua package library and require" {
 
     // Test that require function exists
     try state.loadString("assert(type(require) == 'function')");
+}
+
+test "embedded stdlib modules are preloaded" {
+    const allocator = std.testing.allocator;
+
+    var state = try LuaState.init(allocator);
+    defer state.deinit();
+
+    // All embedded modules should be available in package.preload
+    try state.loadString("assert(type(package.preload['keyway.socket']) == 'function')");
+    try state.loadString("assert(type(package.preload['keyway.ring']) == 'function')");
+    try state.loadString("assert(type(package.preload['keyway.dns']) == 'function')");
+    try state.loadString("assert(type(package.preload['keyway.db_socket']) == 'function')");
+    try state.loadString("assert(type(package.preload['keyway.form']) == 'function')");
+    try state.loadString("assert(type(package.preload['keyway.response']) == 'function')");
+    try state.loadString("assert(type(package.preload['keyway.crypto']) == 'function')");
+    try state.loadString("assert(type(package.preload['keyway.http']) == 'function')");
 }
 
 test "middleware execution order" {

@@ -67,6 +67,10 @@ fn addSharedDeps(
 ) void {
     compile.root_module.addImport("xev", libxev_dep.module("xev"));
     compile.root_module.addImport("luajit", luajit_dep.module("luajit"));
+    // Lua stdlib: scripts/keyway/stdlib.zig uses @embedFile for sibling .lua files
+    compile.root_module.addImport("stdlib", b.createModule(.{
+        .root_source_file = b.path("scripts/keyway/stdlib.zig"),
+    }));
     compile.addCSourceFile(.{
         .file = b.path("vendor/picohttpparser.c"),
         .flags = &.{"-std=c99"},
