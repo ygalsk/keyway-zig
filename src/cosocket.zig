@@ -40,24 +40,6 @@ const cosocket_tls = @import("cosocket_tls.zig");
 // Shared error infrastructure
 // ============================================================================
 
-/// Result of an interpret function: how many Lua values were pushed, and
-/// whether the operation completed (false = re-submitted, e.g. TLS want_read).
-const InterpretResult = struct {
-    nresults: c_int,
-    done: bool = true,
-};
-
-/// Push nil, {category=..., message=...} error table to the Lua thread stack.
-/// All cosocket errors flow through this function so Lua always sees structured tables.
-fn pushErrorTable(thread: *Lua, category: ErrorCategory, msg: [:0]const u8) void {
-    thread.pushNil();
-    thread.createTable(0, 2);
-    thread.pushString(@tagName(category));
-    thread.setField(-2, "category");
-    thread.pushString(msg);
-    thread.setField(-2, "message");
-}
-
 /// Classify an error by xev operation tag. Used by both single-shot interpret functions
 /// and the batch completion path to ensure identical error categorization.
 pub fn classifyOpError(op_tag: anytype) struct { category: ErrorCategory, msg: [:0]const u8 } {
@@ -66,132 +48,6 @@ pub fn classifyOpError(op_tag: anytype) struct { category: ErrorCategory, msg: [
     if (op_tag == .recv) return .{ .category = .upstream_error, .msg = "recv failed" };
     if (op_tag == .close) return .{ .category = .upstream_error, .msg = "close failed" };
     return .{ .category = .server_error, .msg = "unknown op" };
-}
-
-/// Format a TLS decrypt error into a static sentinel-terminated string for Lua.
-/// Includes SSL_ERROR code and first ERR queue message if available.
-fn tlsErrorMsg(comptime prefix: []const u8, de: TlsConn.DecryptError) [:0]const u8 {
-    if (de.msg_len > 0) {
-        return prefix ++ ": tls decrypt failed (see server log for SSL details)";
-    }
-    return prefix ++ ": tls decrypt failed";
-}
-
-// ============================================================================
-// Interpret functions — shared by onOutboundComplete (single-shot path)
-// ============================================================================
-
-/// Interpret a connect/pool_connect/udp_connect completion.
-/// On failure: closes socket, pushes error table. On success: pushes fd (and reuse_count for pool_connect).
-fn interpretConnect(thread: *Lua, s: *SuspendedState, result: xev.Result) InterpretResult {
-    _ = result.connect catch {
-        std.posix.close(s.outbound_fd);
-        s.outbound_fd = 0;
-        s.pending_op = .none;
-        pushErrorTable(thread, .upstream_error, "connection refused");
-        return .{ .nresults = 2 };
-    };
-    if (s.pending_op == .pool_connect) {
-        thread.pushInteger(@intCast(s.outbound_fd));
-        thread.pushInteger(0);
-        s.outbound_fd = 0;
-        s.pending_op = .none;
-        return .{ .nresults = 2 };
-    }
-    thread.pushInteger(@intCast(s.outbound_fd));
-    s.outbound_fd = 0;
-    s.pending_op = .none;
-    return .{ .nresults = 1 };
-}
-
-/// Interpret a send completion.
-/// On failure: pushes error table. On success: pushes bytes_sent.
-fn interpretSend(thread: *Lua, result: xev.Result) InterpretResult {
-    const bytes_sent = result.send catch {
-        pushErrorTable(thread, .upstream_error, "send failed");
-        return .{ .nresults = 2 };
-    };
-    thread.pushInteger(@intCast(bytes_sent));
-    return .{ .nresults = 1 };
-}
-
-/// Interpret a recv completion, handling TLS decryption.
-/// On failure or TLS error: pushes error table. On want_read: re-submits recv (done=false).
-/// On success: pushes data string.
-fn interpretRecv(
-    thread: *Lua,
-    s: *SuspendedState,
-    result: xev.Result,
-    self: *Connection,
-    fd: std.posix.socket_t,
-) InterpretResult {
-    const bytes_read = result.recv catch {
-        s.recv_buf = null;
-        pushErrorTable(thread, .upstream_error, "recv failed");
-        return .{ .nresults = 2 };
-    };
-    if (s.recv_buf) |buf| {
-        if (self.lua_state.getTls(fd)) |tls_conn| {
-            tls_conn.feedCiphertext(buf[0..bytes_read]);
-            var plaintext_buf: [tls_mod.TLS_RECORD_MAX_SIZE]u8 = undefined;
-            switch (tls_conn.decrypt(&plaintext_buf)) {
-                .data => |n| {
-                    thread.pushLString(plaintext_buf[0..n]);
-                    s.recv_buf = null;
-                    return .{ .nresults = 1 };
-                },
-                .want_read => {
-                    // Need more ciphertext — re-submit recv without resuming Lua
-                    s.completion = .{
-                        .op = .{ .recv = .{ .fd = fd, .buffer = .{ .slice = buf } } },
-                        .userdata = self,
-                        .callback = onOutboundComplete,
-                    };
-                    self.loop.add(&s.completion);
-                    return .{ .nresults = 0, .done = false };
-                },
-                .zero_return => {
-                    s.recv_buf = null;
-                    pushErrorTable(thread, .upstream_error, "recv: tls connection closed");
-                    return .{ .nresults = 2 };
-                },
-                .err => |de| {
-                    s.recv_buf = null;
-                    pushErrorTable(thread, .upstream_error, tlsErrorMsg("recv", de));
-                    return .{ .nresults = 2 };
-                },
-            }
-        } else {
-            thread.pushLString(buf[0..bytes_read]);
-        }
-    } else {
-        thread.pushNil();
-    }
-    s.recv_buf = null;
-    return .{ .nresults = 1 };
-}
-
-/// Interpret a close completion.
-/// On failure: pushes error table. On success: pushes 1.
-fn interpretClose(thread: *Lua, s: *SuspendedState, result: xev.Result) InterpretResult {
-    _ = result.close catch {
-        pushErrorTable(thread, .upstream_error, "close failed");
-        return .{ .nresults = 2 };
-    };
-    s.outbound_fd = 0;
-    thread.pushInteger(1);
-    return .{ .nresults = 1 };
-}
-
-// ============================================================================
-// Encrypt/TLS helpers
-// ============================================================================
-
-/// Encrypt plaintext via TLS and drain into an allocated buffer.
-/// Returns ciphertext slice, or null on encrypt/alloc failure.
-pub fn tlsEncryptAlloc(tc: *TlsConn, plaintext: []const u8, allocator: std.mem.Allocator) ?[]u8 {
-    tc.encrypt(plaintext) catch return null;
-    return tc.drainAllAlloc(allocator) catch null;
 }
 
 // ============================================================================
@@ -257,16 +113,16 @@ pub fn onOutboundComplete(
     const op = completion.op;
 
     const ir = if (op == .connect)
-        interpretConnect(thread, s, result)
+        cosocket_ops.interpretConnect(thread, s, result)
     else if (op == .send)
-        interpretSend(thread, result)
+        cosocket_ops.interpretSend(thread, result)
     else if (op == .recv)
-        interpretRecv(thread, s, result, self, completion.op.recv.fd)
+        cosocket_ops.interpretRecv(thread, s, result, self, completion.op.recv.fd)
     else if (op == .close)
-        interpretClose(thread, s, result)
+        cosocket_ops.interpretClose(thread, s, result)
     else blk: {
-        pushErrorTable(thread, .server_error, "unknown outbound op");
-        break :blk InterpretResult{ .nresults = 2 };
+        cosocket_ops.pushErrorTable(thread, .server_error, "unknown outbound op");
+        break :blk cosocket_ops.InterpretResult{ .nresults = 2 };
     };
 
     if (!ir.done) return .disarm;
@@ -302,7 +158,7 @@ pub fn dispatchResume(self: *Connection, thread: *Lua, nresults: c_int, exchange
 pub fn resumeWithError(self: *Connection, category: ErrorCategory, msg: [:0]const u8) void {
     const s = &self.cs.suspended.?;
     const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
-    pushErrorTable(thread, category, msg);
+    cosocket_ops.pushErrorTable(thread, category, msg);
     dispatchResume(self, thread, 2, s.exchange);
 }
 
@@ -310,7 +166,7 @@ pub fn resumeWithError(self: *Connection, category: ErrorCategory, msg: [:0]cons
 pub fn resumeWithTlsError(self: *Connection, comptime prefix: []const u8, de: TlsConn.DecryptError) void {
     const s = &self.cs.suspended.?;
     const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
-    pushErrorTable(thread, .upstream_error, tlsErrorMsg(prefix, de));
+    cosocket_ops.pushErrorTable(thread, .upstream_error, cosocket_ops.tlsErrorMsg(prefix, de));
     dispatchResume(self, thread, 2, s.exchange);
 }
 
@@ -356,7 +212,7 @@ fn drainSubmissionRing(self: *Connection) void {
                 };
                 // TLS-aware send
                 if (self.lua_state.getTls(snd.fd)) |tls_conn| {
-                    const ciphertext = tlsEncryptAlloc(tls_conn, duped, self.arena.allocator()) orelse {
+                    const ciphertext = cosocket_ops.tlsEncryptAlloc(tls_conn, duped, self.arena.allocator()) orelse {
                         self.cs.cq.push(.{ .result = -1, .err_msg = "send: tls encrypt failed", .err_category = .upstream_error });
                         io_index += 1;
                         continue;
@@ -687,30 +543,6 @@ pub fn completeHandler(self: *Connection) void {
 // Tests
 // ============================================================================
 
-test "tlsErrorMsg includes detail suffix when msg_len > 0" {
-    const de = TlsConn.DecryptError{ .ssl_error = 1, .msg_len = 5 };
-    const msg = tlsErrorMsg("recv", de);
-    try std.testing.expectEqualStrings("recv: tls decrypt failed (see server log for SSL details)", msg);
-}
-
-test "tlsErrorMsg returns base message when msg_len == 0" {
-    const de = TlsConn.DecryptError{ .ssl_error = 1, .msg_len = 0 };
-    const msg = tlsErrorMsg("recv", de);
-    try std.testing.expectEqualStrings("recv: tls decrypt failed", msg);
-}
-
-test "tlsErrorMsg works with different prefixes" {
-    const de_with = TlsConn.DecryptError{ .ssl_error = 1, .msg_len = 1 };
-    try std.testing.expectEqualStrings("send: tls decrypt failed (see server log for SSL details)", tlsErrorMsg("send", de_with));
-
-    const de_without = TlsConn.DecryptError{ .ssl_error = 1, .msg_len = 0 };
-    try std.testing.expectEqualStrings("send: tls decrypt failed", tlsErrorMsg("send", de_without));
-}
-
-test "SuspendedState has expected default for outbound_tls" {
-    try std.testing.expect(@sizeOf(SuspendedState) > 0);
-}
-
 test "classifyOpError returns correct categories" {
     // We test with IoEntry.Op values since the function uses == comparison
     const ConnectOp = struct { const tag = .connect; };
@@ -736,14 +568,4 @@ test "classifyOpError returns correct categories" {
     const unknown_err = classifyOpError(@as(IoEntry.Op, .none));
     try std.testing.expectEqual(ErrorCategory.server_error, unknown_err.category);
     try std.testing.expectEqualStrings("unknown op", unknown_err.msg);
-}
-
-test "InterpretResult defaults done to true" {
-    const ir = InterpretResult{ .nresults = 1 };
-    try std.testing.expect(ir.done);
-}
-
-test "InterpretResult can be set to not done" {
-    const ir = InterpretResult{ .nresults = 0, .done = false };
-    try std.testing.expect(!ir.done);
 }
