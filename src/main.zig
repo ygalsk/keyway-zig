@@ -71,3 +71,9 @@ pub fn main() !void {
     // Wait for all workers (runs until Ctrl+C)
     pool.joinAll();
 }
+
+// Pull all modules into the test runner's import graph.
+// Modules not transitively imported from main must be listed here.
+comptime {
+    _ = @import("metrics.zig");
+}
