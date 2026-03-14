@@ -14,8 +14,8 @@ const CIPHERTEXT_BUFFER_SIZE = config.CIPHERTEXT_BUFFER_SIZE;
 
 /// Initialize TLS on this connection. Called from onAccept when TLS is configured.
 pub fn initTls(self: *Connection, tls_ctx: *TlsContext) !void {
-    self.tls_conn = try TlsConn.init(self.base_allocator, tls_ctx.ctx, .server);
-    self.ciphertext_buffer = try LinearBuffer.init(self.base_allocator, CIPHERTEXT_BUFFER_SIZE);
+    self.tls_state.tls_conn = try TlsConn.init(self.base_allocator, tls_ctx.ctx, .server);
+    self.tls_state.ciphertext_buffer = try LinearBuffer.init(self.base_allocator, CIPHERTEXT_BUFFER_SIZE);
 }
 
 /// Drive the inbound TLS handshake state machine after feeding ciphertext.
@@ -47,8 +47,8 @@ pub fn handleTlsDecrypt(self: *Connection, tc: *TlsConn) void {
             self.read_buffer.commitWrite(n);
             // Streaming body size enforcement for TLS connections
             if (self.state == .reading) {
-                self.body_bytes_received += n;
-                if (self.body_bytes_received > config.MAX_BODY_SIZE) {
+                self.http_state.body_bytes_received += n;
+                if (self.http_state.body_bytes_received > config.MAX_BODY_SIZE) {
                     error_response.sendErrorStatus(self, 413, "streaming body exceeds size limit");
                     return;
                 }
@@ -66,7 +66,7 @@ pub fn handleTlsDecrypt(self: *Connection, tc: *TlsConn) void {
 /// Send TLS handshake/ciphertext data over the wire.
 /// Drains all pending data from wbio into encrypt_buf and submits a send.
 fn sendTlsData(self: *Connection, handshake_complete: bool) void {
-    const tc = &self.tls_conn.?;
+    const tc = &self.tls_state.tls_conn.?;
     const total = tc.drainAll();
     if (total == 0) {
         if (handshake_complete) {
@@ -77,7 +77,7 @@ fn sendTlsData(self: *Connection, handshake_complete: bool) void {
         return;
     }
 
-    self.tls_handshake_complete = handshake_complete;
+    self.tls_state.tls_handshake_complete = handshake_complete;
 
     self.write_completion = .{
         .op = .{
@@ -108,12 +108,12 @@ pub fn onTlsHandshakeWrite(
         return .disarm;
     };
 
-    const handshake_complete = self.tls_handshake_complete;
-    self.tls_handshake_complete = false;
+    const handshake_complete = self.tls_state.tls_handshake_complete;
+    self.tls_state.tls_handshake_complete = false;
 
     if (handshake_complete) {
         // Handshake finished, check if there's more data to send (e.g. TLS 1.2 multi-flight)
-        const tc = &self.tls_conn.?;
+        const tc = &self.tls_state.tls_conn.?;
         if (tc.needsWrite()) {
             sendTlsData(self, true);
             return .disarm;

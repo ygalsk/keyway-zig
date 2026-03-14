@@ -117,7 +117,7 @@ pub fn logError(
 
 /// Send an error response for a category. Logs the error and sends the pre-serialized response.
 pub fn sendError(conn: *Connection, category: ErrorCategory, internal_msg: []const u8) void {
-    logError(category, category.defaultStatus(), conn.request_method, conn.request_path, internal_msg);
+    logError(category, category.defaultStatus(), conn.http_state.request_method, conn.http_state.request_path, internal_msg);
     conn.sendRawResponse(categoryResponse(category));
 }
 
@@ -125,7 +125,7 @@ pub fn sendError(conn: *Connection, category: ErrorCategory, internal_msg: []con
 /// Uses pre-serialized response for known statuses, falls back to category default.
 pub fn sendErrorStatus(conn: *Connection, status: u16, internal_msg: []const u8) void {
     const category: ErrorCategory = if (status >= 500) .server_error else .client_error;
-    logError(category, status, conn.request_method, conn.request_path, internal_msg);
+    logError(category, status, conn.http_state.request_method, conn.http_state.request_path, internal_msg);
     if (statusResponse(status)) |resp| {
         conn.sendRawResponse(resp);
     } else {

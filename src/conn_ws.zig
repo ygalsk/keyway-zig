@@ -68,7 +68,7 @@ pub fn startWsRead(conn: *Connection) void {
     conn.read_buffer.compact();
 
     // For TLS: recv into ciphertext_buffer, otherwise into read_buffer
-    const buf = if (conn.ciphertext_buffer) |*cb| blk: {
+    const buf = if (conn.tls_state.ciphertext_buffer) |*cb| blk: {
         if (cb.availableWrite() == 0) {
             conn.close();
             return;
@@ -117,8 +117,8 @@ fn onWsRead(
     }
 
     // TLS path: decrypt before processing
-    if (self.tls_conn) |*tc| {
-        var cb = &self.ciphertext_buffer.?;
+    if (self.tls_state.tls_conn) |*tc| {
+        var cb = &self.tls_state.ciphertext_buffer.?;
         cb.commitWrite(bytes_read);
         const ct_slice = cb.readSlice();
         std.log.debug("ws: TLS feeding {d} ciphertext bytes", .{ct_slice.len});
@@ -282,7 +282,7 @@ fn dispatchWsMessage(conn: *Connection, payload: []const u8) void {
                 .allocator = alloc,
             };
 
-            conn.suspended = .{
+            conn.cs.suspended = .{
                 .completion = undefined,
                 .exchange = dummy_exchange,
                 .recv_buf = null,
@@ -357,7 +357,7 @@ fn onWsSendComplete(
     };
 
     // Resume coroutine with success
-    const s = &self.suspended.?;
+    const s = &self.cs.suspended.?;
     const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
     thread.pushInteger(1);
     wsDispatchResume(self, thread, 1);
@@ -367,7 +367,7 @@ fn onWsSendComplete(
 /// Resume WS coroutine and handle result.
 fn wsDispatchResume(conn: *Connection, thread: *Lua, nresults: c_int) void {
     conn.lua_state.current_connection = conn;
-    const s = &conn.suspended.?;
+    const s = &conn.cs.suspended.?;
     const resume_result = conn.lua_state.resumeHandler(@ptrCast(thread), nresults, s.exchange) catch {
         conn.lua_state.current_connection = null;
         wsCompleteHandler(conn);
@@ -390,7 +390,7 @@ fn wsDispatchResume(conn: *Connection, thread: *Lua, nresults: c_int) void {
 
 /// Clean up suspended state after WS handler completes.
 fn wsCompleteHandler(conn: *Connection) void {
-    const s = conn.suspended orelse return;
+    const s = conn.cs.suspended orelse return;
 
     // Return coroutine thread to cache
     if (s.coroutine_ref != 0) {
@@ -403,7 +403,7 @@ fn wsCompleteHandler(conn: *Connection) void {
     }
 
     if (s.outbound_fd != 0) std.posix.close(s.outbound_fd);
-    conn.suspended = null;
+    conn.cs.suspended = null;
 }
 
 /// Send a WS frame directly (for pong, close responses).
@@ -483,7 +483,7 @@ fn handleWsClose(conn: *Connection, payload: []const u8) void {
 
 /// Resume coroutine with nil, error_message for pre-submission failures (WS context).
 fn resumeWithError(conn: *Connection, msg: [:0]const u8) void {
-    const s = &conn.suspended.?;
+    const s = &conn.cs.suspended.?;
     const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
     thread.pushNil();
     thread.pushString(msg);

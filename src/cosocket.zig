@@ -200,7 +200,7 @@ pub fn tlsEncryptAlloc(tc: *TlsConn, plaintext: []const u8, allocator: std.mem.A
 
 /// Dispatch I/O after a Lua yield: ring path (SQ has entries) or old single-shot path.
 pub fn dispatchIo(conn: *Connection) void {
-    if (conn.sq.len() > 0) {
+    if (conn.cs.sq.len() > 0) {
         drainSubmissionRing(conn);
     } else {
         cosocket_ops.submitOutboundIO(conn);
@@ -223,12 +223,12 @@ pub fn onOutboundComplete(
     const self = castUserdata(Connection, userdata);
 
     // Decrement single-shot pending completion counter
-    self.pending_completions -= 1;
+    self.cs.pending_completions -= 1;
 
     // Timeout cleanup: if the request timed out while this completion was in flight,
     // discard the result and clean up resources without resuming the coroutine.
     if (self.timed_out) {
-        if (self.suspended) |*s| {
+        if (self.cs.suspended) |*s| {
             // Close leaked outbound fd
             if (s.outbound_fd != 0) {
                 std.posix.close(s.outbound_fd);
@@ -246,13 +246,13 @@ pub fn onOutboundComplete(
                 tls_mod.freeTlsConn(self.base_allocator, tls_conn);
                 s.outbound_tls = null;
             }
-            self.suspended = null;
+            self.cs.suspended = null;
         }
         self.maybeFinishClose();
         return .disarm;
     }
 
-    const s = &self.suspended.?;
+    const s = &self.cs.suspended.?;
     const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
     const op = completion.op;
 
@@ -300,7 +300,7 @@ pub fn dispatchResume(self: *Connection, thread: *Lua, nresults: c_int, exchange
 
 /// Resume coroutine with nil, {category, message} error table for pre-submission failures.
 pub fn resumeWithError(self: *Connection, category: ErrorCategory, msg: [:0]const u8) void {
-    const s = &self.suspended.?;
+    const s = &self.cs.suspended.?;
     const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
     pushErrorTable(thread, category, msg);
     dispatchResume(self, thread, 2, s.exchange);
@@ -308,7 +308,7 @@ pub fn resumeWithError(self: *Connection, category: ErrorCategory, msg: [:0]cons
 
 /// Resume with a descriptive TLS error message including SSL error details.
 pub fn resumeWithTlsError(self: *Connection, comptime prefix: []const u8, de: TlsConn.DecryptError) void {
-    const s = &self.suspended.?;
+    const s = &self.cs.suspended.?;
     const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
     pushErrorTable(thread, .upstream_error, tlsErrorMsg(prefix, de));
     dispatchResume(self, thread, 2, s.exchange);
@@ -322,11 +322,11 @@ pub fn resumeWithTlsError(self: *Connection, comptime prefix: []const u8, de: Tl
 /// Synchronous ops (pool_connect hit, setkeepalive) write CQE immediately.
 /// After all entries are drained, if pending_completions == 0 we resume immediately.
 fn drainSubmissionRing(self: *Connection) void {
-    const s = &self.suspended.?;
-    self.cq.reset();
+    const s = &self.cs.suspended.?;
+    self.cs.cq.reset();
     var io_index: u8 = 0;
 
-    while (self.sq.pop()) |entry| {
+    while (self.cs.sq.pop()) |entry| {
         switch (entry.*) {
             .connect => |c| {
                 cosocket_ops.submitBatchConnect(self, c.host, c.port, io_index, .connect);
@@ -341,7 +341,7 @@ fn drainSubmissionRing(self: *Connection) void {
                             tls_mod.freeTlsConn(self.lua_state.allocator, tls_conn);
                         };
                     }
-                    self.cq.push(.{ .result = @intCast(hit.fd) });
+                    self.cs.cq.push(.{ .result = @intCast(hit.fd) });
                 } else {
                     cosocket_ops.submitBatchConnect(self, c.host, c.port, io_index, .pool_connect);
                 }
@@ -350,31 +350,31 @@ fn drainSubmissionRing(self: *Connection) void {
             .send => |snd| {
                 // Arena-dupe send_data before async submission (Lua string lifetime safety)
                 const duped = self.arena.allocator().dupe(u8, snd.data) catch {
-                    self.cq.push(.{ .result = -1, .err_msg = "send: arena alloc failed", .err_category = .server_error });
+                    self.cs.cq.push(.{ .result = -1, .err_msg = "send: arena alloc failed", .err_category = .server_error });
                     io_index += 1;
                     continue;
                 };
                 // TLS-aware send
                 if (self.lua_state.getTls(snd.fd)) |tls_conn| {
                     const ciphertext = tlsEncryptAlloc(tls_conn, duped, self.arena.allocator()) orelse {
-                        self.cq.push(.{ .result = -1, .err_msg = "send: tls encrypt failed", .err_category = .upstream_error });
+                        self.cs.cq.push(.{ .result = -1, .err_msg = "send: tls encrypt failed", .err_category = .upstream_error });
                         io_index += 1;
                         continue;
                     };
-                    self.batch_completions[io_index] = .{
+                    self.cs.batch_completions[io_index] = .{
                         .op = .{ .send = .{ .fd = snd.fd, .buffer = .{ .slice = ciphertext } } },
                         .userdata = self,
                         .callback = onBatchComplete,
                     };
                 } else {
-                    self.batch_completions[io_index] = .{
+                    self.cs.batch_completions[io_index] = .{
                         .op = .{ .send = .{ .fd = snd.fd, .buffer = .{ .slice = duped } } },
                         .userdata = self,
                         .callback = onBatchComplete,
                     };
                 }
-                self.pending_completions += 1;
-                self.loop.add(&self.batch_completions[io_index]);
+                self.cs.pending_completions += 1;
+                self.loop.add(&self.cs.batch_completions[io_index]);
                 io_index += 1;
             },
             .recv => |r| {
@@ -385,23 +385,23 @@ fn drainSubmissionRing(self: *Connection) void {
                         switch (tls_conn.decrypt(&plaintext_buf)) {
                             .data => |n| {
                                 const buf_copy = self.arena.allocator().dupe(u8, plaintext_buf[0..n]) catch {
-                                    self.cq.push(.{ .result = -1, .err_msg = "recv: alloc failed", .err_category = .server_error });
+                                    self.cs.cq.push(.{ .result = -1, .err_msg = "recv: alloc failed", .err_category = .server_error });
                                     io_index += 1;
                                     continue;
                                 };
-                                self.cq.push(.{ .result = @intCast(n), .buf = buf_copy });
+                                self.cs.cq.push(.{ .result = @intCast(n), .buf = buf_copy });
                                 io_index += 1;
                                 continue;
                             },
                             .want_read => {}, // fall through to kernel recv
                             .zero_return => {
-                                self.cq.push(.{ .result = -1, .err_msg = "recv: tls connection closed", .err_category = .upstream_error });
+                                self.cs.cq.push(.{ .result = -1, .err_msg = "recv: tls connection closed", .err_category = .upstream_error });
                                 io_index += 1;
                                 continue;
                             },
                             .err => {
                                 // Detail already logged by decrypt()
-                                self.cq.push(.{ .result = -1, .err_msg = "recv: tls decrypt failed (see server log)", .err_category = .upstream_error });
+                                self.cs.cq.push(.{ .result = -1, .err_msg = "recv: tls decrypt failed (see server log)", .err_category = .upstream_error });
                                 io_index += 1;
                                 continue;
                             },
@@ -409,29 +409,29 @@ fn drainSubmissionRing(self: *Connection) void {
                     }
                 }
                 const buf = self.arena.allocator().alloc(u8, r.max_len) catch {
-                    self.cq.push(.{ .result = -1, .err_msg = "recv: alloc failed", .err_category = .server_error });
+                    self.cs.cq.push(.{ .result = -1, .err_msg = "recv: alloc failed", .err_category = .server_error });
                     io_index += 1;
                     continue;
                 };
-                self.batch_recv_bufs[io_index] = buf;
-                self.batch_completions[io_index] = .{
+                self.cs.batch_recv_bufs[io_index] = buf;
+                self.cs.batch_completions[io_index] = .{
                     .op = .{ .recv = .{ .fd = r.fd, .buffer = .{ .slice = buf } } },
                     .userdata = self,
                     .callback = onBatchComplete,
                 };
-                self.pending_completions += 1;
-                self.loop.add(&self.batch_completions[io_index]);
+                self.cs.pending_completions += 1;
+                self.loop.add(&self.cs.batch_completions[io_index]);
                 io_index += 1;
             },
             .close => |c| {
                 self.lua_state.removeTls(c.fd);
-                self.batch_completions[io_index] = .{
+                self.cs.batch_completions[io_index] = .{
                     .op = .{ .close = .{ .fd = c.fd } },
                     .userdata = self,
                     .callback = onBatchComplete,
                 };
-                self.pending_completions += 1;
-                self.loop.add(&self.batch_completions[io_index]);
+                self.cs.pending_completions += 1;
+                self.loop.add(&self.cs.batch_completions[io_index]);
                 io_index += 1;
             },
             .setkeepalive => |k| {
@@ -445,30 +445,30 @@ fn drainSubmissionRing(self: *Connection) void {
                     @intCast(k.pool_size),
                     tls_ptr,
                 ) catch {
-                    self.cq.push(.{ .result = -1, .err_msg = "setkeepalive: pool put failed", .err_category = .server_error });
+                    self.cs.cq.push(.{ .result = -1, .err_msg = "setkeepalive: pool put failed", .err_category = .server_error });
                     io_index += 1;
                     continue;
                 };
-                self.cq.push(.{ .result = 1 });
+                self.cs.cq.push(.{ .result = 1 });
                 io_index += 1;
             },
             .tls_handshake => |t| {
                 // TLS handshake is multi-step — submit as a sequence via the existing mechanism
                 const tls_conn = self.base_allocator.create(TlsConn) catch {
-                    self.cq.push(.{ .result = -1, .err_msg = "tls_handshake: alloc failed", .err_category = .upstream_error });
+                    self.cs.cq.push(.{ .result = -1, .err_msg = "tls_handshake: alloc failed", .err_category = .upstream_error });
                     io_index += 1;
                     continue;
                 };
                 tls_conn.* = TlsConn.init(self.base_allocator, cosocket_ops.selectClientTlsCtx(self.lua_state, t.tls_mode), .client) catch {
                     self.base_allocator.destroy(tls_conn);
-                    self.cq.push(.{ .result = -1, .err_msg = "tls_handshake: tls init failed", .err_category = .upstream_error });
+                    self.cs.cq.push(.{ .result = -1, .err_msg = "tls_handshake: tls init failed", .err_category = .upstream_error });
                     io_index += 1;
                     continue;
                 };
                 if (t.sni_host) |host| {
                     const host_z = self.arena.allocator().dupeZ(u8, host) catch {
                         tls_mod.freeTlsConn(self.base_allocator, tls_conn);
-                        self.cq.push(.{ .result = -1, .err_msg = "tls_handshake: alloc failed", .err_category = .upstream_error });
+                        self.cs.cq.push(.{ .result = -1, .err_msg = "tls_handshake: alloc failed", .err_category = .upstream_error });
                         io_index += 1;
                         continue;
                     };
@@ -479,24 +479,24 @@ fn drainSubmissionRing(self: *Connection) void {
                 const total = tls_conn.drainAll();
                 if (total == 0) {
                     tls_mod.freeTlsConn(self.base_allocator, tls_conn);
-                    self.cq.push(.{ .result = -1, .err_msg = "tls_handshake: no data produced", .err_category = .upstream_error });
+                    self.cs.cq.push(.{ .result = -1, .err_msg = "tls_handshake: no data produced", .err_category = .upstream_error });
                     io_index += 1;
                     continue;
                 }
 
                 // Store tls_conn for the handshake continuation
-                self.batch_tls_conns[io_index] = tls_conn;
+                self.cs.batch_tls_conns[io_index] = tls_conn;
                 s.outbound_tls = tls_conn;
                 s.outbound_fd = t.fd;
                 s.pending_op = .tls_handshake;
-                self.batch_completions[io_index] = .{
+                self.cs.batch_completions[io_index] = .{
                     .op = .{ .send = .{ .fd = t.fd, .buffer = .{ .slice = tls_conn.encrypt_buf[0..total] } } },
                     .userdata = self,
                     .callback = cosocket_tls.onSendComplete,
                 };
                 // TLS handshake hijacks the suspended state — can only have one per batch
-                self.pending_completions += 1;
-                self.loop.add(&self.batch_completions[io_index]);
+                self.cs.pending_completions += 1;
+                self.loop.add(&self.cs.batch_completions[io_index]);
                 io_index += 1;
             },
             .udp_connect => |u| {
@@ -508,12 +508,12 @@ fn drainSubmissionRing(self: *Connection) void {
             },
         }
     }
-    self.sq.reset();
+    self.cs.sq.reset();
 
-    if (self.pending_completions == 0) {
+    if (self.cs.pending_completions == 0) {
         // All ops were synchronous (pool hits, setkeepalive) — resume immediately
         const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
-        thread.pushInteger(@intCast(self.cq.tail));
+        thread.pushInteger(@intCast(self.cs.cq.tail));
         dispatchResume(self, thread, 1, s.exchange);
     }
     // else: wait for onBatchComplete callbacks to decrement pending_completions
@@ -533,7 +533,7 @@ pub fn onBatchComplete(
     const self = castUserdata(Connection, userdata);
 
     // Determine which SQE index this completion corresponds to
-    const base = @intFromPtr(&self.batch_completions[0]);
+    const base = @intFromPtr(&self.cs.batch_completions[0]);
     const this = @intFromPtr(completion);
     const sqe_index: u8 = @intCast((this - base) / @sizeOf(xev.Completion));
 
@@ -543,28 +543,28 @@ pub fn onBatchComplete(
         _ = result.connect catch {
             std.posix.close(completion.op.connect.socket);
             const classified = classifyOpError(op);
-            self.cq.push(.{ .result = -1, .err_msg = classified.msg, .err_category = classified.category });
+            self.cs.cq.push(.{ .result = -1, .err_msg = classified.msg, .err_category = classified.category });
             batchCompletionCheck(self);
             return .disarm;
         };
-        self.cq.push(.{ .result = @intCast(completion.op.connect.socket) });
+        self.cs.cq.push(.{ .result = @intCast(completion.op.connect.socket) });
     } else if (op == .send) {
         const bytes_sent = result.send catch {
             const classified = classifyOpError(op);
-            self.cq.push(.{ .result = -1, .err_msg = classified.msg, .err_category = classified.category });
+            self.cs.cq.push(.{ .result = -1, .err_msg = classified.msg, .err_category = classified.category });
             batchCompletionCheck(self);
             return .disarm;
         };
-        self.cq.push(.{ .result = @intCast(bytes_sent) });
+        self.cs.cq.push(.{ .result = @intCast(bytes_sent) });
     } else if (op == .recv) {
         const bytes_read = result.recv catch {
-            self.batch_recv_bufs[sqe_index] = null;
+            self.cs.batch_recv_bufs[sqe_index] = null;
             const classified = classifyOpError(op);
-            self.cq.push(.{ .result = -1, .err_msg = classified.msg, .err_category = classified.category });
+            self.cs.cq.push(.{ .result = -1, .err_msg = classified.msg, .err_category = classified.category });
             batchCompletionCheck(self);
             return .disarm;
         };
-        if (self.batch_recv_bufs[sqe_index]) |buf| {
+        if (self.cs.batch_recv_bufs[sqe_index]) |buf| {
             // Check for TLS decryption
             if (self.lua_state.getTls(completion.op.recv.fd)) |tls_conn| {
                 tls_conn.feedCiphertext(buf[0..bytes_read]);
@@ -572,49 +572,49 @@ pub fn onBatchComplete(
                 switch (tls_conn.decrypt(&plaintext_buf)) {
                     .data => |n| {
                         const duped = self.arena.allocator().dupe(u8, plaintext_buf[0..n]) catch {
-                            self.cq.push(.{ .result = -1, .err_msg = "recv: alloc failed", .err_category = .server_error });
-                            self.batch_recv_bufs[sqe_index] = null;
+                            self.cs.cq.push(.{ .result = -1, .err_msg = "recv: alloc failed", .err_category = .server_error });
+                            self.cs.batch_recv_bufs[sqe_index] = null;
                             batchCompletionCheck(self);
                             return .disarm;
                         };
-                        self.cq.push(.{ .result = @intCast(n), .buf = duped });
+                        self.cs.cq.push(.{ .result = @intCast(n), .buf = duped });
                     },
                     .want_read => {
                         // Need more ciphertext — re-submit recv (stays in batch)
-                        self.batch_completions[sqe_index] = .{
+                        self.cs.batch_completions[sqe_index] = .{
                             .op = .{ .recv = .{ .fd = completion.op.recv.fd, .buffer = .{ .slice = buf } } },
                             .userdata = self,
                             .callback = onBatchComplete,
                         };
-                        self.loop.add(&self.batch_completions[sqe_index]);
+                        self.loop.add(&self.cs.batch_completions[sqe_index]);
                         return .disarm; // Don't decrement pending_completions
                     },
                     .zero_return => {
-                        self.cq.push(.{ .result = -1, .err_msg = "recv: tls connection closed", .err_category = .upstream_error });
+                        self.cs.cq.push(.{ .result = -1, .err_msg = "recv: tls connection closed", .err_category = .upstream_error });
                     },
                     .err => {
                         // Detail already logged by decrypt()
-                        self.cq.push(.{ .result = -1, .err_msg = "recv: tls decrypt failed (see server log)", .err_category = .upstream_error });
+                        self.cs.cq.push(.{ .result = -1, .err_msg = "recv: tls decrypt failed (see server log)", .err_category = .upstream_error });
                     },
                 }
             } else {
-                self.cq.push(.{ .result = @intCast(bytes_read), .buf = buf[0..bytes_read] });
+                self.cs.cq.push(.{ .result = @intCast(bytes_read), .buf = buf[0..bytes_read] });
             }
         } else {
-            self.cq.push(.{ .result = -1, .err_msg = "recv: no buffer", .err_category = .server_error });
+            self.cs.cq.push(.{ .result = -1, .err_msg = "recv: no buffer", .err_category = .server_error });
         }
-        self.batch_recv_bufs[sqe_index] = null;
+        self.cs.batch_recv_bufs[sqe_index] = null;
     } else if (op == .close) {
         _ = result.close catch {
             const classified = classifyOpError(op);
-            self.cq.push(.{ .result = -1, .err_msg = classified.msg, .err_category = classified.category });
+            self.cs.cq.push(.{ .result = -1, .err_msg = classified.msg, .err_category = classified.category });
             batchCompletionCheck(self);
             return .disarm;
         };
-        self.cq.push(.{ .result = 1 });
+        self.cs.cq.push(.{ .result = 1 });
     } else {
         const classified = classifyOpError(op);
-        self.cq.push(.{ .result = -1, .err_msg = classified.msg, .err_category = classified.category });
+        self.cs.cq.push(.{ .result = -1, .err_msg = classified.msg, .err_category = classified.category });
     }
 
     batchCompletionCheck(self);
@@ -624,12 +624,12 @@ pub fn onBatchComplete(
 /// Check if all batch completions have arrived; if so, resume Lua with CQ count.
 /// If the request timed out, decrement pending_completions and call maybeFinishClose.
 fn batchCompletionCheck(self: *Connection) void {
-    self.pending_completions -= 1;
+    self.cs.pending_completions -= 1;
     if (self.timed_out) {
         // Timeout cleanup: don't resume Lua, just drain completions
-        if (self.pending_completions == 0) {
+        if (self.cs.pending_completions == 0) {
             // All completions drained — clean up suspended state and free connection
-            if (self.suspended) |*s| {
+            if (self.cs.suspended) |*s| {
                 if (s.coroutine_ref != 0) {
                     self.lua_state.lua.unref(Lua.PseudoIndex.Registry, s.coroutine_ref);
                     s.coroutine_ref = 0;
@@ -638,16 +638,16 @@ fn batchCompletionCheck(self: *Connection) void {
                     std.posix.close(s.outbound_fd);
                     s.outbound_fd = 0;
                 }
-                self.suspended = null;
+                self.cs.suspended = null;
             }
         }
         self.maybeFinishClose();
         return;
     }
-    if (self.pending_completions == 0) {
-        const s = &self.suspended.?;
+    if (self.cs.pending_completions == 0) {
+        const s = &self.cs.suspended.?;
         const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
-        thread.pushInteger(@intCast(self.cq.tail));
+        thread.pushInteger(@intCast(self.cs.cq.tail));
         dispatchResume(self, thread, 1, s.exchange);
     }
 }
@@ -659,7 +659,7 @@ fn batchCompletionCheck(self: *Connection) void {
 /// Handler finished after one or more yield/resume cycles.
 /// Return coroutine to cache, serialize response, submit write.
 pub fn completeHandler(self: *Connection) void {
-    const s = self.suspended orelse return;
+    const s = self.cs.suspended orelse return;
 
     // Return coroutine thread to cache for reuse
     if (s.coroutine_ref != 0) {
@@ -675,7 +675,7 @@ pub fn completeHandler(self: *Connection) void {
     if (s.outbound_fd != 0) std.posix.close(s.outbound_fd);
 
     const exchange = s.exchange;
-    self.suspended = null;
+    self.cs.suspended = null;
 
     self.logAccess(exchange.status);
     self.writeResponse(exchange) catch {

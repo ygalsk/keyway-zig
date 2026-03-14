@@ -57,10 +57,45 @@ const READ_BUFFER_SIZE = config.READ_BUFFER_SIZE;
 const CIPHERTEXT_BUFFER_SIZE = config.CIPHERTEXT_BUFFER_SIZE;
 const LARGE_RESPONSE_THRESHOLD = config.LARGE_RESPONSE_THRESHOLD;
 
+/// Per-request HTTP state — reset between keep-alive requests.
+pub const HttpState = struct {
+    request_start_ns: i128 = 0,
+    request_method: []const u8 = "",
+    request_path: []const u8 = "",
+    request_raw_len: usize = 0, // total bytes consumed by current request (headers + body)
+    body_bytes_received: u64 = 0,
+};
+
+/// Inbound TLS state — set once at connection init, persists across keep-alive.
+pub const TlsState = struct {
+    tls_conn: ?TlsConn = null,
+    ciphertext_buffer: ?LinearBuffer = null, // recv target for TLS connections
+    tls_handshake_complete: bool = false, // flag for sendTlsData -> onTlsHandshakeWrite
+
+    pub fn deinit(self: *TlsState, alloc: std.mem.Allocator) void {
+        if (self.tls_conn) |*tc| tc.deinit(alloc);
+        if (self.ciphertext_buffer) |*cb| cb.deinit();
+    }
+};
+
+/// Outbound cosocket I/O state — submission/completion rings and batch buffers.
+/// Inline on Connection (heap-allocated, never moves) so xev completions
+/// stored in batch_completions have stable addresses.
+pub const CosocketState = struct {
+    sq: ring.SubmissionRing = .{},
+    cq: ring.CompletionRing = .{},
+    pending_completions: u8 = 0,
+    batch_completions: [ring.SubmissionRing.MAX_DEPTH]xev.Completion = undefined,
+    batch_recv_bufs: [ring.SubmissionRing.MAX_DEPTH]?[]u8 = .{null} ** ring.SubmissionRing.MAX_DEPTH,
+    batch_tls_conns: [ring.SubmissionRing.MAX_DEPTH]?*TlsConn = .{null} ** ring.SubmissionRing.MAX_DEPTH,
+    suspended: ?SuspendedState = null,
+};
+
 /// Connection handler - manages HTTP request/response lifecycle
 pub const Connection = struct {
     pub const State = enum { reading, processing, writing, websocket, sse, closing };
 
+    // Core coordinator fields
     base_allocator: std.mem.Allocator,
     arena: std.heap.ArenaAllocator,
     loop: *xev.Loop,
@@ -80,22 +115,11 @@ pub const Connection = struct {
     param_cache: ParamArray,
     query_cache: QueryArray,
 
-    // Access log state
-    request_start_ns: i128 = 0,
-    request_method: []const u8 = "",
-    request_path: []const u8 = "",
-    request_raw_len: usize = 0, // total bytes consumed by current request (headers + body)
+    // Sub-struct: per-request HTTP fields (reset on keep-alive)
+    http_state: HttpState = .{},
 
-    // I/O ring: per-connection submission/completion buffers for batched I/O
-    sq: ring.SubmissionRing = .{},
-    cq: ring.CompletionRing = .{},
-    pending_completions: u8 = 0,
-    batch_completions: [ring.SubmissionRing.MAX_DEPTH]xev.Completion = undefined,
-    batch_recv_bufs: [ring.SubmissionRing.MAX_DEPTH]?[]u8 = .{null} ** ring.SubmissionRing.MAX_DEPTH,
-    batch_tls_conns: [ring.SubmissionRing.MAX_DEPTH]?*TlsConn = .{null} ** ring.SubmissionRing.MAX_DEPTH,
-
-    // Cosocket: non-null when handler is suspended on outbound I/O
-    suspended: ?SuspendedState = null,
+    // Sub-struct: outbound cosocket I/O (rings, batch buffers, suspended coroutine)
+    cs: CosocketState = .{},
 
     // WebSocket: non-null when connection has been upgraded to WebSocket
     ws_state: ?conn_ws.WsState = null,
@@ -104,9 +128,6 @@ pub const Connection = struct {
     sse_state: ?conn_sse.SseState = null,
     // SSE registry pointer: injected at init, copied into SseState at upgrade time
     sse_registry: ?*SseRegistry = null,
-
-    // Body size tracking: accumulated bytes for streaming body enforcement
-    body_bytes_received: u64 = 0,
 
     // Per-request timeout: timer fires after REQUEST_TIMEOUT_MS, sending 504
     // Completions initialized to .{} per xev requirements (Pitfall 3: never undefined)
@@ -117,10 +138,8 @@ pub const Connection = struct {
     // Connection state machine
     state: State = .reading,
 
-    // TLS: non-null when connection is TLS-encrypted
-    tls_conn: ?TlsConn = null,
-    ciphertext_buffer: ?LinearBuffer = null, // recv target for TLS connections
-    tls_handshake_complete: bool = false, // flag for sendTlsData -> onTlsHandshakeWrite
+    // Sub-struct: inbound TLS (set once at connection init, persists across keep-alive)
+    tls_state: TlsState = .{},
 
     pub fn init(
         allocator: std.mem.Allocator,
@@ -169,7 +188,7 @@ pub const Connection = struct {
 
     pub fn deinit(self: *Connection, allocator: std.mem.Allocator) void {
         // Clean up suspended coroutine state if connection closes mid-I/O
-        if (self.suspended) |s| {
+        if (self.cs.suspended) |s| {
             // Unref pinned coroutine to prevent Lua registry leak
             if (s.coroutine_ref != 0) {
                 self.lua_state.lua.unref(Lua.PseudoIndex.Registry, s.coroutine_ref);
@@ -185,8 +204,7 @@ pub const Connection = struct {
         // Clean up SSE state
         if (self.sse_state) |*ss| ss.deinit(self);
         // Clean up TLS resources
-        if (self.tls_conn) |*tc| tc.deinit(self.base_allocator);
-        if (self.ciphertext_buffer) |*cb| cb.deinit();
+        self.tls_state.deinit(self.base_allocator);
         std.posix.close(self.socket);
         self.arena.deinit();
         // param_cache/query_cache are inline structs, no deinit needed
@@ -238,7 +256,7 @@ pub const Connection = struct {
 
     /// Start reading from connection
     pub fn startRead(self: *Connection) void {
-        const buf = if (self.ciphertext_buffer) |*cb| blk: {
+        const buf = if (self.tls_state.ciphertext_buffer) |*cb| blk: {
             if (cb.availableWrite() == 0) {
                 self.send400BadRequest();
                 return;
@@ -289,8 +307,8 @@ pub const Connection = struct {
         }
 
         // TLS path: decrypt ciphertext before processing
-        if (self.tls_conn) |*tc| {
-            var cb = &self.ciphertext_buffer.?;
+        if (self.tls_state.tls_conn) |*tc| {
+            var cb = &self.tls_state.ciphertext_buffer.?;
             cb.commitWrite(bytes_read);
             tc.feedCiphertext(cb.readSlice());
             cb.reset(); // BIO owns the data now
@@ -309,8 +327,8 @@ pub const Connection = struct {
         // Streaming body size enforcement: track accumulated bytes and reject if over limit.
         // Only applies in .reading state (not WebSocket or SSE, which are long-lived).
         if (self.state == .reading) {
-            self.body_bytes_received += bytes_read;
-            if (self.body_bytes_received > config.MAX_BODY_SIZE) {
+            self.http_state.body_bytes_received += bytes_read;
+            if (self.http_state.body_bytes_received > config.MAX_BODY_SIZE) {
                 error_response.sendErrorStatus(self, 413, "streaming body exceeds size limit");
                 return .disarm;
             }
@@ -326,8 +344,8 @@ pub const Connection = struct {
     }
 
     pub fn logAccess(self: *Connection, status: u16) void {
-        const dur_us: i64 = @intCast(@divTrunc(std.time.nanoTimestamp() - self.request_start_ns, 1000));
-        log.accessLog(self.request_method, self.request_path, status, dur_us);
+        const dur_us: i64 = @intCast(@divTrunc(std.time.nanoTimestamp() - self.http_state.request_start_ns, 1000));
+        log.accessLog(self.http_state.request_method, self.http_state.request_path, status, dur_us);
         // Record metrics (latency + error tracking)
         self.server.metrics.recordRequest(@intCast(@max(0, dur_us)), status >= 400);
     }
@@ -384,7 +402,7 @@ pub const Connection = struct {
                 try self.writeResponse(exchange);
             },
             .yielded => {
-                self.suspended = .{
+                self.cs.suspended = .{
                     .completion = undefined,
                     .exchange = exchange,
                     .recv_buf = null,
@@ -406,7 +424,7 @@ pub const Connection = struct {
 
     pub fn sendResponse(self: *Connection) !void {
         self.state = .processing;
-        self.request_start_ns = std.time.nanoTimestamp();
+        self.http_state.request_start_ns = std.time.nanoTimestamp();
 
         const request = self.parseHttpRequest() orelse return;
         const alloc = self.arena.allocator();
@@ -414,9 +432,9 @@ pub const Connection = struct {
         const query_pos = std.mem.indexOfScalar(u8, request.path, '?');
         const clean_path = if (query_pos) |qi| request.path[0..qi] else request.path;
 
-        self.request_method = request.method;
-        self.request_path = clean_path;
-        self.request_raw_len = request.raw_len;
+        self.http_state.request_method = request.method;
+        self.http_state.request_path = clean_path;
+        self.http_state.request_raw_len = request.raw_len;
 
         // Health endpoint: handled before Lua routing (zero Lua overhead)
         if (std.mem.eql(u8, clean_path, "/health")) {
@@ -483,7 +501,7 @@ pub const Connection = struct {
     /// Returns false on allocation/encryption failure (caller decides error handling).
     pub fn submitTlsAwareSend(self: *Connection, data: []const u8, callback: *const fn (?*anyopaque, *xev.Loop, *xev.Completion, xev.Result) xev.CallbackAction, arena_dupe: bool) bool {
         const alloc = self.arena.allocator();
-        if (self.tls_conn) |*tc| {
+        if (self.tls_state.tls_conn) |*tc| {
             const ciphertext = cosocket.tlsEncryptAlloc(tc, data, alloc) orelse return false;
             self.write_completion = .{
                 .op = .{ .send = .{ .fd = self.socket, .buffer = .{ .slice = ciphertext } } },
@@ -601,18 +619,18 @@ pub const Connection = struct {
         std.debug.assert(self.ws_state != null);
         std.log.debug("ws: 101 sent ({d} bytes written), entering WS mode. raw_len={d} buf_avail_read={d} buf_avail_write={d}", .{
             bytes_written,
-            self.request_raw_len,
+            self.http_state.request_raw_len,
             self.read_buffer.availableRead(),
             self.read_buffer.availableWrite(),
         });
         _ = self.arena.reset(.retain_capacity);
-        if (self.request_raw_len > 0) {
-            self.read_buffer.consume(self.request_raw_len);
-            self.request_raw_len = 0;
+        if (self.http_state.request_raw_len > 0) {
+            self.read_buffer.consume(self.http_state.request_raw_len);
+            self.http_state.request_raw_len = 0;
         } else {
             self.read_buffer.reset();
         }
-        if (self.ciphertext_buffer) |*cb| cb.reset();
+        if (self.tls_state.ciphertext_buffer) |*cb| cb.reset();
         std.log.debug("ws: starting WS read loop. buf_avail_read={d} buf_avail_write={d}", .{
             self.read_buffer.availableRead(),
             self.read_buffer.availableWrite(),
@@ -637,10 +655,10 @@ pub const Connection = struct {
     fn handleHttpPostWrite(self: *Connection, bytes_written: usize) void {
         // Cancel the per-request deadline timer on successful response completion
         self.cancelRequestTimer();
-        self.suspended = null;
-        self.sq.reset();
-        self.cq.reset();
-        self.pending_completions = 0;
+        self.cs.suspended = null;
+        self.cs.sq.reset();
+        self.cs.cq.reset();
+        self.cs.pending_completions = 0;
         // Shrink arena if response was large to prevent unbounded growth
         // on keep-alive connections that occasionally serve large responses.
         if (bytes_written > LARGE_RESPONSE_THRESHOLD) {
@@ -651,18 +669,18 @@ pub const Connection = struct {
 
         // Consume exactly the bytes of the completed request (headers + body).
         // This preserves any pipelined data that arrived in the same recv.
-        if (self.request_raw_len > 0) {
-            self.read_buffer.consume(self.request_raw_len);
-            self.request_raw_len = 0;
+        if (self.http_state.request_raw_len > 0) {
+            self.read_buffer.consume(self.http_state.request_raw_len);
+            self.http_state.request_raw_len = 0;
         } else {
             self.read_buffer.reset();
         }
 
         // Reset ciphertext buffer but NOT tls_conn — TLS session persists across keep-alive
-        if (self.ciphertext_buffer) |*cb| cb.reset();
+        if (self.tls_state.ciphertext_buffer) |*cb| cb.reset();
 
         // Reset body tracking and timeout flag for next request on keep-alive
-        self.body_bytes_received = 0;
+        self.http_state.body_bytes_received = 0;
         self.timed_out = false;
 
         self.state = .reading;
@@ -701,7 +719,7 @@ pub const Connection = struct {
     /// completions have fired. Called at every point where pending_completions
     /// is decremented to ensure Connection outlives in-flight xev callbacks.
     pub fn maybeFinishClose(self: *Connection) void {
-        if (self.state == .closing and self.pending_completions == 0) {
+        if (self.state == .closing and self.cs.pending_completions == 0) {
             self.deinit(self.base_allocator);
         }
     }
@@ -715,35 +733,35 @@ pub const Connection = struct {
         // Verify that the condition pending_completions > 0 prevents close.
         const conn = struct {
             state: State,
-            pending_completions: u8,
+            cs: struct { pending_completions: u8 },
         }{
             .state = .closing,
-            .pending_completions = 1,
+            .cs = .{ .pending_completions = 1 },
         };
         // Guard: closing with pending_completions == 1 must NOT deinit
-        try std.testing.expect(!(conn.state == .closing and conn.pending_completions == 0));
+        try std.testing.expect(!(conn.state == .closing and conn.cs.pending_completions == 0));
     }
 
     test "maybeFinishClose: condition met when closing and no pending_completions" {
         const conn = struct {
             state: State,
-            pending_completions: u8,
+            cs: struct { pending_completions: u8 },
         }{
             .state = .closing,
-            .pending_completions = 0,
+            .cs = .{ .pending_completions = 0 },
         };
         // Guard: closing with pending_completions == 0 SHOULD deinit
-        try std.testing.expect(conn.state == .closing and conn.pending_completions == 0);
+        try std.testing.expect(conn.state == .closing and conn.cs.pending_completions == 0);
     }
 
     test "maybeFinishClose: does not deinit when not closing" {
         const conn = struct {
             state: State,
-            pending_completions: u8,
+            cs: struct { pending_completions: u8 },
         }{
             .state = .processing,
-            .pending_completions = 0,
+            .cs = .{ .pending_completions = 0 },
         };
-        try std.testing.expect(!(conn.state == .closing and conn.pending_completions == 0));
+        try std.testing.expect(!(conn.state == .closing and conn.cs.pending_completions == 0));
     }
 };

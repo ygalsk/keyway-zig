@@ -393,27 +393,27 @@ pub const LuaState = struct {
     /// Returns error.NoActiveRequest if no connection is active.
     pub fn pushSqEntry(self: *LuaState, entry: ring.IoEntry) error{ RingFull, NoActiveRequest }!void {
         const conn = self.currentConnection() orelse return error.NoActiveRequest;
-        try conn.sq.push(entry);
+        try conn.cs.sq.push(entry);
     }
 
     /// Read a completion entry by index from the current Connection's CQ.
     /// Returns null if no connection is active or index is out of range.
     pub fn getCqEntry(self: *LuaState, index: u8) ?ring.CQEntry {
         const conn = self.currentConnection() orelse return null;
-        if (index >= conn.cq.tail) return null;
-        return conn.cq.get(index);
+        if (index >= conn.cs.cq.tail) return null;
+        return conn.cs.cq.get(index);
     }
 
     /// Return the number of pending SQ entries, or null if no connection is active.
     pub fn sqLen(self: *LuaState) ?u8 {
         const conn = self.currentConnection() orelse return null;
-        return conn.sq.len();
+        return conn.cs.sq.len();
     }
 
     /// Return the CQ tail (number of completions), or null if no connection is active.
     pub fn cqTail(self: *LuaState) ?u8 {
         const conn = self.currentConnection() orelse return null;
-        return conn.cq.tail;
+        return conn.cs.cq.tail;
     }
 
     /// Cast current_connection to *Connection. Internal helper.

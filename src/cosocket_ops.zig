@@ -52,7 +52,7 @@ fn createTcpSocket(self: *Connection, host: []const u8, port: u16, comptime err_
 }
 
 pub fn submitConnect(self: *Connection, c: anytype, pending_op: IoEntry.Op) void {
-    const s = &self.suspended.?;
+    const s = &self.cs.suspended.?;
     s.pending_op = pending_op;
     const result = createTcpSocket(self, c.host, c.port, "connect: ") orelse return;
     s.outbound_fd = result.sock;
@@ -61,12 +61,12 @@ pub fn submitConnect(self: *Connection, c: anytype, pending_op: IoEntry.Op) void
         .userdata = self,
         .callback = cosocket.onOutboundComplete,
     };
-    self.pending_completions += 1;
+    self.cs.pending_completions += 1;
     self.loop.add(&s.completion);
 }
 
 pub fn submitUdpConnect(self: *Connection, c: anytype) void {
-    const s = &self.suspended.?;
+    const s = &self.cs.suspended.?;
     s.pending_op = .udp_connect;
     const sock = std.posix.socket(
         std.posix.AF.INET,
@@ -95,12 +95,12 @@ pub fn submitUdpConnect(self: *Connection, c: anytype) void {
         .userdata = self,
         .callback = cosocket.onOutboundComplete,
     };
-    self.pending_completions += 1;
+    self.cs.pending_completions += 1;
     self.loop.add(&s.completion);
 }
 
 pub fn submitSend(self: *Connection, snd: anytype) void {
-    const s = &self.suspended.?;
+    const s = &self.cs.suspended.?;
     const data = self.arena.allocator().dupe(u8, snd.data) catch {
         cosocket.resumeWithError(self, .server_error, "send: arena alloc failed");
         return;
@@ -122,12 +122,12 @@ pub fn submitSend(self: *Connection, snd: anytype) void {
             .callback = cosocket.onOutboundComplete,
         };
     }
-    self.pending_completions += 1;
+    self.cs.pending_completions += 1;
     self.loop.add(&s.completion);
 }
 
 pub fn submitRecv(self: *Connection, r: anytype) void {
-    const s = &self.suspended.?;
+    const s = &self.cs.suspended.?;
     // Check if BoringSSL already has buffered plaintext before issuing kernel recv
     if (self.lua_state.getTls(r.fd)) |tls_conn| {
         if (tls_conn.hasPending()) {
@@ -161,24 +161,24 @@ pub fn submitRecv(self: *Connection, r: anytype) void {
         .userdata = self,
         .callback = cosocket.onOutboundComplete,
     };
-    self.pending_completions += 1;
+    self.cs.pending_completions += 1;
     self.loop.add(&s.completion);
 }
 
 pub fn submitClose(self: *Connection, c: anytype) void {
-    const s = &self.suspended.?;
+    const s = &self.cs.suspended.?;
     self.lua_state.removeTls(c.fd);
     s.completion = .{
         .op = .{ .close = .{ .fd = c.fd } },
         .userdata = self,
         .callback = cosocket.onOutboundComplete,
     };
-    self.pending_completions += 1;
+    self.cs.pending_completions += 1;
     self.loop.add(&s.completion);
 }
 
 pub fn submitTlsHandshake(self: *Connection, th: anytype) void {
-    const s = &self.suspended.?;
+    const s = &self.cs.suspended.?;
     s.pending_op = .tls_handshake;
     const tls_conn = self.base_allocator.create(TlsConn) catch {
         cosocket.resumeWithError(self, .upstream_error, "sslhandshake: alloc failed");
@@ -212,7 +212,7 @@ pub fn submitTlsHandshake(self: *Connection, th: anytype) void {
         .callback = cosocket_tls.onSendComplete,
     };
     s.outbound_fd = th.fd;
-    self.pending_completions += 1;
+    self.cs.pending_completions += 1;
     self.loop.add(&s.completion);
 }
 
@@ -255,23 +255,23 @@ pub fn submitBatchConnect(self: *Connection, host: []const u8, port: u16, io_ind
         std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
         0,
     ) catch {
-        self.cq.push(.{ .result = -1, .err_msg = "socket creation failed", .err_category = .upstream_error });
+        self.cs.cq.push(.{ .result = -1, .err_msg = "socket creation failed", .err_category = .upstream_error });
         return;
     };
 
     const addr = std.net.Address.parseIp4(host, port) catch {
         std.posix.close(sock);
-        self.cq.push(.{ .result = -1, .err_msg = "connect: invalid address", .err_category = .upstream_error });
+        self.cs.cq.push(.{ .result = -1, .err_msg = "connect: invalid address", .err_category = .upstream_error });
         return;
     };
 
-    self.batch_completions[io_index] = .{
+    self.cs.batch_completions[io_index] = .{
         .op = .{ .connect = .{ .socket = sock, .addr = addr } },
         .userdata = self,
         .callback = cosocket.onBatchComplete,
     };
-    self.pending_completions += 1;
-    self.loop.add(&self.batch_completions[io_index]);
+    self.cs.pending_completions += 1;
+    self.loop.add(&self.cs.batch_completions[io_index]);
 }
 
 /// Helper: create UDP socket and submit connect for batched I/O
@@ -281,7 +281,7 @@ pub fn submitBatchUdpConnect(self: *Connection, host: []const u8, port: u16, tim
         std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC,
         0,
     ) catch {
-        self.cq.push(.{ .result = -1, .err_msg = "udp_connect: socket creation failed", .err_category = .upstream_error });
+        self.cs.cq.push(.{ .result = -1, .err_msg = "udp_connect: socket creation failed", .err_category = .upstream_error });
         return;
     };
 
@@ -295,15 +295,15 @@ pub fn submitBatchUdpConnect(self: *Connection, host: []const u8, port: u16, tim
 
     const addr = std.net.Address.parseIp4(host, port) catch {
         std.posix.close(sock);
-        self.cq.push(.{ .result = -1, .err_msg = "udp_connect: invalid address", .err_category = .upstream_error });
+        self.cs.cq.push(.{ .result = -1, .err_msg = "udp_connect: invalid address", .err_category = .upstream_error });
         return;
     };
 
-    self.batch_completions[io_index] = .{
+    self.cs.batch_completions[io_index] = .{
         .op = .{ .connect = .{ .socket = sock, .addr = addr } },
         .userdata = self,
         .callback = cosocket.onBatchComplete,
     };
-    self.pending_completions += 1;
-    self.loop.add(&self.batch_completions[io_index]);
+    self.cs.pending_completions += 1;
+    self.loop.add(&self.cs.batch_completions[io_index]);
 }
