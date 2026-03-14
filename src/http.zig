@@ -327,3 +327,75 @@ test "picohttpparser websocket upgrade headers" {
 fn getHeader(req: *const Request, name: []const u8) ?[]const u8 {
     return Parser.getHeader(req, name);
 }
+
+/// Extract Content-Length from parsed request headers.
+/// Returns null if header is missing or value is malformed.
+pub fn getContentLength(request: *const Request) ?u64 {
+    for (request.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, "content-length")) {
+            return std.fmt.parseInt(u64, header.value, 10) catch return null;
+        }
+    }
+    return null;
+}
+
+test "getContentLength returns value when header present" {
+    const headers = [_]Header{
+        .{ .name = "Host", .value = "localhost" },
+        .{ .name = "Content-Length", .value = "1234" },
+    };
+    const request = Request{
+        .method = "POST",
+        .path = "/upload",
+        .version = 1,
+        .headers = @constCast(&headers),
+        .body = "",
+        .raw_len = 0,
+    };
+    try std.testing.expectEqual(@as(u64, 1234), getContentLength(&request).?);
+}
+
+test "getContentLength returns null when header missing" {
+    const headers = [_]Header{
+        .{ .name = "Host", .value = "localhost" },
+    };
+    const request = Request{
+        .method = "GET",
+        .path = "/",
+        .version = 1,
+        .headers = @constCast(&headers),
+        .body = "",
+        .raw_len = 0,
+    };
+    try std.testing.expectEqual(@as(?u64, null), getContentLength(&request));
+}
+
+test "getContentLength returns null for malformed value" {
+    const headers = [_]Header{
+        .{ .name = "Content-Length", .value = "not-a-number" },
+    };
+    const request = Request{
+        .method = "POST",
+        .path = "/",
+        .version = 1,
+        .headers = @constCast(&headers),
+        .body = "",
+        .raw_len = 0,
+    };
+    try std.testing.expectEqual(@as(?u64, null), getContentLength(&request));
+}
+
+test "getContentLength is case-insensitive" {
+    const headers = [_]Header{
+        .{ .name = "content-length", .value = "5678" },
+    };
+    const request = Request{
+        .method = "POST",
+        .path = "/",
+        .version = 1,
+        .headers = @constCast(&headers),
+        .body = "",
+        .raw_len = 0,
+    };
+    try std.testing.expectEqual(@as(u64, 5678), getContentLength(&request).?);
+}

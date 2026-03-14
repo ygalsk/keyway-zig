@@ -335,6 +335,15 @@ pub const Connection = struct {
         self.request_path = clean_path;
         self.request_raw_len = request.raw_len;
 
+        // Reject oversized Content-Length before reading body or routing
+        if (http.getContentLength(&request)) |content_length| {
+            if (content_length > config.MAX_BODY_SIZE) {
+                self.logAccess(413);
+                error_response.sendErrorStatus(self, 413, "body exceeds size limit");
+                return;
+            }
+        }
+
         self.query_cache.clear();
         if (query_pos) |qi| {
             parseQueryString(request.path[qi + 1 ..], &self.query_cache);
