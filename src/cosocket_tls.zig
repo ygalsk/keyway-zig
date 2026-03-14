@@ -20,7 +20,6 @@ const cosocket = @import("cosocket.zig");
 const castUserdata = @import("helpers.zig").castUserdata;
 
 const error_response = @import("error_response.zig");
-const ErrorCategory = error_response.ErrorCategory;
 
 /// xev callback: handshake send completed. Check if handshake is done,
 /// submit recv for server response, or finish.

@@ -365,15 +365,8 @@ pub const Connection = struct {
         // Plaintext path
         self.read_buffer.commitWrite(bytes_read);
 
-        // Streaming body size enforcement: track accumulated bytes and reject if over limit.
-        // Only applies in .reading state (not WebSocket or SSE, which are long-lived).
-        if (self.state == .reading) {
-            self.http_state.body_bytes_received += bytes_read;
-            if (self.http_state.body_bytes_received > config.MAX_BODY_SIZE) {
-                error_response.sendErrorStatus(self, 413, "streaming body exceeds size limit");
-                return .disarm;
-            }
-        }
+        // Streaming body size enforcement (not WebSocket or SSE, which are long-lived).
+        if (self.state == .reading and self.checkBodySizeExceeded(bytes_read)) return .disarm;
 
         self.handleRequest();
         return .disarm;
@@ -602,6 +595,16 @@ pub const Connection = struct {
         error_response.sendError(self, .server_error, "internal error");
     }
 
+    /// Check if accumulated body bytes exceed MAX_BODY_SIZE. Sends 413 if so.
+    pub fn checkBodySizeExceeded(self: *Connection, bytes_read: usize) bool {
+        self.http_state.body_bytes_received += bytes_read;
+        if (self.http_state.body_bytes_received > config.MAX_BODY_SIZE) {
+            error_response.sendErrorStatus(self, 413, "streaming body exceeds size limit");
+            return true;
+        }
+        return false;
+    }
+
     /// Zig-native health endpoint. Returns JSON metrics with zero Lua overhead.
     /// 200 when ready, 503 when draining.
     fn serveHealth(self: *Connection, alloc: std.mem.Allocator) void {
@@ -612,8 +615,10 @@ pub const Connection = struct {
         // Aggregate metrics from all workers via the metrics slice stored on server
         const agg = metrics_mod.aggregate(server.all_worker_metrics, status_str);
 
-        // Format JSON body using arena allocator (freed on arena reset after response)
-        const json = std.fmt.allocPrint(alloc, "{{\"status\":\"{s}\",\"worker_count\":{d},\"total_requests\":{d},\"total_errors\":{d},\"active_connections\":{d},\"latency\":{{\"min_us\":{d},\"max_us\":{d},\"avg_us\":{d}}}}}", .{
+        // Build full HTTP response in a single allocation (JSON body is small and bounded)
+        const status_line: []const u8 = if (http_status == 200) "HTTP/1.1 200 OK" else "HTTP/1.1 503 Service Unavailable";
+        const json_fmt = "{{\"status\":\"{s}\",\"worker_count\":{d},\"total_requests\":{d},\"total_errors\":{d},\"active_connections\":{d},\"latency\":{{\"min_us\":{d},\"max_us\":{d},\"avg_us\":{d}}}}}";
+        const json_args = .{
             agg.status,
             agg.worker_count,
             agg.total_requests,
@@ -622,14 +627,9 @@ pub const Connection = struct {
             agg.latency_min_us,
             agg.latency_max_us,
             agg.latency_avg_us,
-        }) catch {
-            error_response.sendError(self, .server_error, "health endpoint allocation failed");
-            return;
         };
-
-        // Build HTTP response with Content-Type: application/json
-        const status_line: []const u8 = if (http_status == 200) "HTTP/1.1 200 OK" else "HTTP/1.1 503 Service Unavailable";
-        const response_text = std.fmt.allocPrint(alloc, "{s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ status_line, json.len, json }) catch {
+        const json_len = std.fmt.count(json_fmt, json_args);
+        const response_text = std.fmt.allocPrint(alloc, "{s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n" ++ json_fmt, .{status_line, json_len} ++ json_args) catch {
             error_response.sendError(self, .server_error, "health endpoint allocation failed");
             return;
         };

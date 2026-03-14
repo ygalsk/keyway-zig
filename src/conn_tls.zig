@@ -8,8 +8,6 @@ const handler = @import("handler.zig");
 const Connection = handler.Connection;
 const castUserdata = @import("helpers.zig").castUserdata;
 const config = @import("config.zig");
-const error_response = @import("error_response.zig");
-
 const CIPHERTEXT_BUFFER_SIZE = config.CIPHERTEXT_BUFFER_SIZE;
 
 /// Initialize TLS on this connection. Called from onAccept when TLS is configured.
@@ -46,13 +44,7 @@ pub fn handleTlsDecrypt(self: *Connection, tc: *TlsConn) void {
         .data => |n| {
             self.read_buffer.commitWrite(n);
             // Streaming body size enforcement for TLS connections
-            if (self.state == .reading) {
-                self.http_state.body_bytes_received += n;
-                if (self.http_state.body_bytes_received > config.MAX_BODY_SIZE) {
-                    error_response.sendErrorStatus(self, 413, "streaming body exceeds size limit");
-                    return;
-                }
-            }
+            if (self.state == .reading and self.checkBodySizeExceeded(n)) return;
             self.handleRequest();
         },
         .want_read => self.startRead(),

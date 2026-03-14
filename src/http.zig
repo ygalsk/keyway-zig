@@ -331,12 +331,8 @@ fn getHeader(req: *const Request, name: []const u8) ?[]const u8 {
 /// Extract Content-Length from parsed request headers.
 /// Returns null if header is missing or value is malformed.
 pub fn getContentLength(request: *const Request) ?u64 {
-    for (request.headers) |header| {
-        if (std.ascii.eqlIgnoreCase(header.name, "content-length")) {
-            return std.fmt.parseInt(u64, header.value, 10) catch return null;
-        }
-    }
-    return null;
+    const val = Parser.getHeader(request, "content-length") orelse return null;
+    return std.fmt.parseInt(u64, val, 10) catch null;
 }
 
 test "getContentLength returns value when header present" {

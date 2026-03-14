@@ -496,6 +496,11 @@ fn batchCompletionCheck(self: *Connection) void {
                     std.posix.close(s.outbound_fd);
                     s.outbound_fd = 0;
                 }
+                s.recv_buf = null;
+                if (s.outbound_tls) |tls_conn| {
+                    tls_mod.freeTlsConn(self.base_allocator, tls_conn);
+                    s.outbound_tls = null;
+                }
                 self.cs.suspended = null;
             }
         }

@@ -16,7 +16,6 @@ pub const WorkerMetrics = struct {
     error_count: std.atomic.Value(u64),
     active_connections: std.atomic.Value(u32),
     latency_sum_us: std.atomic.Value(u64),
-    latency_count: std.atomic.Value(u64),
     latency_min_us: std.atomic.Value(u64),
     latency_max_us: std.atomic.Value(u64),
 
@@ -27,7 +26,6 @@ pub const WorkerMetrics = struct {
             .error_count = std.atomic.Value(u64).init(0),
             .active_connections = std.atomic.Value(u32).init(0),
             .latency_sum_us = std.atomic.Value(u64).init(0),
-            .latency_count = std.atomic.Value(u64).init(0),
             .latency_min_us = std.atomic.Value(u64).init(std.math.maxInt(u64)),
             .latency_max_us = std.atomic.Value(u64).init(0),
         };
@@ -40,7 +38,6 @@ pub const WorkerMetrics = struct {
             _ = self.error_count.fetchAdd(1, .monotonic);
         }
         _ = self.latency_sum_us.fetchAdd(latency_us, .monotonic);
-        _ = self.latency_count.fetchAdd(1, .monotonic);
 
         // Update min/max — single-writer per worker, no cmpxchg needed
         const current_min = self.latency_min_us.load(.monotonic);
@@ -79,7 +76,6 @@ pub fn aggregate(metrics: []const *WorkerMetrics, status: []const u8) Aggregated
     var total_errors: u64 = 0;
     var active_connections: u64 = 0;
     var latency_sum: u64 = 0;
-    var latency_count: u64 = 0;
     var global_min: u64 = std.math.maxInt(u64);
     var global_max: u64 = 0;
 
@@ -88,7 +84,6 @@ pub fn aggregate(metrics: []const *WorkerMetrics, status: []const u8) Aggregated
         total_errors += m.error_count.load(.monotonic);
         active_connections += m.active_connections.load(.monotonic);
         latency_sum += m.latency_sum_us.load(.monotonic);
-        latency_count += m.latency_count.load(.monotonic);
 
         const worker_min = m.latency_min_us.load(.monotonic);
         const worker_max = m.latency_max_us.load(.monotonic);
@@ -97,8 +92,8 @@ pub fn aggregate(metrics: []const *WorkerMetrics, status: []const u8) Aggregated
     }
 
     // Handle zero-request edge case
-    const avg = if (latency_count > 0) latency_sum / latency_count else 0;
-    const min = if (latency_count > 0) global_min else 0;
+    const avg = if (total_requests > 0) latency_sum / total_requests else 0;
+    const min = if (total_requests > 0) global_min else 0;
 
     return .{
         .status = status,
@@ -122,7 +117,6 @@ test "WorkerMetrics.init has correct defaults" {
     try std.testing.expectEqual(@as(u64, 0), m.error_count.raw);
     try std.testing.expectEqual(@as(u32, 0), m.active_connections.raw);
     try std.testing.expectEqual(@as(u64, 0), m.latency_sum_us.raw);
-    try std.testing.expectEqual(@as(u64, 0), m.latency_count.raw);
     try std.testing.expectEqual(std.math.maxInt(u64), m.latency_min_us.raw);
     try std.testing.expectEqual(@as(u64, 0), m.latency_max_us.raw);
 }
@@ -134,7 +128,6 @@ test "recordRequest updates all counters" {
     try std.testing.expectEqual(@as(u64, 1), m.request_count.raw);
     try std.testing.expectEqual(@as(u64, 0), m.error_count.raw);
     try std.testing.expectEqual(@as(u64, 500), m.latency_sum_us.raw);
-    try std.testing.expectEqual(@as(u64, 1), m.latency_count.raw);
     try std.testing.expectEqual(@as(u64, 500), m.latency_min_us.raw);
     try std.testing.expectEqual(@as(u64, 500), m.latency_max_us.raw);
 }
