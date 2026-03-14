@@ -37,6 +37,15 @@ pub const DEFAULT_BACKLOG: u31 = 128;
 /// Maximum HTTP request headers (picohttpparser limit).
 pub const MAX_HEADERS: usize = 100;
 
+/// HTTP request timeout in milliseconds. Requests exceeding this are terminated.
+pub const REQUEST_TIMEOUT_MS: u64 = 30_000;
+
+/// Graceful shutdown drain deadline in milliseconds. In-flight requests get this long to complete.
+pub const DRAIN_DEADLINE_MS: u64 = 30_000;
+
+/// Maximum HTTP request body size in bytes (1 MB). Bodies exceeding this get 413.
+pub const MAX_BODY_SIZE: u64 = 1_048_576;
+
 comptime {
     // RING_DEPTH must be a power of 2 (ring buffer wrapping requires it)
     if (RING_DEPTH == 0 or (RING_DEPTH & (RING_DEPTH - 1)) != 0)
@@ -51,4 +60,11 @@ comptime {
         @compileError("MAX_ROUTE_PARAMS must be <= 8");
     if (MAX_QUERY_PARAMS > 8)
         @compileError("MAX_QUERY_PARAMS must be <= 8");
+    // Production safety constants
+    if (REQUEST_TIMEOUT_MS == 0)
+        @compileError("REQUEST_TIMEOUT_MS must be > 0");
+    if (DRAIN_DEADLINE_MS == 0)
+        @compileError("DRAIN_DEADLINE_MS must be > 0");
+    if (MAX_BODY_SIZE < 1024)
+        @compileError("MAX_BODY_SIZE must be >= 1024");
 }

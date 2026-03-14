@@ -64,6 +64,9 @@ const response_500 = comptimeErrorResponse(500, "Internal Server Error", "Intern
 const response_502 = comptimeErrorResponse(502, "Bad Gateway", "Bad Gateway");
 const response_504 = comptimeErrorResponse(504, "Gateway Timeout", "Gateway Timeout");
 
+/// Pre-serialized 413 response for oversized request bodies.
+const response_413 = comptimeErrorResponse(413, "Content Too Large", "Content Too Large");
+
 /// Pre-serialized 404 response for route misses.
 const response_404 = comptimeErrorResponse(404, "Not Found", "Not Found");
 
@@ -83,6 +86,7 @@ fn statusResponse(status: u16) ?[]const u8 {
     return switch (status) {
         400 => response_400,
         404 => response_404,
+        413 => response_413,
         500 => response_500,
         502 => response_502,
         504 => response_504,
@@ -155,7 +159,7 @@ test "ErrorCategory.logLevel maps correctly" {
 }
 
 test "pre-serialized responses are valid HTTP" {
-    const responses = [_][]const u8{ response_400, response_404, response_500, response_502, response_504 };
+    const responses = [_][]const u8{ response_400, response_404, response_413, response_500, response_502, response_504 };
     for (responses) |resp| {
         try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1"));
         try std.testing.expect(std.mem.indexOf(u8, resp, "Content-Length:") != null);
@@ -170,6 +174,16 @@ test "sendErrorStatus(404) produces Not Found response" {
     const resp = statusResponse(404).?;
     try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 404 Not Found"));
     try std.testing.expect(std.mem.indexOf(u8, resp, "Content-Length:") != null);
+}
+
+test "statusResponse(413) produces Content Too Large response" {
+    const resp = statusResponse(413).?;
+    try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1 413 Content Too Large"));
+    try std.testing.expect(std.mem.indexOf(u8, resp, "Content-Length:") != null);
+    // Verify body
+    const body_start = std.mem.indexOf(u8, resp, "\r\n\r\n").? + 4;
+    const body = resp[body_start..];
+    try std.testing.expectEqualStrings("Content Too Large", body);
 }
 
 test "pre-serialized 404 body is Not Found with correct Content-Length" {
