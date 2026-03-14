@@ -40,7 +40,18 @@ const metrics_mod = @import("metrics.zig");
 const ParamArray = params.ParamArray;
 const QueryArray = params.QueryArray;
 const parseQueryString = params.parseQueryString;
-const SuspendedState = cosocket.SuspendedState;
+/// Cosocket suspend state — bundled so one `= null` replaces seven resets.
+/// Non-null means a handler is yielded waiting on outbound I/O.
+pub const SuspendedState = struct {
+    completion: xev.Completion,
+    exchange: *HttpExchange,
+    recv_buf: ?[]u8,
+    coroutine_ref: i32,
+    coroutine_thread: *anyopaque,
+    outbound_fd: std.posix.socket_t,
+    pending_op: ring.IoEntry.Op,
+    outbound_tls: ?*TlsConn = null, // temporary, during handshake only
+};
 
 const READ_BUFFER_SIZE = config.READ_BUFFER_SIZE;
 const CIPHERTEXT_BUFFER_SIZE = config.CIPHERTEXT_BUFFER_SIZE;
