@@ -2,6 +2,7 @@ const Lua = @import("luajit").Lua;
 const LuaState = @import("lua_state.zig").LuaState;
 const castUserdata = @import("helpers.zig").castUserdata;
 const io_request = @import("io_request.zig");
+const ErrorCategory = @import("error_response.zig").ErrorCategory;
 
 extern "c" fn lua_yield(L: *anyopaque, nresults: c_int) c_int;
 
@@ -83,6 +84,18 @@ pub fn keyway_ring_result(lua: *Lua) callconv(.c) c_int {
     };
     lua.pushInteger(@intCast(cqe.result));
     if (cqe.buf) |b| lua.pushLString(b) else lua.pushNil();
-    if (cqe.err_msg) |e| lua.pushString(e) else lua.pushNil();
+    if (cqe.err_msg) |e| {
+        // Construct structured error table {category=..., message=...}
+        // matching single-shot path error format for consistency
+        lua.createTable(0, 2);
+        if (cqe.err_category) |cat| {
+            lua.pushString(@tagName(cat));
+        } else {
+            lua.pushString("server_error");
+        }
+        lua.setField(-2, "category");
+        lua.pushString(e);
+        lua.setField(-2, "message");
+    } else lua.pushNil();
     return 3;
 }

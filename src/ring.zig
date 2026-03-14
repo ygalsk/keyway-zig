@@ -9,6 +9,7 @@
 const std = @import("std");
 const config = @import("config.zig");
 const TlsMode = @import("io_request.zig").TlsMode;
+const ErrorCategory = @import("error_response.zig").ErrorCategory;
 
 /// Tagged union describing a single outbound I/O intent.
 /// Each variant carries only the fields relevant to that operation.
@@ -47,6 +48,7 @@ pub const CQEntry = struct {
     result: i32, // fd for connect, byte count for send/recv, negative for error
     buf: ?[]const u8 = null, // recv: pointer to filled buffer (arena-allocated)
     err_msg: ?[*:0]const u8 = null,
+    err_category: ?ErrorCategory = null, // error classification for structured Lua error tables
 };
 
 /// Fixed-size ring buffer for I/O submission entries.
@@ -165,6 +167,27 @@ test "CompletionRing: push/get/reset" {
 
     cq.reset();
     try std.testing.expectEqual(@as(u8, 0), cq.tail);
+}
+
+test "CQEntry: err_category round-trips correctly" {
+    var cq = CompletionRing{};
+
+    // Push entry with err_category
+    cq.push(.{ .result = -1, .err_msg = "connection refused", .err_category = .upstream_error });
+    cq.push(.{ .result = -1, .err_msg = "recv: alloc failed", .err_category = .server_error });
+    cq.push(.{ .result = 5 }); // success entry, no category
+
+    const e0 = cq.get(0);
+    try std.testing.expectEqual(@as(i32, -1), e0.result);
+    try std.testing.expectEqual(ErrorCategory.upstream_error, e0.err_category.?);
+    try std.testing.expectEqualStrings("connection refused", std.mem.span(e0.err_msg.?));
+
+    const e1 = cq.get(1);
+    try std.testing.expectEqual(ErrorCategory.server_error, e1.err_category.?);
+
+    const e2 = cq.get(2);
+    try std.testing.expect(e2.err_category == null);
+    try std.testing.expect(e2.err_msg == null);
 }
 
 test "IoEntry: tagged union active field" {

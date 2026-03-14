@@ -1,14 +1,19 @@
 //! Outbound I/O engine — yield/resume bridge between Lua coroutines and libxev.
 //!
 //! Flow:
-//!   Lua handler yields  →  dispatchIo()  →  submitOutboundIO() or drainSubmissionRing()
-//!       ↓                                         ↓
-//!   xev async op        ←  onOutbound/onBatchComplete callback
-//!       ↓
-//!   dispatchResume()    →  lua_resume(thread, nresults)
-//!       ↓
-//!   completed?          →  completeHandler() → serialize response → write
-//!   yielded again?      →  dispatchIo() (loop)
+//!   Lua handler yields  ->  dispatchIo()  ->  submitOutboundIO() or drainSubmissionRing()
+//!       |                                         |
+//!   xev async op        <-  onOutbound/onBatchComplete callback
+//!       |
+//!   dispatchResume()    ->  lua_resume(thread, nresults)
+//!       |
+//!   completed?          ->  completeHandler() -> serialize response -> write
+//!   yielded again?      ->  dispatchIo() (loop)
+//!
+//! I/O completion paths:
+//!   Single-shot: submitOutboundIO -> xev -> onOutboundComplete -> interpret{Op} -> dispatchResume
+//!   Batch:       drainSubmissionRing -> xev -> onBatchComplete -> classifyOpError -> CQEntry -> ring_api
+//! Both paths share interpret/classify functions for consistent error categorization.
 //!
 //! Single-shot path: one pending_io at a time (connect, send, recv, close).
 //! Batch path: submission ring drained, multiple xev ops in flight, resume on last completion.
@@ -25,6 +30,8 @@ const ring = @import("ring.zig");
 const tls_mod = @import("tls.zig");
 const TlsConn = tls_mod.TlsConn;
 const Lua = @import("luajit").Lua;
+const error_response = @import("error_response.zig");
+const ErrorCategory = error_response.ErrorCategory;
 
 const handler_mod = @import("handler.zig");
 const Connection = handler_mod.Connection;
@@ -43,6 +50,38 @@ pub const SuspendedState = struct {
     outbound_tls: ?*TlsConn = null, // temporary, during handshake only
 };
 
+// ============================================================================
+// Shared error infrastructure
+// ============================================================================
+
+/// Result of an interpret function: how many Lua values were pushed, and
+/// whether the operation completed (false = re-submitted, e.g. TLS want_read).
+const InterpretResult = struct {
+    nresults: c_int,
+    done: bool = true,
+};
+
+/// Push nil, {category=..., message=...} error table to the Lua thread stack.
+/// All cosocket errors flow through this function so Lua always sees structured tables.
+fn pushErrorTable(thread: *Lua, category: ErrorCategory, msg: [:0]const u8) void {
+    thread.pushNil();
+    thread.createTable(0, 2);
+    thread.pushString(@tagName(category));
+    thread.setField(-2, "category");
+    thread.pushString(msg);
+    thread.setField(-2, "message");
+}
+
+/// Classify an error by xev operation tag. Used by both single-shot interpret functions
+/// and the batch completion path to ensure identical error categorization.
+pub fn classifyOpError(op_tag: anytype) struct { category: ErrorCategory, msg: [:0]const u8 } {
+    if (op_tag == .connect) return .{ .category = .upstream_error, .msg = "connection refused" };
+    if (op_tag == .send) return .{ .category = .upstream_error, .msg = "send failed" };
+    if (op_tag == .recv) return .{ .category = .upstream_error, .msg = "recv failed" };
+    if (op_tag == .close) return .{ .category = .upstream_error, .msg = "close failed" };
+    return .{ .category = .server_error, .msg = "unknown op" };
+}
+
 /// Format a TLS decrypt error into a static sentinel-terminated string for Lua.
 /// Includes SSL_ERROR code and first ERR queue message if available.
 fn tlsErrorMsg(comptime prefix: []const u8, de: TlsConn.DecryptError) [:0]const u8 {
@@ -51,6 +90,116 @@ fn tlsErrorMsg(comptime prefix: []const u8, de: TlsConn.DecryptError) [:0]const 
     }
     return prefix ++ ": tls decrypt failed";
 }
+
+// ============================================================================
+// Interpret functions — shared by onOutboundComplete (single-shot path)
+// ============================================================================
+
+/// Interpret a connect/pool_connect/udp_connect completion.
+/// On failure: closes socket, pushes error table. On success: pushes fd (and reuse_count for pool_connect).
+fn interpretConnect(thread: *Lua, s: *SuspendedState, result: xev.Result) InterpretResult {
+    _ = result.connect catch {
+        std.posix.close(s.outbound_fd);
+        s.outbound_fd = 0;
+        s.pending_op = .none;
+        pushErrorTable(thread, .upstream_error, "connection refused");
+        return .{ .nresults = 2 };
+    };
+    if (s.pending_op == .pool_connect) {
+        thread.pushInteger(@intCast(s.outbound_fd));
+        thread.pushInteger(0);
+        s.outbound_fd = 0;
+        s.pending_op = .none;
+        return .{ .nresults = 2 };
+    }
+    thread.pushInteger(@intCast(s.outbound_fd));
+    s.outbound_fd = 0;
+    s.pending_op = .none;
+    return .{ .nresults = 1 };
+}
+
+/// Interpret a send completion.
+/// On failure: pushes error table. On success: pushes bytes_sent.
+fn interpretSend(thread: *Lua, result: xev.Result) InterpretResult {
+    const bytes_sent = result.send catch {
+        pushErrorTable(thread, .upstream_error, "send failed");
+        return .{ .nresults = 2 };
+    };
+    thread.pushInteger(@intCast(bytes_sent));
+    return .{ .nresults = 1 };
+}
+
+/// Interpret a recv completion, handling TLS decryption.
+/// On failure or TLS error: pushes error table. On want_read: re-submits recv (done=false).
+/// On success: pushes data string.
+fn interpretRecv(
+    thread: *Lua,
+    s: *SuspendedState,
+    result: xev.Result,
+    self: *Connection,
+    fd: std.posix.socket_t,
+) InterpretResult {
+    const bytes_read = result.recv catch {
+        s.recv_buf = null;
+        pushErrorTable(thread, .upstream_error, "recv failed");
+        return .{ .nresults = 2 };
+    };
+    if (s.recv_buf) |buf| {
+        if (self.lua_state.getTls(fd)) |tls_conn| {
+            tls_conn.feedCiphertext(buf[0..bytes_read]);
+            var plaintext_buf: [tls_mod.TLS_RECORD_MAX_SIZE]u8 = undefined;
+            switch (tls_conn.decrypt(&plaintext_buf)) {
+                .data => |n| {
+                    thread.pushLString(plaintext_buf[0..n]);
+                    s.recv_buf = null;
+                    return .{ .nresults = 1 };
+                },
+                .want_read => {
+                    // Need more ciphertext — re-submit recv without resuming Lua
+                    s.completion = .{
+                        .op = .{ .recv = .{ .fd = fd, .buffer = .{ .slice = buf } } },
+                        .userdata = self,
+                        .callback = onOutboundComplete,
+                    };
+                    self.loop.add(&s.completion);
+                    return .{ .nresults = 0, .done = false };
+                },
+                .zero_return => {
+                    s.recv_buf = null;
+                    pushErrorTable(thread, .upstream_error, "recv: tls connection closed");
+                    return .{ .nresults = 2 };
+                },
+                .err => |de| {
+                    s.recv_buf = null;
+                    pushErrorTable(thread, .upstream_error, tlsErrorMsg("recv", de));
+                    return .{ .nresults = 2 };
+                },
+            }
+        } else {
+            thread.pushLString(buf[0..bytes_read]);
+        }
+    } else {
+        thread.pushNil();
+    }
+    s.recv_buf = null;
+    return .{ .nresults = 1 };
+}
+
+/// Interpret a close completion.
+/// On failure: pushes error table. On success: pushes 1.
+fn interpretClose(thread: *Lua, s: *SuspendedState, result: xev.Result) InterpretResult {
+    _ = result.close catch {
+        pushErrorTable(thread, .upstream_error, "close failed");
+        return .{ .nresults = 2 };
+    };
+    s.outbound_fd = 0;
+    thread.pushInteger(1);
+    return .{ .nresults = 1 };
+}
+
+// ============================================================================
+// Encrypt/TLS helpers
+// ============================================================================
 
 /// Encrypt plaintext via TLS and drain into an allocated buffer.
 /// Returns ciphertext slice, or null on encrypt/alloc failure.
@@ -68,6 +217,10 @@ fn selectClientTlsCtx(lua_state: *LuaState, mode: TlsMode) @TypeOf(lua_state.tls
     };
 }
 
+// ============================================================================
+// I/O dispatch
+// ============================================================================
+
 /// Dispatch I/O after a Lua yield: ring path (SQ has entries) or old single-shot path.
 pub fn dispatchIo(conn: *Connection) void {
     if (conn.sq.len() > 0) {
@@ -83,12 +236,12 @@ fn createTcpSocket(self: *Connection, host: []const u8, port: u16, comptime err_
         std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
         0,
     ) catch {
-        resumeWithError(self, err_prefix ++ "socket creation failed");
+        resumeWithError(self, .upstream_error, err_prefix ++ "socket creation failed");
         return null;
     };
     const addr = std.net.Address.parseIp4(host, port) catch {
         std.posix.close(sock);
-        resumeWithError(self, err_prefix ++ "invalid address");
+        resumeWithError(self, .upstream_error, err_prefix ++ "invalid address");
         return null;
     };
     return .{ .sock = sock, .addr = addr };
@@ -115,7 +268,7 @@ fn submitUdpConnect(self: *Connection, c: anytype) void {
         std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC,
         0,
     ) catch {
-        resumeWithError(self, "udp_connect: socket creation failed");
+        resumeWithError(self, .upstream_error, "udp_connect: socket creation failed");
         return;
     };
     if (c.timeout_ms > 0) {
@@ -129,7 +282,7 @@ fn submitUdpConnect(self: *Connection, c: anytype) void {
     const addr = std.net.Address.parseIp4(c.host, c.port) catch {
         std.posix.close(sock);
         s.outbound_fd = 0;
-        resumeWithError(self, "udp_connect: invalid address");
+        resumeWithError(self, .upstream_error, "udp_connect: invalid address");
         return;
     };
     s.completion = .{
@@ -143,12 +296,12 @@ fn submitUdpConnect(self: *Connection, c: anytype) void {
 fn submitSend(self: *Connection, snd: anytype) void {
     const s = &self.suspended.?;
     const data = self.arena.allocator().dupe(u8, snd.data) catch {
-        resumeWithError(self, "send: arena alloc failed");
+        resumeWithError(self, .server_error, "send: arena alloc failed");
         return;
     };
     if (self.lua_state.getTls(snd.fd)) |tls_conn| {
         const ciphertext = tlsEncryptAlloc(tls_conn, data, self.arena.allocator()) orelse {
-            resumeWithError(self, "send: tls encrypt failed");
+            resumeWithError(self, .upstream_error, "send: tls encrypt failed");
             return;
         };
         s.completion = .{
@@ -181,7 +334,7 @@ fn submitRecv(self: *Connection, r: anytype) void {
                 },
                 .want_read => {},
                 .zero_return => {
-                    resumeWithError(self, "recv: tls connection closed");
+                    resumeWithError(self, .upstream_error, "recv: tls connection closed");
                     return;
                 },
                 .err => |de| {
@@ -192,7 +345,7 @@ fn submitRecv(self: *Connection, r: anytype) void {
         }
     }
     const buf = self.arena.allocator().alloc(u8, r.max_len) catch {
-        resumeWithError(self, "recv: alloc failed");
+        resumeWithError(self, .server_error, "recv: alloc failed");
         return;
     };
     s.recv_buf = buf;
@@ -215,48 +368,10 @@ fn submitClose(self: *Connection, c: anytype) void {
     self.loop.add(&s.completion);
 }
 
-fn submitTlsHandshake(self: *Connection, th: anytype) void {
-    const s = &self.suspended.?;
-    s.pending_op = .tls_handshake;
-    const tls_conn = self.base_allocator.create(TlsConn) catch {
-        resumeWithError(self, "sslhandshake: alloc failed");
-        return;
-    };
-    tls_conn.* = TlsConn.init(self.base_allocator, selectClientTlsCtx(self.lua_state, th.tls_mode), .client) catch {
-        self.base_allocator.destroy(tls_conn);
-        resumeWithError(self, "sslhandshake: tls init failed");
-        return;
-    };
-    if (th.sni_host) |host| {
-        const host_z = self.arena.allocator().dupeZ(u8, host) catch {
-            tls_mod.freeTlsConn(self.base_allocator, tls_conn);
-            resumeWithError(self, "sslhandshake: alloc failed");
-            return;
-        };
-        tls_conn.setSni(host_z);
-    }
-    s.outbound_tls = tls_conn;
-    _ = tls_conn.handshake();
-    const total = tls_conn.drainAll();
-    if (total == 0) {
-        tls_mod.freeTlsConn(self.base_allocator, tls_conn);
-        s.outbound_tls = null;
-        resumeWithError(self, "sslhandshake: no handshake data produced");
-        return;
-    }
-    s.completion = .{
-        .op = .{ .send = .{ .fd = th.fd, .buffer = .{ .slice = tls_conn.encrypt_buf[0..total] } } },
-        .userdata = self,
-        .callback = onTlsOutboundHandshakeSend,
-    };
-    s.outbound_fd = th.fd;
-    self.loop.add(&s.completion);
-}
-
 /// Read pending_io from LuaState, dispatch to per-op handler
 fn submitOutboundIO(self: *Connection) void {
     const pending = self.lua_state.pending_io orelse {
-        resumeWithError(self, "no pending I/O operation");
+        resumeWithError(self, .server_error, "no pending I/O operation");
         return;
     };
     self.lua_state.pending_io = null;
@@ -268,13 +383,18 @@ fn submitOutboundIO(self: *Connection) void {
         .send => |snd| submitSend(self, snd),
         .recv => |r| submitRecv(self, r),
         .close => |c| submitClose(self, c),
-        .tls_handshake => |th| submitTlsHandshake(self, th),
-        .setkeepalive => resumeWithError(self, "setkeepalive: not valid as pending I/O"),
-        .none => resumeWithError(self, "no pending I/O operation"),
+        .tls_handshake => |th| TlsHandshakeState.submit(self, th),
+        .setkeepalive => resumeWithError(self, .server_error, "setkeepalive: not valid as pending I/O"),
+        .none => resumeWithError(self, .server_error, "no pending I/O operation"),
     }
 }
 
-/// xev callback for all outbound I/O completions
+// ============================================================================
+// Single-shot completion callback
+// ============================================================================
+
+/// xev callback for all outbound I/O completions.
+/// Pure dispatch: extract result, call interpret function, resume coroutine.
 fn onOutboundComplete(
     userdata: ?*anyopaque,
     loop: *xev.Loop,
@@ -282,259 +402,219 @@ fn onOutboundComplete(
     result: xev.Result,
 ) xev.CallbackAction {
     _ = loop;
-
     const self = castUserdata(Connection, userdata);
     const s = &self.suspended.?;
     const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
-    const exchange = s.exchange;
-
-    // Determine what completed based on the op that was submitted
     const op = completion.op;
-    var nresults: c_int = 1;
 
-    if (op == .connect) {
-        _ = result.connect catch {
-            std.posix.close(s.outbound_fd);
-            s.outbound_fd = 0;
-            thread.pushNil();
-            thread.pushString("connection refused");
-            nresults = 2;
-            s.pending_op = .none;
-            dispatchResume(self, thread, nresults, exchange);
-            return .disarm;
-        };
-        if (s.pending_op == .pool_connect) {
-            // pool_connect returns (fd, reuse_count=0)
-            thread.pushInteger(@intCast(s.outbound_fd));
-            thread.pushInteger(0);
-            nresults = 2;
-        } else {
-            // connect and udp_connect both return fd only
-            thread.pushInteger(@intCast(s.outbound_fd));
-        }
-        s.outbound_fd = 0; // ownership transferred to Lua; completeHandler must not close it
-        s.pending_op = .none;
-    } else if (op == .send) {
-        const bytes_sent = result.send catch {
-            thread.pushNil();
-            thread.pushString("send failed");
-            nresults = 2;
-            dispatchResume(self, thread, nresults, exchange);
-            return .disarm;
-        };
-        thread.pushInteger(@intCast(bytes_sent));
-    } else if (op == .recv) {
-        const bytes_read = result.recv catch {
-            thread.pushNil();
-            thread.pushString("recv failed");
-            nresults = 2;
-            s.recv_buf = null;
-            dispatchResume(self, thread, nresults, exchange);
-            return .disarm;
-        };
-        if (s.recv_buf) |buf| {
-            // Check if this fd has TLS state — decrypt before pushing to Lua
-            if (self.lua_state.getTls(completion.op.recv.fd)) |tls_conn| {
-                tls_conn.feedCiphertext(buf[0..bytes_read]);
-                var plaintext_buf: [tls_mod.TLS_RECORD_MAX_SIZE]u8 = undefined;
-                switch (tls_conn.decrypt(&plaintext_buf)) {
-                    .data => |n| {
-                        thread.pushLString(plaintext_buf[0..n]);
-                    },
-                    .want_read => {
-                        // Need more ciphertext — re-submit recv without resuming Lua
-                        s.completion = .{
-                            .op = .{ .recv = .{ .fd = completion.op.recv.fd, .buffer = .{ .slice = buf } } },
-                            .userdata = self,
-                            .callback = onOutboundComplete,
-                        };
-                        self.loop.add(&s.completion);
-                        return .disarm;
-                    },
-                    .zero_return => {
-                        thread.pushNil();
-                        thread.pushString("recv: tls connection closed");
-                        nresults = 2;
-                        s.recv_buf = null;
-                        dispatchResume(self, thread, nresults, exchange);
-                        return .disarm;
-                    },
-                    .err => |de| {
-                        thread.pushNil();
-                        thread.pushString(tlsErrorMsg("recv", de));
-                        nresults = 2;
-                        s.recv_buf = null;
-                        dispatchResume(self, thread, nresults, exchange);
-                        return .disarm;
-                    },
-                }
-            } else {
-                thread.pushLString(buf[0..bytes_read]);
-            }
-        } else {
-            thread.pushNil();
-        }
-        s.recv_buf = null;
-    } else if (op == .close) {
-        _ = result.close catch {
-            thread.pushNil();
-            thread.pushString("close failed");
-            nresults = 2;
-            dispatchResume(self, thread, nresults, exchange);
-            return .disarm;
-        };
-        s.outbound_fd = 0; // fd is now closed; prevent completeHandler double-close
-        thread.pushInteger(1);
-    } else {
-        thread.pushNil();
-        thread.pushString("unknown outbound op");
-        nresults = 2;
-    }
+    const ir = if (op == .connect)
+        interpretConnect(thread, s, result)
+    else if (op == .send)
+        interpretSend(thread, result)
+    else if (op == .recv)
+        interpretRecv(thread, s, result, self, completion.op.recv.fd)
+    else if (op == .close)
+        interpretClose(thread, s, result)
+    else blk: {
+        pushErrorTable(thread, .server_error, "unknown outbound op");
+        break :blk InterpretResult{ .nresults = 2 };
+    };
 
-    dispatchResume(self, thread, nresults, exchange);
+    if (!ir.done) return .disarm;
+    dispatchResume(self, thread, ir.nresults, s.exchange);
     return .disarm;
 }
 
-/// TLS outbound handshake: send completed -> check if done or recv more
-fn onTlsOutboundHandshakeSend(
-    userdata: ?*anyopaque,
-    loop: *xev.Loop,
-    completion: *xev.Completion,
-    result: xev.Result,
-) xev.CallbackAction {
-    _ = loop;
-    _ = completion;
+// ============================================================================
+// TLS handshake state machine
+// ============================================================================
 
-    const self = castUserdata(Connection, userdata);
-    const s = &self.suspended.?;
-    const tls_conn = s.outbound_tls orelse {
-        resumeWithError(self, "sslhandshake: missing tls state");
-        return .disarm;
-    };
-
-    _ = result.send catch {
-        cleanupOutboundTls(self);
-        resumeWithError(self, "sslhandshake: send failed");
-        return .disarm;
-    };
-
-    // If handshake already completed (we were just flushing final wbio), finish now
-    if (tls_conn.isEstablished()) {
-        finishOutboundHandshake(self, tls_conn);
-        return .disarm;
-    }
-
-    // Need more data from server — recv
-    submitTlsHandshakeRecv(self);
-    return .disarm;
-}
-
-/// TLS outbound handshake: recv completed -> feed to SSL, continue or complete
-fn onTlsOutboundHandshakeRecv(
-    userdata: ?*anyopaque,
-    loop: *xev.Loop,
-    completion: *xev.Completion,
-    result: xev.Result,
-) xev.CallbackAction {
-    _ = loop;
-    _ = completion;
-
-    const self = castUserdata(Connection, userdata);
-    const s = &self.suspended.?;
-    const tls_conn = s.outbound_tls orelse {
-        resumeWithError(self, "sslhandshake: missing tls state");
-        return .disarm;
-    };
-
-    const bytes_read = result.recv catch {
-        cleanupOutboundTls(self);
-        resumeWithError(self, "sslhandshake: recv failed");
-        return .disarm;
-    };
-
-    if (bytes_read == 0) {
-        cleanupOutboundTls(self);
-        resumeWithError(self, "sslhandshake: connection closed");
-        return .disarm;
-    }
-
-    // Feed received ciphertext to TLS engine
-    if (s.recv_buf) |buf| {
-        tls_conn.feedCiphertext(buf[0..bytes_read]);
-    }
-
-    const hs_result = tls_conn.handshake();
-
-    // Drain any outbound data the handshake produced (e.g. Finished)
-    if (tls_conn.needsWrite()) {
-        const total = tls_conn.drainAll();
-        if (total > 0) {
-            // Send it — onTlsOutboundHandshakeSend checks .established to know if done
-            s.completion = .{
-                .op = .{ .send = .{ .fd = s.outbound_fd, .buffer = .{ .slice = tls_conn.encrypt_buf[0..total] } } },
-                .userdata = self,
-                .callback = onTlsOutboundHandshakeSend,
-            };
-            self.loop.add(&s.completion);
-            return .disarm;
-        }
-    }
-
-    switch (hs_result) {
-        .complete => finishOutboundHandshake(self, tls_conn),
-        .want_read => submitTlsHandshakeRecv(self),
-        .failed => {
-            cleanupOutboundTls(self);
-            resumeWithError(self, "sslhandshake: handshake failed");
-        },
-    }
-    return .disarm;
-}
-
-/// Finish a successful outbound TLS handshake — store in tls_map, resume Lua
-fn finishOutboundHandshake(self: *Connection, tls_conn: *TlsConn) void {
-    const s = &self.suspended.?;
-    self.lua_state.registerTls(s.outbound_fd, tls_conn) catch {
-        cleanupOutboundTls(self);
-        resumeWithError(self, "sslhandshake: map put failed");
-        return;
-    };
-    s.outbound_tls = null;
-    s.outbound_fd = 0;
-    s.pending_op = .none;
-    const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
-    thread.pushInteger(1);
-    dispatchResume(self, thread, 1, s.exchange);
-}
-
-/// Submit a recv for handshake data, reusing existing recv_buf or allocating one
-fn submitTlsHandshakeRecv(self: *Connection) void {
-    const s = &self.suspended.?;
-    const buf = s.recv_buf orelse blk: {
-        const b = self.arena.allocator().alloc(u8, tls_mod.TLS_RECORD_MAX_SIZE) catch {
-            cleanupOutboundTls(self);
-            resumeWithError(self, "sslhandshake: alloc failed");
+/// Namespace for TLS handshake lifecycle on outbound cosocket connections.
+/// All state lives on Connection.SuspendedState — this struct provides methods
+/// that encapsulate the multi-step handshake protocol (submit, send, recv, finish, cleanup).
+const TlsHandshakeState = struct {
+    /// Start a TLS handshake on the given fd. Allocates TlsConn, sets SNI,
+    /// initiates handshake, and submits first send to xev.
+    pub fn submit(self_conn: *Connection, th: anytype) void {
+        const s = &self_conn.suspended.?;
+        s.pending_op = .tls_handshake;
+        const tls_conn = self_conn.base_allocator.create(TlsConn) catch {
+            resumeWithError(self_conn, .upstream_error, "sslhandshake: alloc failed");
             return;
         };
-        s.recv_buf = b;
-        break :blk b;
-    };
-    s.completion = .{
-        .op = .{ .recv = .{ .fd = s.outbound_fd, .buffer = .{ .slice = buf } } },
-        .userdata = self,
-        .callback = onTlsOutboundHandshakeRecv,
-    };
-    self.loop.add(&s.completion);
-}
-
-/// Clean up outbound TLS state on handshake failure
-fn cleanupOutboundTls(self: *Connection) void {
-    const s = &self.suspended.?;
-    if (s.outbound_tls) |tls_conn| {
-        tls_mod.freeTlsConn(self.base_allocator, tls_conn);
-        s.outbound_tls = null;
+        tls_conn.* = TlsConn.init(self_conn.base_allocator, selectClientTlsCtx(self_conn.lua_state, th.tls_mode), .client) catch {
+            self_conn.base_allocator.destroy(tls_conn);
+            resumeWithError(self_conn, .upstream_error, "sslhandshake: tls init failed");
+            return;
+        };
+        if (th.sni_host) |host| {
+            const host_z = self_conn.arena.allocator().dupeZ(u8, host) catch {
+                tls_mod.freeTlsConn(self_conn.base_allocator, tls_conn);
+                resumeWithError(self_conn, .upstream_error, "sslhandshake: alloc failed");
+                return;
+            };
+            tls_conn.setSni(host_z);
+        }
+        s.outbound_tls = tls_conn;
+        _ = tls_conn.handshake();
+        const total = tls_conn.drainAll();
+        if (total == 0) {
+            tls_mod.freeTlsConn(self_conn.base_allocator, tls_conn);
+            s.outbound_tls = null;
+            resumeWithError(self_conn, .upstream_error, "sslhandshake: no handshake data produced");
+            return;
+        }
+        s.completion = .{
+            .op = .{ .send = .{ .fd = th.fd, .buffer = .{ .slice = tls_conn.encrypt_buf[0..total] } } },
+            .userdata = self_conn,
+            .callback = TlsHandshakeState.onSendComplete,
+        };
+        s.outbound_fd = th.fd;
+        self_conn.loop.add(&s.completion);
     }
-}
+
+    /// xev callback: handshake send completed. Check if handshake is done,
+    /// submit recv for server response, or finish.
+    pub fn onSendComplete(
+        userdata: ?*anyopaque,
+        loop: *xev.Loop,
+        completion: *xev.Completion,
+        result: xev.Result,
+    ) xev.CallbackAction {
+        _ = loop;
+        _ = completion;
+
+        const self_conn = castUserdata(Connection, userdata);
+        const s = &self_conn.suspended.?;
+        const tls_conn = s.outbound_tls orelse {
+            resumeWithError(self_conn, .upstream_error, "sslhandshake: missing tls state");
+            return .disarm;
+        };
+
+        _ = result.send catch {
+            TlsHandshakeState.cleanup(self_conn);
+            resumeWithError(self_conn, .upstream_error, "sslhandshake: send failed");
+            return .disarm;
+        };
+
+        if (tls_conn.isEstablished()) {
+            TlsHandshakeState.finish(self_conn, tls_conn);
+            return .disarm;
+        }
+
+        TlsHandshakeState.submitRecv(self_conn);
+        return .disarm;
+    }
+
+    /// xev callback: handshake recv completed. Feed ciphertext to TLS engine,
+    /// continue handshake, submit next send or finish.
+    pub fn onRecvComplete(
+        userdata: ?*anyopaque,
+        loop: *xev.Loop,
+        completion: *xev.Completion,
+        result: xev.Result,
+    ) xev.CallbackAction {
+        _ = loop;
+        _ = completion;
+
+        const self_conn = castUserdata(Connection, userdata);
+        const s = &self_conn.suspended.?;
+        const tls_conn = s.outbound_tls orelse {
+            resumeWithError(self_conn, .upstream_error, "sslhandshake: missing tls state");
+            return .disarm;
+        };
+
+        const bytes_read = result.recv catch {
+            TlsHandshakeState.cleanup(self_conn);
+            resumeWithError(self_conn, .upstream_error, "sslhandshake: recv failed");
+            return .disarm;
+        };
+
+        if (bytes_read == 0) {
+            TlsHandshakeState.cleanup(self_conn);
+            resumeWithError(self_conn, .upstream_error, "sslhandshake: connection closed");
+            return .disarm;
+        }
+
+        if (s.recv_buf) |buf| {
+            tls_conn.feedCiphertext(buf[0..bytes_read]);
+        }
+
+        const hs_result = tls_conn.handshake();
+
+        if (tls_conn.needsWrite()) {
+            const total = tls_conn.drainAll();
+            if (total > 0) {
+                s.completion = .{
+                    .op = .{ .send = .{ .fd = s.outbound_fd, .buffer = .{ .slice = tls_conn.encrypt_buf[0..total] } } },
+                    .userdata = self_conn,
+                    .callback = TlsHandshakeState.onSendComplete,
+                };
+                self_conn.loop.add(&s.completion);
+                return .disarm;
+            }
+        }
+
+        switch (hs_result) {
+            .complete => TlsHandshakeState.finish(self_conn, tls_conn),
+            .want_read => TlsHandshakeState.submitRecv(self_conn),
+            .failed => {
+                TlsHandshakeState.cleanup(self_conn);
+                resumeWithError(self_conn, .upstream_error, "sslhandshake: handshake failed");
+            },
+        }
+        return .disarm;
+    }
+
+    /// Handshake complete: register TLS conn, resume coroutine with success.
+    fn finish(self_conn: *Connection, tls_conn: *TlsConn) void {
+        const s = &self_conn.suspended.?;
+        self_conn.lua_state.registerTls(s.outbound_fd, tls_conn) catch {
+            TlsHandshakeState.cleanup(self_conn);
+            resumeWithError(self_conn, .upstream_error, "sslhandshake: map put failed");
+            return;
+        };
+        s.outbound_tls = null;
+        s.outbound_fd = 0;
+        s.pending_op = .none;
+        const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
+        thread.pushInteger(1);
+        dispatchResume(self_conn, thread, 1, s.exchange);
+    }
+
+    /// Submit a recv for the next handshake message from the server.
+    fn submitRecv(self_conn: *Connection) void {
+        const s = &self_conn.suspended.?;
+        const buf = s.recv_buf orelse blk: {
+            const b = self_conn.arena.allocator().alloc(u8, tls_mod.TLS_RECORD_MAX_SIZE) catch {
+                TlsHandshakeState.cleanup(self_conn);
+                resumeWithError(self_conn, .upstream_error, "sslhandshake: alloc failed");
+                return;
+            };
+            s.recv_buf = b;
+            break :blk b;
+        };
+        s.completion = .{
+            .op = .{ .recv = .{ .fd = s.outbound_fd, .buffer = .{ .slice = buf } } },
+            .userdata = self_conn,
+            .callback = TlsHandshakeState.onRecvComplete,
+        };
+        self_conn.loop.add(&s.completion);
+    }
+
+    /// Clean up TLS resources on handshake failure.
+    pub fn cleanup(self_conn: *Connection) void {
+        const s = &self_conn.suspended.?;
+        if (s.outbound_tls) |tls_conn| {
+            tls_mod.freeTlsConn(self_conn.base_allocator, tls_conn);
+            s.outbound_tls = null;
+        }
+    }
+};
+
+// ============================================================================
+// Resume helpers
+// ============================================================================
 
 /// Resume coroutine and dispatch based on result
 pub fn dispatchResume(self: *Connection, thread: *Lua, nresults: c_int, exchange: *HttpExchange) void {
@@ -555,6 +635,26 @@ pub fn dispatchResume(self: *Connection, thread: *Lua, nresults: c_int, exchange
         },
     }
 }
+
+/// Resume coroutine with nil, {category, message} error table for pre-submission failures.
+fn resumeWithError(self: *Connection, category: ErrorCategory, msg: [:0]const u8) void {
+    const s = &self.suspended.?;
+    const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
+    pushErrorTable(thread, category, msg);
+    dispatchResume(self, thread, 2, s.exchange);
+}
+
+/// Resume with a descriptive TLS error message including SSL error details.
+fn resumeWithTlsError(self: *Connection, comptime prefix: []const u8, de: TlsConn.DecryptError) void {
+    const s = &self.suspended.?;
+    const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
+    pushErrorTable(thread, .upstream_error, tlsErrorMsg(prefix, de));
+    dispatchResume(self, thread, 2, s.exchange);
+}
+
+// ============================================================================
+// Batch I/O path
+// ============================================================================
 
 /// Drain the submission ring: process each IoEntry, submit async I/O to xev.
 /// Synchronous ops (pool_connect hit, setkeepalive) write CQE immediately.
@@ -588,14 +688,14 @@ fn drainSubmissionRing(self: *Connection) void {
             .send => |snd| {
                 // Arena-dupe send_data before async submission (Lua string lifetime safety)
                 const duped = self.arena.allocator().dupe(u8, snd.data) catch {
-                    self.cq.push(.{ .result = -1, .err_msg = "send: arena alloc failed" });
+                    self.cq.push(.{ .result = -1, .err_msg = "send: arena alloc failed", .err_category = .server_error });
                     io_index += 1;
                     continue;
                 };
                 // TLS-aware send
                 if (self.lua_state.getTls(snd.fd)) |tls_conn| {
                     const ciphertext = tlsEncryptAlloc(tls_conn, duped, self.arena.allocator()) orelse {
-                        self.cq.push(.{ .result = -1, .err_msg = "send: tls encrypt failed" });
+                        self.cq.push(.{ .result = -1, .err_msg = "send: tls encrypt failed", .err_category = .upstream_error });
                         io_index += 1;
                         continue;
                     };
@@ -623,7 +723,7 @@ fn drainSubmissionRing(self: *Connection) void {
                         switch (tls_conn.decrypt(&plaintext_buf)) {
                             .data => |n| {
                                 const buf_copy = self.arena.allocator().dupe(u8, plaintext_buf[0..n]) catch {
-                                    self.cq.push(.{ .result = -1, .err_msg = "recv: alloc failed" });
+                                    self.cq.push(.{ .result = -1, .err_msg = "recv: alloc failed", .err_category = .server_error });
                                     io_index += 1;
                                     continue;
                                 };
@@ -633,13 +733,13 @@ fn drainSubmissionRing(self: *Connection) void {
                             },
                             .want_read => {}, // fall through to kernel recv
                             .zero_return => {
-                                self.cq.push(.{ .result = -1, .err_msg = "recv: tls connection closed" });
+                                self.cq.push(.{ .result = -1, .err_msg = "recv: tls connection closed", .err_category = .upstream_error });
                                 io_index += 1;
                                 continue;
                             },
                             .err => {
                                 // Detail already logged by decrypt()
-                                self.cq.push(.{ .result = -1, .err_msg = "recv: tls decrypt failed (see server log)" });
+                                self.cq.push(.{ .result = -1, .err_msg = "recv: tls decrypt failed (see server log)", .err_category = .upstream_error });
                                 io_index += 1;
                                 continue;
                             },
@@ -647,7 +747,7 @@ fn drainSubmissionRing(self: *Connection) void {
                     }
                 }
                 const buf = self.arena.allocator().alloc(u8, r.max_len) catch {
-                    self.cq.push(.{ .result = -1, .err_msg = "recv: alloc failed" });
+                    self.cq.push(.{ .result = -1, .err_msg = "recv: alloc failed", .err_category = .server_error });
                     io_index += 1;
                     continue;
                 };
@@ -683,7 +783,7 @@ fn drainSubmissionRing(self: *Connection) void {
                     @intCast(k.pool_size),
                     tls_ptr,
                 ) catch {
-                    self.cq.push(.{ .result = -1, .err_msg = "setkeepalive: pool put failed" });
+                    self.cq.push(.{ .result = -1, .err_msg = "setkeepalive: pool put failed", .err_category = .server_error });
                     io_index += 1;
                     continue;
                 };
@@ -693,20 +793,20 @@ fn drainSubmissionRing(self: *Connection) void {
             .tls_handshake => |t| {
                 // TLS handshake is multi-step — submit as a sequence via the existing mechanism
                 const tls_conn = self.base_allocator.create(TlsConn) catch {
-                    self.cq.push(.{ .result = -1, .err_msg = "tls_handshake: alloc failed" });
+                    self.cq.push(.{ .result = -1, .err_msg = "tls_handshake: alloc failed", .err_category = .upstream_error });
                     io_index += 1;
                     continue;
                 };
                 tls_conn.* = TlsConn.init(self.base_allocator, selectClientTlsCtx(self.lua_state, t.tls_mode), .client) catch {
                     self.base_allocator.destroy(tls_conn);
-                    self.cq.push(.{ .result = -1, .err_msg = "tls_handshake: tls init failed" });
+                    self.cq.push(.{ .result = -1, .err_msg = "tls_handshake: tls init failed", .err_category = .upstream_error });
                     io_index += 1;
                     continue;
                 };
                 if (t.sni_host) |host| {
                     const host_z = self.arena.allocator().dupeZ(u8, host) catch {
                         tls_mod.freeTlsConn(self.base_allocator, tls_conn);
-                        self.cq.push(.{ .result = -1, .err_msg = "tls_handshake: alloc failed" });
+                        self.cq.push(.{ .result = -1, .err_msg = "tls_handshake: alloc failed", .err_category = .upstream_error });
                         io_index += 1;
                         continue;
                     };
@@ -717,7 +817,7 @@ fn drainSubmissionRing(self: *Connection) void {
                 const total = tls_conn.drainAll();
                 if (total == 0) {
                     tls_mod.freeTlsConn(self.base_allocator, tls_conn);
-                    self.cq.push(.{ .result = -1, .err_msg = "tls_handshake: no data produced" });
+                    self.cq.push(.{ .result = -1, .err_msg = "tls_handshake: no data produced", .err_category = .upstream_error });
                     io_index += 1;
                     continue;
                 }
@@ -730,7 +830,7 @@ fn drainSubmissionRing(self: *Connection) void {
                 self.batch_completions[io_index] = .{
                     .op = .{ .send = .{ .fd = t.fd, .buffer = .{ .slice = tls_conn.encrypt_buf[0..total] } } },
                     .userdata = self,
-                    .callback = onTlsOutboundHandshakeSend,
+                    .callback = TlsHandshakeState.onSendComplete,
                 };
                 // TLS handshake hijacks the suspended state — can only have one per batch
                 self.pending_completions += 1;
@@ -764,13 +864,13 @@ fn submitBatchConnect(self: *Connection, host: []const u8, port: u16, io_index: 
         std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
         0,
     ) catch {
-        self.cq.push(.{ .result = -1, .err_msg = "socket creation failed" });
+        self.cq.push(.{ .result = -1, .err_msg = "socket creation failed", .err_category = .upstream_error });
         return;
     };
 
     const addr = std.net.Address.parseIp4(host, port) catch {
         std.posix.close(sock);
-        self.cq.push(.{ .result = -1, .err_msg = "connect: invalid address" });
+        self.cq.push(.{ .result = -1, .err_msg = "connect: invalid address", .err_category = .upstream_error });
         return;
     };
 
@@ -790,7 +890,7 @@ fn submitBatchUdpConnect(self: *Connection, host: []const u8, port: u16, timeout
         std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC,
         0,
     ) catch {
-        self.cq.push(.{ .result = -1, .err_msg = "udp_connect: socket creation failed" });
+        self.cq.push(.{ .result = -1, .err_msg = "udp_connect: socket creation failed", .err_category = .upstream_error });
         return;
     };
 
@@ -804,7 +904,7 @@ fn submitBatchUdpConnect(self: *Connection, host: []const u8, port: u16, timeout
 
     const addr = std.net.Address.parseIp4(host, port) catch {
         std.posix.close(sock);
-        self.cq.push(.{ .result = -1, .err_msg = "udp_connect: invalid address" });
+        self.cq.push(.{ .result = -1, .err_msg = "udp_connect: invalid address", .err_category = .upstream_error });
         return;
     };
 
@@ -819,6 +919,7 @@ fn submitBatchUdpConnect(self: *Connection, host: []const u8, port: u16, timeout
 
 /// xev callback for batched I/O completions.
 /// Writes result into CQ at the correct index. When all completions arrive, resumes Lua once.
+/// Uses classifyOpError for consistent error categorization with the single-shot path.
 fn onBatchComplete(
     userdata: ?*anyopaque,
     loop: *xev.Loop,
@@ -838,16 +939,17 @@ fn onBatchComplete(
 
     if (op == .connect) {
         _ = result.connect catch {
-            // Close the socket on connect failure
             std.posix.close(completion.op.connect.socket);
-            self.cq.push(.{ .result = -1, .err_msg = "connection refused" });
+            const classified = classifyOpError(op);
+            self.cq.push(.{ .result = -1, .err_msg = classified.msg, .err_category = classified.category });
             batchCompletionCheck(self);
             return .disarm;
         };
         self.cq.push(.{ .result = @intCast(completion.op.connect.socket) });
     } else if (op == .send) {
         const bytes_sent = result.send catch {
-            self.cq.push(.{ .result = -1, .err_msg = "send failed" });
+            const classified = classifyOpError(op);
+            self.cq.push(.{ .result = -1, .err_msg = classified.msg, .err_category = classified.category });
             batchCompletionCheck(self);
             return .disarm;
         };
@@ -855,7 +957,8 @@ fn onBatchComplete(
     } else if (op == .recv) {
         const bytes_read = result.recv catch {
             self.batch_recv_bufs[sqe_index] = null;
-            self.cq.push(.{ .result = -1, .err_msg = "recv failed" });
+            const classified = classifyOpError(op);
+            self.cq.push(.{ .result = -1, .err_msg = classified.msg, .err_category = classified.category });
             batchCompletionCheck(self);
             return .disarm;
         };
@@ -867,7 +970,7 @@ fn onBatchComplete(
                 switch (tls_conn.decrypt(&plaintext_buf)) {
                     .data => |n| {
                         const duped = self.arena.allocator().dupe(u8, plaintext_buf[0..n]) catch {
-                            self.cq.push(.{ .result = -1, .err_msg = "recv: alloc failed" });
+                            self.cq.push(.{ .result = -1, .err_msg = "recv: alloc failed", .err_category = .server_error });
                             self.batch_recv_bufs[sqe_index] = null;
                             batchCompletionCheck(self);
                             return .disarm;
@@ -885,29 +988,31 @@ fn onBatchComplete(
                         return .disarm; // Don't decrement pending_completions
                     },
                     .zero_return => {
-                        self.cq.push(.{ .result = -1, .err_msg = "recv: tls connection closed" });
+                        self.cq.push(.{ .result = -1, .err_msg = "recv: tls connection closed", .err_category = .upstream_error });
                     },
                     .err => {
                         // Detail already logged by decrypt()
-                        self.cq.push(.{ .result = -1, .err_msg = "recv: tls decrypt failed (see server log)" });
+                        self.cq.push(.{ .result = -1, .err_msg = "recv: tls decrypt failed (see server log)", .err_category = .upstream_error });
                     },
                 }
             } else {
                 self.cq.push(.{ .result = @intCast(bytes_read), .buf = buf[0..bytes_read] });
             }
         } else {
-            self.cq.push(.{ .result = -1, .err_msg = "recv: no buffer" });
+            self.cq.push(.{ .result = -1, .err_msg = "recv: no buffer", .err_category = .server_error });
         }
         self.batch_recv_bufs[sqe_index] = null;
     } else if (op == .close) {
         _ = result.close catch {
-            self.cq.push(.{ .result = -1, .err_msg = "close failed" });
+            const classified = classifyOpError(op);
+            self.cq.push(.{ .result = -1, .err_msg = classified.msg, .err_category = classified.category });
             batchCompletionCheck(self);
             return .disarm;
         };
         self.cq.push(.{ .result = 1 });
     } else {
-        self.cq.push(.{ .result = -1, .err_msg = "unknown op" });
+        const classified = classifyOpError(op);
+        self.cq.push(.{ .result = -1, .err_msg = classified.msg, .err_category = classified.category });
     }
 
     batchCompletionCheck(self);
@@ -924,6 +1029,10 @@ fn batchCompletionCheck(self: *Connection) void {
         dispatchResume(self, thread, 1, s.exchange);
     }
 }
+
+// ============================================================================
+// Handler completion
+// ============================================================================
 
 /// Handler finished after one or more yield/resume cycles.
 /// Return coroutine to cache, serialize response, submit write.
@@ -952,23 +1061,9 @@ pub fn completeHandler(self: *Connection) void {
     };
 }
 
-/// Resume coroutine with nil, error_message for pre-submission failures
-fn resumeWithError(self: *Connection, msg: [:0]const u8) void {
-    const s = &self.suspended.?;
-    const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
-    thread.pushNil();
-    thread.pushString(msg);
-    dispatchResume(self, thread, 2, s.exchange);
-}
-
-/// Resume with a descriptive TLS error message including SSL error details.
-fn resumeWithTlsError(self: *Connection, comptime prefix: []const u8, de: TlsConn.DecryptError) void {
-    const s = &self.suspended.?;
-    const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
-    thread.pushNil();
-    thread.pushString(tlsErrorMsg(prefix, de));
-    dispatchResume(self, thread, 2, s.exchange);
-}
+// ============================================================================
+// Tests
+// ============================================================================
 
 test "tlsErrorMsg includes detail suffix when msg_len > 0" {
     const de = TlsConn.DecryptError{ .ssl_error = 1, .msg_len = 5 };
@@ -992,4 +1087,41 @@ test "tlsErrorMsg works with different prefixes" {
 
 test "SuspendedState has expected default for outbound_tls" {
     try std.testing.expect(@sizeOf(SuspendedState) > 0);
+}
+
+test "classifyOpError returns correct categories" {
+    // We test with IoEntry.Op values since the function uses == comparison
+    const ConnectOp = struct { const tag = .connect; };
+    _ = ConnectOp;
+
+    // Test the function returns valid struct for each known op
+    const connect_err = classifyOpError(@as(IoEntry.Op, .connect));
+    try std.testing.expectEqual(ErrorCategory.upstream_error, connect_err.category);
+    try std.testing.expectEqualStrings("connection refused", connect_err.msg);
+
+    const send_err = classifyOpError(@as(IoEntry.Op, .send));
+    try std.testing.expectEqual(ErrorCategory.upstream_error, send_err.category);
+    try std.testing.expectEqualStrings("send failed", send_err.msg);
+
+    const recv_err = classifyOpError(@as(IoEntry.Op, .recv));
+    try std.testing.expectEqual(ErrorCategory.upstream_error, recv_err.category);
+    try std.testing.expectEqualStrings("recv failed", recv_err.msg);
+
+    const close_err = classifyOpError(@as(IoEntry.Op, .close));
+    try std.testing.expectEqual(ErrorCategory.upstream_error, close_err.category);
+    try std.testing.expectEqualStrings("close failed", close_err.msg);
+
+    const unknown_err = classifyOpError(@as(IoEntry.Op, .none));
+    try std.testing.expectEqual(ErrorCategory.server_error, unknown_err.category);
+    try std.testing.expectEqualStrings("unknown op", unknown_err.msg);
+}
+
+test "InterpretResult defaults done to true" {
+    const ir = InterpretResult{ .nresults = 1 };
+    try std.testing.expect(ir.done);
+}
+
+test "InterpretResult can be set to not done" {
+    const ir = InterpretResult{ .nresults = 0, .done = false };
+    try std.testing.expect(!ir.done);
 }
