@@ -53,6 +53,7 @@ pub const Worker = struct {
         sse_bus: ?*SseBroadcastBus,
         coordinator: ?*ShutdownCoordinator,
         metrics: *WorkerMetrics,
+        all_metrics_ptrs: []const *WorkerMetrics,
     };
 
     /// Spawn a worker thread
@@ -65,6 +66,7 @@ pub const Worker = struct {
         sse_bus: ?*SseBroadcastBus,
         coordinator: ?*ShutdownCoordinator,
         worker_metrics: *WorkerMetrics,
+        all_metrics_ptrs: []const *WorkerMetrics,
     ) !Worker {
         const ctx = try allocator.create(Context);
         ctx.* = Context{
@@ -76,6 +78,7 @@ pub const Worker = struct {
             .sse_bus = sse_bus,
             .coordinator = coordinator,
             .metrics = worker_metrics,
+            .all_metrics_ptrs = all_metrics_ptrs,
         };
 
         const thread = try std.Thread.spawn(.{}, workerMain, .{ctx});
@@ -181,6 +184,9 @@ pub const Worker = struct {
         );
         defer server.deinit();
 
+        // Expose all worker metrics to health endpoint
+        server.all_worker_metrics = ctx.all_metrics_ptrs;
+
         // Register shutdown Async watcher (fires when coordinator signals drain)
         var shutdown_completion: xev.Completion = undefined;
         var drain_timer_completion: xev.Completion = .{};
@@ -274,6 +280,7 @@ pub const ThreadPool = struct {
     sse_bus: ?*SseBroadcastBus,
     coordinator: ?*ShutdownCoordinator = null,
     worker_metrics: []WorkerMetrics,
+    all_metrics_ptrs: []*WorkerMetrics,
 
     /// Create thread pool with the given number of workers.
     /// Pass worker_count=0 to auto-detect (one worker per CPU core).
@@ -305,9 +312,15 @@ pub const ThreadPool = struct {
         // Create SSE broadcast bus (shared across all workers)
         const sse_bus = SseBroadcastBus.init(allocator, num_workers) catch null;
 
+        // Build slice of pointers to all worker metrics (for health endpoint aggregation)
+        const all_metrics_ptrs = try allocator.alloc(*WorkerMetrics, num_workers);
+        for (all_metrics_ptrs, 0..) |*ptr, i| {
+            ptr.* = &worker_metrics[i];
+        }
+
         // Spawn workers
         for (workers, 0..) |*worker, i| {
-            worker.* = try Worker.spawn(allocator, server_config, i, num_workers, bpf_ready, sse_bus, coordinator, &worker_metrics[i]);
+            worker.* = try Worker.spawn(allocator, server_config, i, num_workers, bpf_ready, sse_bus, coordinator, &worker_metrics[i], all_metrics_ptrs);
         }
 
         return ThreadPool{
@@ -317,6 +330,7 @@ pub const ThreadPool = struct {
             .sse_bus = sse_bus,
             .coordinator = coordinator,
             .worker_metrics = worker_metrics,
+            .all_metrics_ptrs = all_metrics_ptrs,
         };
     }
 
@@ -331,6 +345,7 @@ pub const ThreadPool = struct {
     pub fn deinit(self: *ThreadPool) void {
         if (self.sse_bus) |bus| bus.deinit();
         self.allocator.destroy(self.bpf_ready);
+        self.allocator.free(self.all_metrics_ptrs);
         self.allocator.free(self.worker_metrics);
         self.allocator.free(self.workers);
     }

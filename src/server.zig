@@ -26,6 +26,7 @@ pub const Server = struct {
     tls_ctx: ?TlsContext,
     sse_registry: ?*SseRegistry,
     metrics: *WorkerMetrics,
+    all_worker_metrics: []const *WorkerMetrics = &.{},
     draining: bool = false,
     active_connections: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
@@ -201,6 +202,7 @@ pub const Server = struct {
             self.router,
             self.lua_state,
             self.sse_registry,
+            self,
         ) catch |err| {
             std.log.err("connection init failed err={}", .{err});
             std.posix.close(client_socket);

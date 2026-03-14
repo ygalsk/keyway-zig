@@ -33,6 +33,9 @@ const conn_sse = @import("conn_sse.zig");
 const conn_ws = @import("conn_ws.zig");
 const cosocket = @import("cosocket.zig");
 const error_response = @import("error_response.zig");
+const Server = @import("server.zig").Server;
+const WorkerMetrics = @import("metrics.zig").WorkerMetrics;
+const metrics_mod = @import("metrics.zig");
 
 const ParamArray = params.ParamArray;
 const QueryArray = params.QueryArray;
@@ -53,6 +56,7 @@ pub const Connection = struct {
     socket: std.posix.socket_t,
     router: *Router,
     lua_state: *LuaState,
+    server: *Server,
 
     // Completions (must have stable address!)
     read_completion: xev.Completion,
@@ -111,6 +115,7 @@ pub const Connection = struct {
         router: *Router,
         lua_state: *LuaState,
         sse_registry: ?*SseRegistry,
+        server: *Server,
     ) !*Connection {
         const conn = try allocator.create(Connection);
         errdefer allocator.destroy(conn);
@@ -137,6 +142,7 @@ pub const Connection = struct {
             .param_cache = ParamArray{},
             .query_cache = QueryArray{},
             .sse_registry = sse_registry,
+            .server = server,
         };
 
         return conn;
@@ -266,6 +272,8 @@ pub const Connection = struct {
     pub fn logAccess(self: *Connection, status: u16) void {
         const dur_us: i64 = @intCast(@divTrunc(std.time.nanoTimestamp() - self.request_start_ns, 1000));
         log.accessLog(self.request_method, self.request_path, status, dur_us);
+        // Record metrics (latency + error tracking)
+        self.server.metrics.recordRequest(@intCast(@max(0, dur_us)), status >= 400);
     }
 
     fn parseHttpRequest(self: *Connection) ?http.Request {
@@ -347,6 +355,12 @@ pub const Connection = struct {
         self.request_method = request.method;
         self.request_path = clean_path;
         self.request_raw_len = request.raw_len;
+
+        // Health endpoint: handled before Lua routing (zero Lua overhead)
+        if (std.mem.eql(u8, clean_path, "/health")) {
+            self.serveHealth(alloc);
+            return;
+        }
 
         // Reject oversized Content-Length before reading body or routing
         if (http.getContentLength(&request)) |content_length| {
@@ -443,6 +457,53 @@ pub const Connection = struct {
         error_response.sendError(self, .server_error, "internal error");
     }
 
+    /// Zig-native health endpoint. Returns JSON metrics with zero Lua overhead.
+    /// 200 when ready, 503 when draining.
+    fn serveHealth(self: *Connection, alloc: std.mem.Allocator) void {
+        const server = self.server;
+        const status_str: []const u8 = if (server.draining) "draining" else "ok";
+        const http_status: u16 = if (server.draining) 503 else 200;
+
+        // Aggregate metrics from all workers via the metrics slice stored on server
+        const agg = metrics_mod.aggregate(server.all_worker_metrics, status_str);
+
+        // Format JSON body using arena allocator (freed on arena reset after response)
+        const json = std.fmt.allocPrint(alloc, "{{\"status\":\"{s}\",\"worker_count\":{d},\"total_requests\":{d},\"total_errors\":{d},\"active_connections\":{d},\"latency\":{{\"min_us\":{d},\"max_us\":{d},\"avg_us\":{d}}}}}", .{
+            agg.status,
+            agg.worker_count,
+            agg.total_requests,
+            agg.total_errors,
+            agg.active_connections,
+            agg.latency_min_us,
+            agg.latency_max_us,
+            agg.latency_avg_us,
+        }) catch {
+            error_response.sendError(self, .server_error, "health endpoint allocation failed");
+            return;
+        };
+
+        // Build HTTP response with Content-Type: application/json
+        const status_line: []const u8 = if (http_status == 200) "HTTP/1.1 200 OK\r\n" else "HTTP/1.1 503 Service Unavailable\r\n";
+        const content_length_str = std.fmt.allocPrint(alloc, "Content-Length: {d}\r\n", .{json.len}) catch {
+            error_response.sendError(self, .server_error, "health endpoint allocation failed");
+            return;
+        };
+
+        const response_text = std.mem.concat(alloc, u8, &.{
+            status_line,
+            "Content-Type: application/json\r\n",
+            content_length_str,
+            "\r\n",
+            json,
+        }) catch {
+            error_response.sendError(self, .server_error, "health endpoint allocation failed");
+            return;
+        };
+
+        self.logAccess(http_status);
+        self.sendRawResponse(response_text);
+    }
+
     fn onWrite(
         userdata: ?*anyopaque,
         loop: *xev.Loop,
@@ -534,6 +595,12 @@ pub const Connection = struct {
 
         self.state = .reading;
 
+        // During drain: close keep-alive connections after current request completes
+        if (self.server.draining) {
+            self.close();
+            return;
+        }
+
         // If there's leftover data in the buffer (HTTP pipelining), process it now
         if (self.read_buffer.availableRead() > 0) {
             self.sendResponse() catch |err| {
@@ -549,6 +616,9 @@ pub const Connection = struct {
     pub fn close(self: *Connection) void {
         if (self.state == .closing) return;
         self.state = .closing;
+        // Decrement active connection counters
+        _ = self.server.active_connections.fetchSub(1, .monotonic);
+        self.server.metrics.decrementActiveConnections();
         self.deinit(self.base_allocator);
     }
 };
