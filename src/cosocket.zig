@@ -257,6 +257,7 @@ fn submitConnect(self: *Connection, c: anytype, pending_op: IoEntry.Op) void {
         .userdata = self,
         .callback = onOutboundComplete,
     };
+    self.pending_completions += 1;
     self.loop.add(&s.completion);
 }
 
@@ -290,6 +291,7 @@ fn submitUdpConnect(self: *Connection, c: anytype) void {
         .userdata = self,
         .callback = onOutboundComplete,
     };
+    self.pending_completions += 1;
     self.loop.add(&s.completion);
 }
 
@@ -316,6 +318,7 @@ fn submitSend(self: *Connection, snd: anytype) void {
             .callback = onOutboundComplete,
         };
     }
+    self.pending_completions += 1;
     self.loop.add(&s.completion);
 }
 
@@ -354,6 +357,7 @@ fn submitRecv(self: *Connection, r: anytype) void {
         .userdata = self,
         .callback = onOutboundComplete,
     };
+    self.pending_completions += 1;
     self.loop.add(&s.completion);
 }
 
@@ -365,6 +369,7 @@ fn submitClose(self: *Connection, c: anytype) void {
         .userdata = self,
         .callback = onOutboundComplete,
     };
+    self.pending_completions += 1;
     self.loop.add(&s.completion);
 }
 
@@ -403,6 +408,37 @@ fn onOutboundComplete(
 ) xev.CallbackAction {
     _ = loop;
     const self = castUserdata(Connection, userdata);
+
+    // Decrement single-shot pending completion counter
+    self.pending_completions -= 1;
+
+    // Timeout cleanup: if the request timed out while this completion was in flight,
+    // discard the result and clean up resources without resuming the coroutine.
+    if (self.timed_out) {
+        if (self.suspended) |*s| {
+            // Close leaked outbound fd
+            if (s.outbound_fd != 0) {
+                std.posix.close(s.outbound_fd);
+                s.outbound_fd = 0;
+            }
+            // Free recv buffer if allocated
+            s.recv_buf = null;
+            // Unref pinned coroutine from Lua registry (prevents leak)
+            if (s.coroutine_ref != 0) {
+                self.lua_state.lua.unref(Lua.PseudoIndex.Registry, s.coroutine_ref);
+                s.coroutine_ref = 0;
+            }
+            // Clean up TLS conn if mid-handshake
+            if (s.outbound_tls) |tls_conn| {
+                tls_mod.freeTlsConn(self.base_allocator, tls_conn);
+                s.outbound_tls = null;
+            }
+            self.suspended = null;
+        }
+        self.maybeFinishClose();
+        return .disarm;
+    }
+
     const s = &self.suspended.?;
     const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
     const op = completion.op;
@@ -470,6 +506,7 @@ const TlsHandshakeState = struct {
             .callback = TlsHandshakeState.onSendComplete,
         };
         s.outbound_fd = th.fd;
+        self_conn.pending_completions += 1;
         self_conn.loop.add(&s.completion);
     }
 
@@ -485,6 +522,23 @@ const TlsHandshakeState = struct {
         _ = completion;
 
         const self_conn = castUserdata(Connection, userdata);
+
+        // Timeout: clean up TLS handshake state without resuming coroutine.
+        // Decrement pending_completions (incremented by TlsHandshakeState.submit).
+        if (self_conn.timed_out) {
+            self_conn.pending_completions -= 1;
+            TlsHandshakeState.cleanup(self_conn);
+            if (self_conn.suspended) |*s| {
+                if (s.coroutine_ref != 0) {
+                    self_conn.lua_state.lua.unref(Lua.PseudoIndex.Registry, s.coroutine_ref);
+                    s.coroutine_ref = 0;
+                }
+                self_conn.suspended = null;
+            }
+            self_conn.maybeFinishClose();
+            return .disarm;
+        }
+
         const s = &self_conn.suspended.?;
         const tls_conn = s.outbound_tls orelse {
             resumeWithError(self_conn, .upstream_error, "sslhandshake: missing tls state");
@@ -518,6 +572,26 @@ const TlsHandshakeState = struct {
         _ = completion;
 
         const self_conn = castUserdata(Connection, userdata);
+
+        // Timeout: clean up TLS handshake state without resuming coroutine.
+        // Note: recv during handshake uses the same pending_completions slot as the
+        // initial submit (no additional increment), so we only decrement on terminal exit.
+        // Since onSendComplete re-arms without decrement, and onRecvComplete is the recv
+        // step of the same handshake sequence, we decrement here on timed_out.
+        if (self_conn.timed_out) {
+            self_conn.pending_completions -= 1;
+            TlsHandshakeState.cleanup(self_conn);
+            if (self_conn.suspended) |*s| {
+                if (s.coroutine_ref != 0) {
+                    self_conn.lua_state.lua.unref(Lua.PseudoIndex.Registry, s.coroutine_ref);
+                    s.coroutine_ref = 0;
+                }
+                self_conn.suspended = null;
+            }
+            self_conn.maybeFinishClose();
+            return .disarm;
+        }
+
         const s = &self_conn.suspended.?;
         const tls_conn = s.outbound_tls orelse {
             resumeWithError(self_conn, .upstream_error, "sslhandshake: missing tls state");
@@ -1020,8 +1094,28 @@ fn onBatchComplete(
 }
 
 /// Check if all batch completions have arrived; if so, resume Lua with CQ count.
+/// If the request timed out, decrement pending_completions and call maybeFinishClose.
 fn batchCompletionCheck(self: *Connection) void {
     self.pending_completions -= 1;
+    if (self.timed_out) {
+        // Timeout cleanup: don't resume Lua, just drain completions
+        if (self.pending_completions == 0) {
+            // All completions drained — clean up suspended state and free connection
+            if (self.suspended) |*s| {
+                if (s.coroutine_ref != 0) {
+                    self.lua_state.lua.unref(Lua.PseudoIndex.Registry, s.coroutine_ref);
+                    s.coroutine_ref = 0;
+                }
+                if (s.outbound_fd != 0) {
+                    std.posix.close(s.outbound_fd);
+                    s.outbound_fd = 0;
+                }
+                self.suspended = null;
+            }
+        }
+        self.maybeFinishClose();
+        return;
+    }
     if (self.pending_completions == 0) {
         const s = &self.suspended.?;
         const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
