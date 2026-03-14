@@ -51,13 +51,14 @@ pub fn handleWsUpgrade(conn: *Connection, exchange: *HttpExchange, request: *con
         .on_message_ref = exchange.ws_on_message_ref,
         .on_close_ref = exchange.ws_on_close_ref,
     };
+    conn.state = .websocket;
     // Clear exchange refs so they aren't double-freed
     exchange.ws_on_message_ref = 0;
     exchange.ws_on_close_ref = 0;
 
     conn.logAccess(101);
 
-    // Send 101 — onWrite will detect ws_state and enter WS read loop
+    // Send 101 — onWrite dispatches via state enum to WS read loop
     try conn.writeResponseDirect(&resp);
 }
 

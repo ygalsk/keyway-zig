@@ -429,54 +429,60 @@ pub const Connection = struct {
     ) xev.CallbackAction {
         _ = loop;
         _ = completion;
-
         const self = castUserdata(Connection, userdata);
-
         const bytes_written = result.send catch |err| {
             std.log.err("[fd={d}] send failed err={}", .{ self.socket, err });
             self.close();
             return .disarm;
         };
-
-        // WebSocket upgrade: after 101 is sent, switch to WS frame loop
-        if (self.ws_state != null) {
-            std.log.debug("ws: 101 sent ({d} bytes written), entering WS mode. raw_len={d} buf_avail_read={d} buf_avail_write={d}", .{
-                bytes_written,
-                self.request_raw_len,
-                self.read_buffer.availableRead(),
-                self.read_buffer.availableWrite(),
-            });
-            _ = self.arena.reset(.retain_capacity);
-            // Consume the HTTP request bytes
-            if (self.request_raw_len > 0) {
-                self.read_buffer.consume(self.request_raw_len);
-                self.request_raw_len = 0;
-            } else {
-                self.read_buffer.reset();
-            }
-            if (self.ciphertext_buffer) |*cb| cb.reset();
-            std.log.debug("ws: starting WS read loop. buf_avail_read={d} buf_avail_write={d}", .{
-                self.read_buffer.availableRead(),
-                self.read_buffer.availableWrite(),
-            });
-            // If the client sent WS data in the same TCP segment as the HTTP
-            // upgrade request, process it now instead of waiting for another recv.
-            if (self.read_buffer.availableRead() > 0) {
-                conn_ws.processWsFrames(self);
-            } else {
-                conn_ws.startWsRead(self);
-            }
-            return .disarm;
+        switch (self.state) {
+            .websocket => self.handleWsPostWrite(bytes_written),
+            .sse => self.handleSsePostWrite(),
+            else => self.handleHttpPostWrite(bytes_written),
         }
+        return .disarm;
+    }
 
-        // SSE upgrade: after headers are sent, subscribe and start disconnect watch
-        if (self.sse_state != null) {
-            // SSE headers already sent — start watching for client disconnect
-            conn_sse.startSseDisconnectWatch(self);
-            return .disarm;
+    /// Post-write handler for WebSocket upgrade: reset arena, consume HTTP bytes,
+    /// enter WS frame read loop.
+    fn handleWsPostWrite(self: *Connection, bytes_written: usize) void {
+        std.debug.assert(self.ws_state != null);
+        std.log.debug("ws: 101 sent ({d} bytes written), entering WS mode. raw_len={d} buf_avail_read={d} buf_avail_write={d}", .{
+            bytes_written,
+            self.request_raw_len,
+            self.read_buffer.availableRead(),
+            self.read_buffer.availableWrite(),
+        });
+        _ = self.arena.reset(.retain_capacity);
+        if (self.request_raw_len > 0) {
+            self.read_buffer.consume(self.request_raw_len);
+            self.request_raw_len = 0;
+        } else {
+            self.read_buffer.reset();
         }
+        if (self.ciphertext_buffer) |*cb| cb.reset();
+        std.log.debug("ws: starting WS read loop. buf_avail_read={d} buf_avail_write={d}", .{
+            self.read_buffer.availableRead(),
+            self.read_buffer.availableWrite(),
+        });
+        // If the client sent WS data in the same TCP segment as the HTTP
+        // upgrade request, process it now instead of waiting for another recv.
+        if (self.read_buffer.availableRead() > 0) {
+            conn_ws.processWsFrames(self);
+        } else {
+            conn_ws.startWsRead(self);
+        }
+    }
 
-        // Reset for next request (HTTP/1.1 keep-alive)
+    /// Post-write handler for SSE upgrade: start watching for client disconnect.
+    fn handleSsePostWrite(self: *Connection) void {
+        std.debug.assert(self.sse_state != null);
+        conn_sse.startSseDisconnectWatch(self);
+    }
+
+    /// Post-write handler for HTTP responses: reset state for keep-alive,
+    /// handle pipelining.
+    fn handleHttpPostWrite(self: *Connection, bytes_written: usize) void {
         self.suspended = null;
         self.sq.reset();
         self.cq.reset();
@@ -508,13 +514,11 @@ pub const Connection = struct {
             self.sendResponse() catch |err| {
                 std.log.err("[fd={d}] pipelined response dispatch failed err={}", .{ self.socket, err });
                 self.close();
-                return .disarm;
             };
         } else {
             self.read_buffer.reset();
             self.startRead();
         }
-        return .disarm;
     }
 
     pub fn close(self: *Connection) void {

@@ -26,14 +26,16 @@ pub fn handleSseUpgrade(self: *Connection, exchange: *HttpExchange) void {
         return;
     };
 
-    // Set SSE state before sending headers (onWrite checks this)
+    // Set SSE state before sending headers (onWrite dispatches via state enum)
     self.sse_state = .{ .room = room_dupe };
+    self.state = .sse;
 
     // Subscribe to SSE registry
     if (self.sse_registry) |reg| {
         reg.subscribe(room_dupe, self) catch {
             self.base_allocator.free(room_dupe);
             self.sse_state = null;
+            self.state = .processing;
             self.send500InternalError();
             return;
         };
