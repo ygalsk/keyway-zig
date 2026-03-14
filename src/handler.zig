@@ -93,6 +93,9 @@ pub const Connection = struct {
     sse_writing: bool = false,
     sse_disconnect_completion: xev.Completion = undefined,
 
+    // Body size tracking: accumulated bytes for streaming body enforcement
+    body_bytes_received: u64 = 0,
+
     // Connection state machine
     state: State = .reading,
 
@@ -240,6 +243,16 @@ pub const Connection = struct {
 
         // Plaintext path
         self.read_buffer.commitWrite(bytes_read);
+
+        // Streaming body size enforcement: track accumulated bytes and reject if over limit.
+        // Only applies in .reading state (not WebSocket or SSE, which are long-lived).
+        if (self.state == .reading) {
+            self.body_bytes_received += bytes_read;
+            if (self.body_bytes_received > config.MAX_BODY_SIZE) {
+                error_response.sendErrorStatus(self, 413, "streaming body exceeds size limit");
+                return .disarm;
+            }
+        }
 
         self.sendResponse() catch |err| {
             std.log.err("[fd={d}] response dispatch failed err={}", .{ self.socket, err });
@@ -515,6 +528,9 @@ pub const Connection = struct {
 
         // Reset ciphertext buffer but NOT tls_conn — TLS session persists across keep-alive
         if (self.ciphertext_buffer) |*cb| cb.reset();
+
+        // Reset body tracking for next request on keep-alive
+        self.body_bytes_received = 0;
 
         self.state = .reading;
 
