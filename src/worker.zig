@@ -8,6 +8,10 @@ const lua_api = @import("lua_api.zig");
 const sse = @import("sse.zig");
 const SseRegistry = sse.SseRegistry;
 const SseBroadcastBus = sse.SseBroadcastBus;
+const ShutdownCoordinator = @import("shutdown.zig").ShutdownCoordinator;
+const metrics_mod = @import("metrics.zig");
+const WorkerMetrics = metrics_mod.WorkerMetrics;
+const config = @import("config.zig");
 
 /// Pin calling thread to specified CPU core (Linux-only)
 /// This is architecturally required for proactor systems to ensure:
@@ -47,25 +51,31 @@ pub const Worker = struct {
         num_workers: usize,
         bpf_ready: *std.atomic.Value(bool),
         sse_bus: ?*SseBroadcastBus,
+        coordinator: ?*ShutdownCoordinator,
+        metrics: *WorkerMetrics,
     };
 
     /// Spawn a worker thread
     pub fn spawn(
         allocator: std.mem.Allocator,
-        config: Server.Config,
+        server_config: Server.Config,
         worker_id: usize,
         num_workers: usize,
         bpf_ready: *std.atomic.Value(bool),
         sse_bus: ?*SseBroadcastBus,
+        coordinator: ?*ShutdownCoordinator,
+        worker_metrics: *WorkerMetrics,
     ) !Worker {
         const ctx = try allocator.create(Context);
         ctx.* = Context{
             .allocator = allocator,
-            .config = config,
+            .config = server_config,
             .worker_id = worker_id,
             .num_workers = num_workers,
             .bpf_ready = bpf_ready,
             .sse_bus = sse_bus,
+            .coordinator = coordinator,
+            .metrics = worker_metrics,
         };
 
         const thread = try std.Thread.spawn(.{}, workerMain, .{ctx});
@@ -73,7 +83,7 @@ pub const Worker = struct {
         return Worker{
             .allocator = allocator,
             .thread = thread,
-            .config = config,
+            .config = server_config,
             .router = undefined, // Each worker creates its own router
             .worker_id = worker_id,
         };
@@ -167,8 +177,23 @@ pub const Worker = struct {
             @intCast(ctx.worker_id),
             ctx.bpf_ready,
             &sse_registry,
+            ctx.metrics,
         );
         defer server.deinit();
+
+        // Register shutdown Async watcher (fires when coordinator signals drain)
+        var shutdown_completion: xev.Completion = undefined;
+        var drain_timer_completion: xev.Completion = .{};
+        if (ctx.coordinator) |coord| {
+            const async_watcher = coord.getAsync(ctx.worker_id);
+            const shutdown_ctx = try ctx.allocator.create(ShutdownContext);
+            shutdown_ctx.* = .{
+                .server = &server,
+                .coordinator = coord,
+                .drain_timer_completion = &drain_timer_completion,
+            };
+            async_watcher.wait(&loop, &shutdown_completion, ShutdownContext, shutdown_ctx, onShutdownSignal);
+        }
 
         std.log.info("Worker {d} ready on port {d}", .{ ctx.worker_id, ctx.config.port });
 
@@ -180,19 +205,83 @@ pub const Worker = struct {
     }
 };
 
+/// Context for shutdown signal callback.
+const ShutdownContext = struct {
+    server: *Server,
+    coordinator: *ShutdownCoordinator,
+    drain_timer_completion: *xev.Completion,
+};
+
+/// xev.Async callback — fires on the worker's event loop when shutdown signal received.
+fn onShutdownSignal(
+    ctx_opt: ?*ShutdownContext,
+    loop: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Async.WaitError!void,
+) xev.CallbackAction {
+    _ = r catch return .disarm;
+    const ctx = ctx_opt orelse return .disarm;
+
+    if (ctx.coordinator.isForceShutdown()) {
+        std.log.info("Force shutdown — closing all connections immediately", .{});
+        ctx.server.forceCloseAll();
+        return .disarm;
+    }
+
+    std.log.info("Shutting down...", .{});
+    ctx.server.stopAccepting();
+    ctx.server.closeIdleConnections();
+
+    const active = ctx.server.active_connections.load(.monotonic);
+    std.log.info("Draining {d} active connections (deadline {d}ms)", .{ active, config.DRAIN_DEADLINE_MS });
+
+    if (active == 0) {
+        std.log.info("Shutdown complete — no active connections", .{});
+        return .disarm;
+    }
+
+    // Start drain deadline timer
+    loop.timer(ctx.drain_timer_completion, config.DRAIN_DEADLINE_MS, ctx.server, onDrainDeadline);
+
+    // Re-arm to catch second signal (force shutdown)
+    return .rearm;
+}
+
+/// Drain deadline expired — force-close all remaining connections.
+fn onDrainDeadline(
+    userdata: ?*anyopaque,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    _: xev.Result,
+) xev.CallbackAction {
+    if (userdata) |ud| {
+        const server: *Server = @ptrCast(@alignCast(ud));
+        const remaining = server.active_connections.load(.monotonic);
+        if (remaining > 0) {
+            std.log.info("Drain deadline expired — force-closing {d} connections", .{remaining});
+            server.forceCloseAll();
+        }
+    }
+    std.log.info("Shutdown complete", .{});
+    return .disarm;
+}
+
 /// Thread pool manager
 pub const ThreadPool = struct {
     allocator: std.mem.Allocator,
     workers: []Worker,
     bpf_ready: *std.atomic.Value(bool),
     sse_bus: ?*SseBroadcastBus,
+    coordinator: ?*ShutdownCoordinator = null,
+    worker_metrics: []WorkerMetrics,
 
     /// Create thread pool with the given number of workers.
     /// Pass worker_count=0 to auto-detect (one worker per CPU core).
     pub fn init(
         allocator: std.mem.Allocator,
-        config: Server.Config,
+        server_config: Server.Config,
         worker_count: u16,
+        coordinator: ?*ShutdownCoordinator,
     ) !ThreadPool {
         const num_cpus = try std.Thread.getCpuCount();
         const num_workers: usize = if (worker_count > 0) @intCast(worker_count) else num_cpus;
@@ -200,6 +289,13 @@ pub const ThreadPool = struct {
 
         const workers = try allocator.alloc(Worker, num_workers);
         errdefer allocator.free(workers);
+
+        // Create per-worker metrics (allocated here so pointers remain stable)
+        const worker_metrics = try allocator.alloc(WorkerMetrics, num_workers);
+        errdefer allocator.free(worker_metrics);
+        for (worker_metrics) |*m| {
+            m.* = WorkerMetrics.init();
+        }
 
         // Create BPF synchronization flag
         const bpf_ready = try allocator.create(std.atomic.Value(bool));
@@ -211,7 +307,7 @@ pub const ThreadPool = struct {
 
         // Spawn workers
         for (workers, 0..) |*worker, i| {
-            worker.* = try Worker.spawn(allocator, config, i, num_workers, bpf_ready, sse_bus);
+            worker.* = try Worker.spawn(allocator, server_config, i, num_workers, bpf_ready, sse_bus, coordinator, &worker_metrics[i]);
         }
 
         return ThreadPool{
@@ -219,6 +315,8 @@ pub const ThreadPool = struct {
             .workers = workers,
             .bpf_ready = bpf_ready,
             .sse_bus = sse_bus,
+            .coordinator = coordinator,
+            .worker_metrics = worker_metrics,
         };
     }
 
@@ -233,6 +331,7 @@ pub const ThreadPool = struct {
     pub fn deinit(self: *ThreadPool) void {
         if (self.sse_bus) |bus| bus.deinit();
         self.allocator.destroy(self.bpf_ready);
+        self.allocator.free(self.worker_metrics);
         self.allocator.free(self.workers);
     }
 };

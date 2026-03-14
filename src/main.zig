@@ -3,6 +3,7 @@ const log = @import("log.zig");
 const cli = @import("cli.zig");
 const Server = @import("server.zig").Server;
 const ThreadPool = @import("worker.zig").ThreadPool;
+const shutdown = @import("shutdown.zig");
 
 pub const version = "0.1.0";
 
@@ -62,8 +63,19 @@ pub fn main() !void {
         .tls_key_path = tls_key,
     };
 
-    // Create thread pool (workers=0 means auto-detect CPU count)
-    var pool = try ThreadPool.init(allocator, server_config, cli_config.workers);
+    // Determine worker count (0 means auto-detect CPU count)
+    const num_cpus = try std.Thread.getCpuCount();
+    const num_workers: usize = if (cli_config.workers > 0) @intCast(cli_config.workers) else num_cpus;
+
+    // Create shutdown coordinator before spawning workers (one Async per worker)
+    var coordinator = try shutdown.ShutdownCoordinator.init(allocator, num_workers);
+    defer coordinator.deinit();
+
+    // Register SIGTERM/SIGINT handlers (first signal drains, second force-kills)
+    shutdown.registerSignalHandlers(&coordinator);
+
+    // Create thread pool — workers receive coordinator for drain integration
+    var pool = try ThreadPool.init(allocator, server_config, cli_config.workers, &coordinator);
     defer pool.deinit();
 
     std.log.info("Keyway - Ready on {s}:{d} (press Ctrl+C to stop)", .{ server_config.host, server_config.port });
@@ -76,4 +88,5 @@ pub fn main() !void {
 // Modules not transitively imported from main must be listed here.
 comptime {
     _ = @import("metrics.zig");
+    _ = @import("shutdown.zig");
 }

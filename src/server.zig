@@ -8,6 +8,7 @@ const TlsContext = @import("tls.zig").TlsContext;
 const castUserdata = @import("helpers.zig").castUserdata;
 const SseRegistry = @import("sse.zig").SseRegistry;
 const tuning = @import("config.zig");
+const WorkerMetrics = @import("metrics.zig").WorkerMetrics;
 
 // TCP socket configuration
 const DEFAULT_BACKLOG = tuning.DEFAULT_BACKLOG;
@@ -24,6 +25,9 @@ pub const Server = struct {
     lua_state: *LuaState,
     tls_ctx: ?TlsContext,
     sse_registry: ?*SseRegistry,
+    metrics: *WorkerMetrics,
+    draining: bool = false,
+    active_connections: std.atomic.Value(u32) = std.atomic.Value(u32).init(0),
 
     /// Server configuration
     pub const Config = struct {
@@ -45,6 +49,7 @@ pub const Server = struct {
         worker_id: u32,
         bpf_ready: ?*std.atomic.Value(bool),
         sse_registry: ?*SseRegistry,
+        metrics: *WorkerMetrics,
     ) !Server {
         // Parse address
         const addr = try std.net.Address.parseIp(config.host, config.port);
@@ -128,6 +133,7 @@ pub const Server = struct {
             .lua_state = lua_state,
             .tls_ctx = tls_ctx,
             .sse_registry = sse_registry,
+            .metrics = metrics,
         };
     }
 
@@ -160,10 +166,18 @@ pub const Server = struct {
         const self = castUserdata(Server, userdata);
 
         const client_socket = result.accept catch |err| {
+            // During shutdown, accept errors are expected (listen socket closed)
+            if (self.draining) return .disarm;
             std.log.err("accept failed err={}", .{err});
             self.acceptNext();
             return .disarm;
         };
+
+        // If draining, reject new connections
+        if (self.draining) {
+            std.posix.close(client_socket);
+            return .disarm;
+        }
 
         // Set TCP_NODELAY to disable Nagle's algorithm (reduce latency)
         std.posix.setsockopt(
@@ -174,6 +188,10 @@ pub const Server = struct {
         ) catch |err| {
             std.log.err("setsockopt TCP_NODELAY failed err={}", .{err});
         };
+
+        // Track active connections (for health endpoint and drain logging)
+        _ = self.active_connections.fetchAdd(1, .monotonic);
+        self.metrics.incrementActiveConnections();
 
         // Create connection handler
         const conn = Connection.init(
@@ -208,10 +226,33 @@ pub const Server = struct {
         return .disarm;
     }
 
+    /// Stop accepting new connections (called on drain signal).
+    pub fn stopAccepting(self: *Server) void {
+        self.draining = true;
+    }
+
+    /// Close idle keep-alive connections (no in-flight request).
+    /// Currently a no-op; connections check draining flag in post-write path.
+    pub fn closeIdleConnections(_: *Server) void {
+        // Idle keep-alive connections will close after their current request
+        // completes, because handleHttpPostWrite checks server.draining.
+        // There's no connection list to iterate — xev tracks armed completions.
+    }
+
+    /// Force-close all connections by closing the listen socket.
+    /// Armed completions on the listen fd will fail, cascading cleanup.
+    pub fn forceCloseAll(self: *Server) void {
+        // Closing the listen socket causes pending accept to fail.
+        // Individual connections will get errors on their next I/O.
+        std.posix.close(self.socket);
+        // Re-assign to invalid fd to prevent double-close in deinit
+        self.socket = -1;
+    }
+
     /// Clean up server resources
     pub fn deinit(self: *Server) void {
         if (self.tls_ctx) |*tc| tc.deinit();
-        std.posix.close(self.socket);
+        if (self.socket != -1) std.posix.close(self.socket);
     }
 };
 
@@ -227,11 +268,12 @@ test "server init and deinit" {
     var lua_state = try LuaState.init(allocator);
     defer lua_state.deinit();
 
-    const config = Server.Config{
+    const server_config = Server.Config{
         .host = "127.0.0.1",
         .port = 0, // Let OS assign port
     };
 
-    var server = try Server.init(allocator, &loop, config, &router, &lua_state, 1, 0, null, null);
+    var test_metrics = WorkerMetrics.init();
+    var server = try Server.init(allocator, &loop, server_config, &router, &lua_state, 1, 0, null, null, &test_metrics);
     defer server.deinit();
 }
