@@ -5,6 +5,8 @@
 //!
 //! Batch path: submitBatchConnect/submitBatchUdpConnect are called from
 //! drainSubmissionRing in cosocket.zig for batched I/O.
+//!
+//! After kTLS: send/recv are plaintext — the kernel handles crypto transparently.
 
 const std = @import("std");
 const xev = @import("xev");
@@ -33,7 +35,7 @@ const error_response = @import("error_response.zig");
 const ErrorCategory = error_response.ErrorCategory;
 
 // ============================================================================
-// Shared error infrastructure (moved from cosocket.zig)
+// Shared error infrastructure
 // ============================================================================
 
 /// Result of an interpret function: how many Lua values were pushed, and
@@ -52,15 +54,6 @@ pub fn pushErrorTable(thread: *Lua, category: ErrorCategory, msg: [:0]const u8) 
     thread.setField(-2, "category");
     thread.pushString(msg);
     thread.setField(-2, "message");
-}
-
-/// Format a TLS decrypt error into a static sentinel-terminated string for Lua.
-/// Includes SSL_ERROR code and first ERR queue message if available.
-pub fn tlsErrorMsg(comptime prefix: []const u8, de: TlsConn.DecryptError) [:0]const u8 {
-    if (de.msg_len > 0) {
-        return prefix ++ ": tls decrypt failed (see server log for SSL details)";
-    }
-    return prefix ++ ": tls decrypt failed";
 }
 
 // ============================================================================
@@ -101,15 +94,12 @@ pub fn interpretSend(thread: *Lua, result: xev.Result) InterpretResult {
     return .{ .nresults = 1 };
 }
 
-/// Interpret a recv completion, handling TLS decryption.
-/// On failure or TLS error: pushes error table. On want_read: re-submits recv (done=false).
-/// On success: pushes data string.
+/// Interpret a recv completion.
+/// After kTLS, recv data is already plaintext — no decryption needed.
 pub fn interpretRecv(
     thread: *Lua,
     s: *SuspendedState,
     result: xev.Result,
-    self: *Connection,
-    fd: std.posix.socket_t,
 ) InterpretResult {
     const bytes_read = result.recv catch {
         s.recv_buf = null;
@@ -117,42 +107,7 @@ pub fn interpretRecv(
         return .{ .nresults = 2 };
     };
     if (s.recv_buf) |buf| {
-        if (self.lua_state.getTls(fd)) |tls_conn| {
-            tls_conn.feedCiphertext(buf[0..bytes_read]);
-            var plaintext_buf: [tls_mod.TLS_RECORD_MAX_SIZE]u8 = undefined;
-            switch (tls_conn.decrypt(&plaintext_buf)) {
-                .data => |n| {
-                    thread.pushLString(plaintext_buf[0..n]);
-                    s.recv_buf = null;
-                    return .{ .nresults = 1 };
-                },
-                .want_read => {
-                    // Need more ciphertext — re-submit recv without resuming Lua.
-                    // Re-increment pending_completions because onOutboundComplete
-                    // already decremented it before calling interpretRecv.
-                    s.completion = .{
-                        .op = .{ .recv = .{ .fd = fd, .buffer = .{ .slice = buf } } },
-                        .userdata = self,
-                        .callback = cosocket.onOutboundComplete,
-                    };
-                    self.cs.pending_completions += 1;
-                    self.loop.add(&s.completion);
-                    return .{ .nresults = 0, .done = false };
-                },
-                .zero_return => {
-                    s.recv_buf = null;
-                    pushErrorTable(thread, .upstream_error, "recv: tls connection closed");
-                    return .{ .nresults = 2 };
-                },
-                .err => |de| {
-                    s.recv_buf = null;
-                    pushErrorTable(thread, .upstream_error, tlsErrorMsg("recv", de));
-                    return .{ .nresults = 2 };
-                },
-            }
-        } else {
-            thread.pushLString(buf[0..bytes_read]);
-        }
+        thread.pushLString(buf[0..bytes_read]);
     } else {
         thread.pushNil();
     }
@@ -170,17 +125,6 @@ pub fn interpretClose(thread: *Lua, s: *SuspendedState, result: xev.Result) Inte
     s.outbound_fd = 0;
     thread.pushInteger(1);
     return .{ .nresults = 1 };
-}
-
-// ============================================================================
-// Encrypt/TLS helpers
-// ============================================================================
-
-/// Encrypt plaintext via TLS and drain into an allocated buffer.
-/// Returns ciphertext slice, or null on encrypt/alloc failure.
-pub fn tlsEncryptAlloc(tc: *TlsConn, plaintext: []const u8, allocator: std.mem.Allocator) ?[]u8 {
-    tc.encrypt(plaintext) catch return null;
-    return tc.drainAllAlloc(allocator) catch null;
 }
 
 // -- Single-shot submit functions --
@@ -202,10 +146,10 @@ fn createTcpSocket(self: *Connection, host: []const u8, port: u16, comptime err_
     return .{ .sock = sock, .addr = addr };
 }
 
-pub fn submitConnect(self: *Connection, c: anytype, pending_op: IoEntry.Op) void {
+pub fn submitConnect(self: *Connection, conn: anytype, pending_op: IoEntry.Op) void {
     const s = &self.cs.suspended.?;
     s.pending_op = pending_op;
-    const result = createTcpSocket(self, c.host, c.port, "connect: ") orelse return;
+    const result = createTcpSocket(self, conn.host, conn.port, "connect: ") orelse return;
     s.outbound_fd = result.sock;
     s.completion = .{
         .op = .{ .connect = .{ .socket = result.sock, .addr = result.addr } },
@@ -216,7 +160,7 @@ pub fn submitConnect(self: *Connection, c: anytype, pending_op: IoEntry.Op) void
     self.loop.add(&s.completion);
 }
 
-pub fn submitUdpConnect(self: *Connection, c: anytype) void {
+pub fn submitUdpConnect(self: *Connection, conn: anytype) void {
     const s = &self.cs.suspended.?;
     s.pending_op = .udp_connect;
     const sock = std.posix.socket(
@@ -227,15 +171,15 @@ pub fn submitUdpConnect(self: *Connection, c: anytype) void {
         cosocket.resumeWithError(self, .upstream_error, "udp_connect: socket creation failed");
         return;
     };
-    if (c.timeout_ms > 0) {
+    if (conn.timeout_ms > 0) {
         const tv = std.posix.timeval{
-            .sec = @intCast(c.timeout_ms / 1000),
-            .usec = @intCast((c.timeout_ms % 1000) * 1000),
+            .sec = @intCast(conn.timeout_ms / 1000),
+            .usec = @intCast((conn.timeout_ms % 1000) * 1000),
         };
         _ = std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
     }
     s.outbound_fd = sock;
-    const addr = std.net.Address.parseIp4(c.host, c.port) catch {
+    const addr = std.net.Address.parseIp4(conn.host, conn.port) catch {
         std.posix.close(sock);
         s.outbound_fd = 0;
         cosocket.resumeWithError(self, .upstream_error, "udp_connect: invalid address");
@@ -250,58 +194,25 @@ pub fn submitUdpConnect(self: *Connection, c: anytype) void {
     self.loop.add(&s.completion);
 }
 
+/// Submit plaintext send — kernel encrypts if kTLS is active.
 pub fn submitSend(self: *Connection, snd: anytype) void {
     const s = &self.cs.suspended.?;
     const data = self.arena.allocator().dupe(u8, snd.data) catch {
         cosocket.resumeWithError(self, .server_error, "send: arena alloc failed");
         return;
     };
-    if (self.lua_state.getTls(snd.fd)) |tls_conn| {
-        const ciphertext = tlsEncryptAlloc(tls_conn, data, self.arena.allocator()) orelse {
-            cosocket.resumeWithError(self, .upstream_error, "send: tls encrypt failed");
-            return;
-        };
-        s.completion = .{
-            .op = .{ .send = .{ .fd = snd.fd, .buffer = .{ .slice = ciphertext } } },
-            .userdata = self,
-            .callback = cosocket.onOutboundComplete,
-        };
-    } else {
-        s.completion = .{
-            .op = .{ .send = .{ .fd = snd.fd, .buffer = .{ .slice = data } } },
-            .userdata = self,
-            .callback = cosocket.onOutboundComplete,
-        };
-    }
+    s.completion = .{
+        .op = .{ .send = .{ .fd = snd.fd, .buffer = .{ .slice = data } } },
+        .userdata = self,
+        .callback = cosocket.onOutboundComplete,
+    };
     self.cs.pending_completions += 1;
     self.loop.add(&s.completion);
 }
 
+/// Submit plaintext recv — kernel decrypts if kTLS is active.
 pub fn submitRecv(self: *Connection, r: anytype) void {
     const s = &self.cs.suspended.?;
-    // Check if BoringSSL already has buffered plaintext before issuing kernel recv
-    if (self.lua_state.getTls(r.fd)) |tls_conn| {
-        if (tls_conn.hasPending()) {
-            var plaintext_buf: [tls_mod.TLS_RECORD_MAX_SIZE]u8 = undefined;
-            switch (tls_conn.decrypt(&plaintext_buf)) {
-                .data => |n| {
-                    const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
-                    thread.pushLString(plaintext_buf[0..n]);
-                    cosocket.dispatchResume(self, thread, 1, s.exchange);
-                    return;
-                },
-                .want_read => {},
-                .zero_return => {
-                    cosocket.resumeWithError(self, .upstream_error, "recv: tls connection closed");
-                    return;
-                },
-                .err => |de| {
-                    cosocket.resumeWithTlsError(self, "recv", de);
-                    return;
-                },
-            }
-        }
-    }
     const buf = self.arena.allocator().alloc(u8, r.max_len) catch {
         cosocket.resumeWithError(self, .server_error, "recv: alloc failed");
         return;
@@ -316,11 +227,10 @@ pub fn submitRecv(self: *Connection, r: anytype) void {
     self.loop.add(&s.completion);
 }
 
-pub fn submitClose(self: *Connection, c: anytype) void {
+pub fn submitClose(self: *Connection, cl: anytype) void {
     const s = &self.cs.suspended.?;
-    self.lua_state.removeTls(c.fd);
     s.completion = .{
-        .op = .{ .close = .{ .fd = c.fd } },
+        .op = .{ .close = .{ .fd = cl.fd } },
         .userdata = self,
         .callback = cosocket.onOutboundComplete,
     };
@@ -340,6 +250,7 @@ pub fn submitTlsHandshake(self: *Connection, th: anytype) void {
         cosocket.resumeWithError(self, .upstream_error, "sslhandshake: tls init failed");
         return;
     };
+    tls_conn.fixupExData();
     if (th.sni_host) |host| {
         const host_z = self.arena.allocator().dupeZ(u8, host) catch {
             tls_mod.freeTlsConn(self.base_allocator, tls_conn);
@@ -376,12 +287,12 @@ pub fn submitOutboundIO(self: *Connection) void {
     self.lua_state.pending_io = null;
 
     switch (pending) {
-        .connect => |c| submitConnect(self, c, .connect),
-        .pool_connect => |c| submitConnect(self, c, .pool_connect),
-        .udp_connect => |c| submitUdpConnect(self, c),
+        .connect => |conn| submitConnect(self, conn, .connect),
+        .pool_connect => |conn| submitConnect(self, conn, .pool_connect),
+        .udp_connect => |conn| submitUdpConnect(self, conn),
         .send => |snd| submitSend(self, snd),
         .recv => |r| submitRecv(self, r),
-        .close => |c| submitClose(self, c),
+        .close => |cl| submitClose(self, cl),
         .tls_handshake => |th| submitTlsHandshake(self, th),
         .setkeepalive => cosocket.resumeWithError(self, .server_error, "setkeepalive: not valid as pending I/O"),
         .none => cosocket.resumeWithError(self, .server_error, "no pending I/O operation"),
@@ -462,26 +373,6 @@ pub fn submitBatchUdpConnect(self: *Connection, host: []const u8, port: u16, tim
 // ============================================================================
 // Tests
 // ============================================================================
-
-test "tlsErrorMsg includes detail suffix when msg_len > 0" {
-    const de = TlsConn.DecryptError{ .ssl_error = 1, .msg_len = 5 };
-    const msg = tlsErrorMsg("recv", de);
-    try std.testing.expectEqualStrings("recv: tls decrypt failed (see server log for SSL details)", msg);
-}
-
-test "tlsErrorMsg returns base message when msg_len == 0" {
-    const de = TlsConn.DecryptError{ .ssl_error = 1, .msg_len = 0 };
-    const msg = tlsErrorMsg("recv", de);
-    try std.testing.expectEqualStrings("recv: tls decrypt failed", msg);
-}
-
-test "tlsErrorMsg works with different prefixes" {
-    const de_with = TlsConn.DecryptError{ .ssl_error = 1, .msg_len = 1 };
-    try std.testing.expectEqualStrings("send: tls decrypt failed (see server log for SSL details)", tlsErrorMsg("send", de_with));
-
-    const de_without = TlsConn.DecryptError{ .ssl_error = 1, .msg_len = 0 };
-    try std.testing.expectEqualStrings("send: tls decrypt failed", tlsErrorMsg("send", de_without));
-}
 
 test "InterpretResult defaults done to true" {
     const ir = InterpretResult{ .nresults = 1 };

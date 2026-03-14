@@ -3,8 +3,6 @@ const Lua = @import("luajit").Lua;
 const LuaState = @import("lua_state.zig").LuaState;
 const castUserdata = @import("helpers.zig").castUserdata;
 const IoEntry = @import("ring.zig").IoEntry;
-const tls_mod = @import("tls.zig");
-const TlsConn = tls_mod.TlsConn;
 
 extern "c" fn lua_yield(L: *anyopaque, nresults: c_int) c_int;
 
@@ -200,14 +198,8 @@ pub fn keyway_pool_connect(lua: *Lua) callconv(.c) c_int {
     const pool_name = std.mem.span(pool_name_cstr);
 
     // Try pool first (synchronous path)
+    // After kTLS, pooled connections are plain fds — kernel handles crypto.
     if (state.pool.get(pool_name)) |entry| {
-        // Restore TLS state from pool if present
-        if (entry.tls_conn) |tls_conn| {
-            state.registerTls(entry.fd, tls_conn) catch {
-                // TLS map insert failed — free TLS state, still return the fd
-                tls_mod.freeTlsConn(state.allocator, tls_conn);
-            };
-        }
         lua.pushInteger(@intCast(entry.fd));
         lua.pushInteger(@intCast(entry.reuse_count + 1));
         return 2; // No yield — return fd and reuse_count directly
@@ -240,16 +232,13 @@ pub fn keyway_pool_setkeepalive(lua: *Lua) callconv(.c) c_int {
 
     const fd: std.posix.socket_t = @intCast(fd_raw);
 
-    // Transfer TLS state from tls_map to pool if present
-    const tls_ptr: ?*TlsConn = state.detachTls(fd);
-
+    // After kTLS, no TLS state to transfer — kernel handles crypto.
     state.pool.put(
         std.mem.span(pool_name_cstr),
         fd,
         @intCast(reuse_raw),
         @intCast(timeout_raw),
         @intCast(size_raw),
-        tls_ptr,
     ) catch {
         lua.pushNil();
         lua.pushString("setkeepalive: pool put failed");

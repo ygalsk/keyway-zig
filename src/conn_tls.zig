@@ -13,6 +13,7 @@ const CIPHERTEXT_BUFFER_SIZE = config.CIPHERTEXT_BUFFER_SIZE;
 /// Initialize TLS on this connection. Called from onAccept when TLS is configured.
 pub fn initTls(self: *Connection, tls_ctx: *TlsContext) !void {
     self.tls_state.tls_conn = try TlsConn.init(self.base_allocator, tls_ctx.ctx, .server);
+    self.tls_state.tls_conn.?.fixupExData();
     self.tls_state.ciphertext_buffer = try LinearBuffer.init(self.base_allocator, CIPHERTEXT_BUFFER_SIZE);
 }
 
@@ -27,29 +28,27 @@ pub fn handleTlsHandshake(self: *Connection, tc: *TlsConn) void {
     }
 
     switch (hs_result) {
-        .complete => self.startRead(), // handshake done, read first HTTP data
+        .complete => completeHandshake(self),
         .want_read => self.startRead(), // need more handshake data from client
         .failed => self.close(),
     }
 }
 
-/// Decrypt application data from the TLS engine after handshake is established.
-pub fn handleTlsDecrypt(self: *Connection, tc: *TlsConn) void {
-    const out = self.read_buffer.writeSlice();
-    if (out.len == 0) {
-        self.send400BadRequest();
+/// Handshake done: set up kTLS, free TLS state, start plaintext reads.
+fn completeHandshake(self: *Connection) void {
+    const tc = &self.tls_state.tls_conn.?;
+    tc.setupKtls(self.socket) catch {
+        self.close();
         return;
+    };
+    // Free TLS state — kernel handles crypto now
+    tc.deinit(self.base_allocator);
+    self.tls_state.tls_conn = null;
+    if (self.tls_state.ciphertext_buffer) |*cb| {
+        cb.deinit();
+        self.tls_state.ciphertext_buffer = null;
     }
-    switch (tc.decrypt(out)) {
-        .data => |n| {
-            self.read_buffer.commitWrite(n);
-            // Streaming body size enforcement for TLS connections
-            if (self.state == .reading and self.checkBodySizeExceeded(n)) return;
-            self.handleRequest();
-        },
-        .want_read => self.startRead(),
-        .zero_return, .err => self.close(),
-    }
+    self.startRead();
 }
 
 /// Send TLS handshake/ciphertext data over the wire.
@@ -59,7 +58,7 @@ fn sendTlsData(self: *Connection, handshake_complete: bool) void {
     const total = tc.drainAll();
     if (total == 0) {
         if (handshake_complete) {
-            self.startRead();
+            completeHandshake(self);
         } else {
             self.close();
         }
@@ -107,8 +106,7 @@ pub fn onTlsHandshakeWrite(
             sendTlsData(self, true);
             return .disarm;
         }
-        // Ready for first HTTP request
-        self.startRead();
+        completeHandshake(self);
     } else {
         // Need more handshake data from client
         self.startRead();
@@ -116,7 +114,6 @@ pub fn onTlsHandshakeWrite(
     return .disarm;
 }
 
-// Tests for conn_tls require a live TlsContext (OpenSSL/BoringSSL) and a
+// Tests for conn_tls require a live TlsContext (OpenSSL) and a
 // Connection with xev.Loop, so unit tests are not feasible here. TLS
-// handshake and decrypt are covered by integration tests against the running
-// server.
+// handshake is covered by integration tests against the running server.

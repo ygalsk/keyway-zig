@@ -20,8 +20,6 @@ const ConnectionPool = @import("connection_pool.zig").ConnectionPool;
 const Connection = @import("handler.zig").Connection;
 const tls = @import("tls.zig");
 const castUserdata = @import("helpers.zig").castUserdata;
-const TlsConn = tls.TlsConn;
-const ClientTlsContext = tls.ClientTlsContext;
 const TlsManager = tls.TlsManager;
 const SseRegistry = @import("sse.zig").SseRegistry;
 
@@ -380,26 +378,6 @@ pub const LuaState = struct {
 
         registry.broadcast(std.mem.span(room), std.mem.span(data));
         return 0;
-    }
-
-    /// Ownership transfers to TlsManager.
-    pub fn registerTls(self: *LuaState, fd: std.posix.socket_t, tls_conn: *TlsConn) !void {
-        try self.tls_manager.registerTls(fd, tls_conn);
-    }
-
-    /// Borrow — returns null for plain TCP.
-    pub fn getTls(self: *LuaState, fd: std.posix.socket_t) ?*TlsConn {
-        return self.tls_manager.getTls(fd);
-    }
-
-    /// Ownership transfers to caller. Used for pool transfer or manual cleanup.
-    pub fn detachTls(self: *LuaState, fd: std.posix.socket_t) ?*TlsConn {
-        return self.tls_manager.detachTls(fd);
-    }
-
-    /// Remove and free. Used on close paths.
-    pub fn removeTls(self: *LuaState, fd: std.posix.socket_t) void {
-        self.tls_manager.removeTls(fd);
     }
 
     // --- Ring API delegation methods ---

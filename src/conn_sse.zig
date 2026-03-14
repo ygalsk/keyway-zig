@@ -68,9 +68,7 @@ pub fn handleSseUpgrade(self: *Connection, exchange: *HttpExchange) void {
 
     // Manually serialize SSE headers (no Content-Length — streaming)
     const sse_headers = "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nCache-Control: no-cache\r\nConnection: keep-alive\r\n\r\n";
-    if (!self.submitTlsAwareSend(sse_headers, onWrite, true)) {
-        self.close();
-    }
+    self.submitSend(sse_headers, onWrite, true);
 }
 
 /// Start watching for client disconnect (recv that returns EOF/error).
@@ -138,11 +136,7 @@ pub fn drainSseQueue(self: *Connection) void {
     ss.drain_index += 1;
     ss.writing = true;
 
-    if (!self.submitTlsAwareSend(data, onSseSendComplete, true)) {
-        self.base_allocator.free(data);
-        self.close();
-        return;
-    }
+    self.submitSend(data, onSseSendComplete, true);
     self.base_allocator.free(data);
 }
 

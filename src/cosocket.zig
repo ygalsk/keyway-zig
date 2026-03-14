@@ -15,8 +15,7 @@
 //!   Batch:       drainSubmissionRing -> xev -> onBatchComplete -> classifyOpError -> CQEntry -> ring_api
 //! Both paths share interpret/classify functions for consistent error categorization.
 //!
-//! Single-shot path: one pending_io at a time (connect, send, recv, close).
-//! Batch path: submission ring drained, multiple xev ops in flight, resume on last completion.
+//! After kTLS: all send/recv are plaintext — the kernel handles crypto transparently.
 
 const std = @import("std");
 const xev = @import("xev");
@@ -119,7 +118,7 @@ pub fn onOutboundComplete(
     else if (op == .send)
         cosocket_ops.interpretSend(thread, result)
     else if (op == .recv)
-        cosocket_ops.interpretRecv(thread, s, result, self, completion.op.recv.fd)
+        cosocket_ops.interpretRecv(thread, s, result)
     else if (op == .close)
         cosocket_ops.interpretClose(thread, s, result)
     else blk: {
@@ -164,14 +163,6 @@ pub fn resumeWithError(self: *Connection, category: ErrorCategory, msg: [:0]cons
     dispatchResume(self, thread, 2, s.exchange);
 }
 
-/// Resume with a descriptive TLS error message including SSL error details.
-pub fn resumeWithTlsError(self: *Connection, comptime prefix: []const u8, de: TlsConn.DecryptError) void {
-    const s = &self.cs.suspended.?;
-    const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
-    cosocket_ops.pushErrorTable(thread, .upstream_error, cosocket_ops.tlsErrorMsg(prefix, de));
-    dispatchResume(self, thread, 2, s.exchange);
-}
-
 // ============================================================================
 // Batch I/O path
 // ============================================================================
@@ -186,22 +177,16 @@ fn drainSubmissionRing(self: *Connection) void {
 
     while (self.cs.sq.pop()) |entry| {
         switch (entry.*) {
-            .connect => |c| {
-                cosocket_ops.submitBatchConnect(self, c.host, c.port, io_index, .connect);
+            .connect => |cn| {
+                cosocket_ops.submitBatchConnect(self, cn.host, cn.port, io_index, .connect);
                 io_index += 1;
             },
-            .pool_connect => |c| {
+            .pool_connect => |cn| {
                 // Sync pool hit -> write CQE immediately, no xev submission
-                if (self.lua_state.pool.get(c.pool_name)) |hit| {
-                    // Restore TLS state from pool if present
-                    if (hit.tls_conn) |tls_conn| {
-                        self.lua_state.registerTls(hit.fd, tls_conn) catch {
-                            tls_mod.freeTlsConn(self.lua_state.allocator, tls_conn);
-                        };
-                    }
+                if (self.lua_state.pool.get(cn.pool_name)) |hit| {
                     self.cs.cq.push(.{ .result = @intCast(hit.fd) });
                 } else {
-                    cosocket_ops.submitBatchConnect(self, c.host, c.port, io_index, .pool_connect);
+                    cosocket_ops.submitBatchConnect(self, cn.host, cn.port, io_index, .pool_connect);
                 }
                 io_index += 1;
             },
@@ -212,60 +197,18 @@ fn drainSubmissionRing(self: *Connection) void {
                     io_index += 1;
                     continue;
                 };
-                // TLS-aware send
-                if (self.lua_state.getTls(snd.fd)) |tls_conn| {
-                    const ciphertext = cosocket_ops.tlsEncryptAlloc(tls_conn, duped, self.arena.allocator()) orelse {
-                        self.cs.cq.push(.{ .result = -1, .err_msg = "send: tls encrypt failed", .err_category = .upstream_error });
-                        io_index += 1;
-                        continue;
-                    };
-                    self.cs.batch_completions[io_index] = .{
-                        .op = .{ .send = .{ .fd = snd.fd, .buffer = .{ .slice = ciphertext } } },
-                        .userdata = self,
-                        .callback = onBatchComplete,
-                    };
-                } else {
-                    self.cs.batch_completions[io_index] = .{
-                        .op = .{ .send = .{ .fd = snd.fd, .buffer = .{ .slice = duped } } },
-                        .userdata = self,
-                        .callback = onBatchComplete,
-                    };
-                }
+                // Plaintext send — kernel encrypts if kTLS is active
+                self.cs.batch_completions[io_index] = .{
+                    .op = .{ .send = .{ .fd = snd.fd, .buffer = .{ .slice = duped } } },
+                    .userdata = self,
+                    .callback = onBatchComplete,
+                };
                 self.cs.pending_completions += 1;
                 self.loop.add(&self.cs.batch_completions[io_index]);
                 io_index += 1;
             },
             .recv => |r| {
-                // Check for buffered TLS plaintext first
-                if (self.lua_state.getTls(r.fd)) |tls_conn| {
-                    if (tls_conn.hasPending()) {
-                        var plaintext_buf: [tls_mod.TLS_RECORD_MAX_SIZE]u8 = undefined;
-                        switch (tls_conn.decrypt(&plaintext_buf)) {
-                            .data => |n| {
-                                const buf_copy = self.arena.allocator().dupe(u8, plaintext_buf[0..n]) catch {
-                                    self.cs.cq.push(.{ .result = -1, .err_msg = "recv: alloc failed", .err_category = .server_error });
-                                    io_index += 1;
-                                    continue;
-                                };
-                                self.cs.cq.push(.{ .result = @intCast(n), .buf = buf_copy });
-                                io_index += 1;
-                                continue;
-                            },
-                            .want_read => {}, // fall through to kernel recv
-                            .zero_return => {
-                                self.cs.cq.push(.{ .result = -1, .err_msg = "recv: tls connection closed", .err_category = .upstream_error });
-                                io_index += 1;
-                                continue;
-                            },
-                            .err => {
-                                // Detail already logged by decrypt()
-                                self.cs.cq.push(.{ .result = -1, .err_msg = "recv: tls decrypt failed (see server log)", .err_category = .upstream_error });
-                                io_index += 1;
-                                continue;
-                            },
-                        }
-                    }
-                }
+                // Plaintext recv — kernel decrypts if kTLS is active
                 const buf = self.arena.allocator().alloc(u8, r.max_len) catch {
                     self.cs.cq.push(.{ .result = -1, .err_msg = "recv: alloc failed", .err_category = .server_error });
                     io_index += 1;
@@ -281,10 +224,9 @@ fn drainSubmissionRing(self: *Connection) void {
                 self.loop.add(&self.cs.batch_completions[io_index]);
                 io_index += 1;
             },
-            .close => |c| {
-                self.lua_state.removeTls(c.fd);
+            .close => |cl| {
                 self.cs.batch_completions[io_index] = .{
-                    .op = .{ .close = .{ .fd = c.fd } },
+                    .op = .{ .close = .{ .fd = cl.fd } },
                     .userdata = self,
                     .callback = onBatchComplete,
                 };
@@ -293,15 +235,13 @@ fn drainSubmissionRing(self: *Connection) void {
                 io_index += 1;
             },
             .setkeepalive => |k| {
-                // Always synchronous — put fd into pool
-                const tls_ptr: ?*TlsConn = self.lua_state.detachTls(k.fd);
+                // Always synchronous — put fd into pool (no TLS state to transfer after kTLS)
                 self.lua_state.pool.put(
                     k.pool_name,
                     k.fd,
                     @intCast(k.reuse_count),
                     @intCast(k.timeout_ms),
                     @intCast(k.pool_size),
-                    tls_ptr,
                 ) catch {
                     self.cs.cq.push(.{ .result = -1, .err_msg = "setkeepalive: pool put failed", .err_category = .server_error });
                     io_index += 1;
@@ -323,6 +263,7 @@ fn drainSubmissionRing(self: *Connection) void {
                     io_index += 1;
                     continue;
                 };
+                tls_conn.fixupExData();
                 if (t.sni_host) |host| {
                     const host_z = self.arena.allocator().dupeZ(u8, host) catch {
                         tls_mod.freeTlsConn(self.base_allocator, tls_conn);
@@ -343,7 +284,6 @@ fn drainSubmissionRing(self: *Connection) void {
                 }
 
                 // Store tls_conn for the handshake continuation
-                self.cs.batch_tls_conns[io_index] = tls_conn;
                 s.outbound_tls = tls_conn;
                 s.outbound_fd = t.fd;
                 s.pending_op = .tls_handshake;
@@ -379,7 +319,7 @@ fn drainSubmissionRing(self: *Connection) void {
 
 /// xev callback for batched I/O completions.
 /// Writes result into CQ at the correct index. When all completions arrive, resumes Lua once.
-/// Uses classifyOpError for consistent error categorization with the single-shot path.
+/// After kTLS, recv data is already plaintext — no decryption needed.
 pub fn onBatchComplete(
     userdata: ?*anyopaque,
     loop: *xev.Loop,
@@ -423,41 +363,8 @@ pub fn onBatchComplete(
             return .disarm;
         };
         if (self.cs.batch_recv_bufs[sqe_index]) |buf| {
-            // Check for TLS decryption
-            if (self.lua_state.getTls(completion.op.recv.fd)) |tls_conn| {
-                tls_conn.feedCiphertext(buf[0..bytes_read]);
-                var plaintext_buf: [tls_mod.TLS_RECORD_MAX_SIZE]u8 = undefined;
-                switch (tls_conn.decrypt(&plaintext_buf)) {
-                    .data => |n| {
-                        const duped = self.arena.allocator().dupe(u8, plaintext_buf[0..n]) catch {
-                            self.cs.cq.push(.{ .result = -1, .err_msg = "recv: alloc failed", .err_category = .server_error });
-                            self.cs.batch_recv_bufs[sqe_index] = null;
-                            batchCompletionCheck(self);
-                            return .disarm;
-                        };
-                        self.cs.cq.push(.{ .result = @intCast(n), .buf = duped });
-                    },
-                    .want_read => {
-                        // Need more ciphertext — re-submit recv (stays in batch)
-                        self.cs.batch_completions[sqe_index] = .{
-                            .op = .{ .recv = .{ .fd = completion.op.recv.fd, .buffer = .{ .slice = buf } } },
-                            .userdata = self,
-                            .callback = onBatchComplete,
-                        };
-                        self.loop.add(&self.cs.batch_completions[sqe_index]);
-                        return .disarm; // Don't decrement pending_completions
-                    },
-                    .zero_return => {
-                        self.cs.cq.push(.{ .result = -1, .err_msg = "recv: tls connection closed", .err_category = .upstream_error });
-                    },
-                    .err => {
-                        // Detail already logged by decrypt()
-                        self.cs.cq.push(.{ .result = -1, .err_msg = "recv: tls decrypt failed (see server log)", .err_category = .upstream_error });
-                    },
-                }
-            } else {
-                self.cs.cq.push(.{ .result = @intCast(bytes_read), .buf = buf[0..bytes_read] });
-            }
+            // Plaintext data — kernel already decrypted if kTLS is active
+            self.cs.cq.push(.{ .result = @intCast(bytes_read), .buf = buf[0..bytes_read] });
         } else {
             self.cs.cq.push(.{ .result = -1, .err_msg = "recv: no buffer", .err_category = .server_error });
         }
@@ -551,11 +458,6 @@ pub fn completeHandler(self: *Connection) void {
 // ============================================================================
 
 test "classifyOpError returns correct categories" {
-    // We test with IoEntry.Op values since the function uses == comparison
-    const ConnectOp = struct { const tag = .connect; };
-    _ = ConnectOp;
-
-    // Test the function returns valid struct for each known op
     const connect_err = classifyOpError(@as(IoEntry.Op, .connect));
     try std.testing.expectEqual(ErrorCategory.upstream_error, connect_err.category);
     try std.testing.expectEqualStrings("connection refused", connect_err.msg);

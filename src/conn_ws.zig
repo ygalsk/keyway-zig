@@ -67,7 +67,7 @@ pub fn startWsRead(conn: *Connection) void {
     // Compact read buffer to reclaim consumed space before checking capacity
     conn.read_buffer.compact();
 
-    // For TLS: recv into ciphertext_buffer, otherwise into read_buffer
+    // After kTLS, ciphertext_buffer is null — recv goes directly to read_buffer
     const buf = if (conn.tls_state.ciphertext_buffer) |*cb| blk: {
         if (cb.availableWrite() == 0) {
             conn.close();
@@ -116,45 +116,8 @@ fn onWsRead(
         return .disarm;
     }
 
-    // TLS path: decrypt before processing
-    if (self.tls_state.tls_conn) |*tc| {
-        var cb = &self.tls_state.ciphertext_buffer.?;
-        cb.commitWrite(bytes_read);
-        const ct_slice = cb.readSlice();
-        std.log.debug("ws: TLS feeding {d} ciphertext bytes", .{ct_slice.len});
-        tc.feedCiphertext(ct_slice);
-        cb.reset();
-
-        const out = self.read_buffer.writeSlice();
-        if (out.len == 0) {
-            std.log.err("ws: read_buffer full, closing", .{});
-            self.close();
-            return .disarm;
-        }
-        switch (tc.decrypt(out)) {
-            .data => |n| {
-                std.log.debug("ws: TLS decrypted {d} plaintext bytes", .{n});
-                self.read_buffer.commitWrite(n);
-            },
-            .want_read => {
-                std.log.debug("ws: TLS wants more data", .{});
-                startWsRead(self);
-                return .disarm;
-            },
-            .zero_return => {
-                std.log.info("ws: TLS clean shutdown", .{});
-                self.close();
-                return .disarm;
-            },
-            .err => {
-                std.log.err("ws: TLS decrypt error", .{});
-                self.close();
-                return .disarm;
-            },
-        }
-    } else {
-        self.read_buffer.commitWrite(bytes_read);
-    }
+    // After kTLS, recv data is already plaintext — kernel decrypts transparently
+    self.read_buffer.commitWrite(bytes_read);
 
     processWsFrames(self);
     return .disarm;
@@ -334,9 +297,7 @@ fn submitWsSend(conn: *Connection) void {
     const frame_data = frame_buf[0..frame_len];
 
     // frame_data is arena-owned, no dupe needed
-    if (!conn.submitTlsAwareSend(frame_data, onWsSendComplete, false)) {
-        resumeWithError(conn,"ws_send: tls encrypt failed");
-    }
+    conn.submitSend(frame_data, onWsSendComplete, false);
 }
 
 /// xev callback after WS frame send completes.
@@ -412,9 +373,7 @@ fn sendWsFrame(conn: *Connection, opcode: ws.Opcode, payload: []const u8) void {
     const truncated = if (payload.len > 128) payload[0..128] else payload;
     const frame_len = ws.serializeFrame(opcode, truncated, &frame_buf);
 
-    if (!conn.submitTlsAwareSend(frame_buf[0..frame_len], onWsControlSent, true)) {
-        conn.close();
-    }
+    conn.submitSend(frame_buf[0..frame_len], onWsControlSent, true);
 }
 
 /// Callback after sending a WS control frame (pong). Continue reading.
@@ -440,9 +399,7 @@ pub fn sendWsClose(conn: *Connection, status_code: u16) void {
     var buf: [16]u8 = undefined;
     const n = ws.serializeCloseFrame(status_code, &buf);
 
-    if (!conn.submitTlsAwareSend(buf[0..n], onWsCloseSent, true)) {
-        conn.close();
-    }
+    conn.submitSend(buf[0..n], onWsCloseSent, true);
 }
 
 /// Callback after sending close frame — disconnect.

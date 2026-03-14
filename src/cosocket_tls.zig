@@ -3,8 +3,9 @@
 //! Manages the multi-step TLS handshake over xev async I/O:
 //!   send ClientHello -> recv ServerHello -> ... -> established
 //!
-//! Each step is an xev callback that feeds ciphertext to BoringSSL,
+//! Each step is an xev callback that feeds ciphertext to OpenSSL,
 //! drains outbound data, and re-submits until handshake completes.
+//! After handshake, kTLS is set up and TlsConn is freed.
 
 const std = @import("std");
 const xev = @import("xev");
@@ -118,13 +119,18 @@ pub fn onRecvComplete(
     return .disarm;
 }
 
-/// Handshake complete: register TLS conn, resume coroutine with success.
+/// Handshake complete: set up kTLS, free TlsConn, resume coroutine with success.
 fn finish(self: *Connection, tls_conn: *TlsConn) void {
     const s = &self.cs.suspended.?;
-    self.lua_state.registerTls(s.outbound_fd, tls_conn) catch {
-        failHandshake(self, "sslhandshake: map put failed");
+
+    // Enable kTLS — kernel handles encrypt/decrypt from here
+    tls_conn.setupKtls(s.outbound_fd) catch {
+        failHandshake(self, "sslhandshake: ktls setup failed");
         return;
     };
+
+    // Free TlsConn — no longer needed after kTLS
+    tls_mod.freeTlsConn(self.base_allocator, tls_conn);
     s.outbound_tls = null;
     s.outbound_fd = 0;
     s.pending_op = .none;

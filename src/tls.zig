@@ -4,10 +4,17 @@ const c = @cImport({
     @cInclude("openssl/ssl.h");
     @cInclude("openssl/err.h");
     @cInclude("openssl/bio.h");
+    @cInclude("openssl/hmac.h");
+    @cInclude("openssl/evp.h");
+    @cInclude("linux/tls.h");
+    @cInclude("netinet/tcp.h");
 });
 
 const ENCRYPT_BUF_SIZE = config.TLS_ENCRYPT_BUF_SIZE;
 pub const TLS_RECORD_MAX_SIZE = config.TLS_RECORD_MAX_SIZE;
+
+// kTLS setsockopt constants
+const SOL_TLS: i32 = 282;
 
 /// Per-worker TLS context wrapping SSL_CTX.
 /// One per worker thread — shares config across all connections on that worker.
@@ -56,6 +63,9 @@ pub const TlsContext = struct {
         if (c.SSL_CTX_check_private_key(ctx) != 1) {
             return error.KeyCertMismatch;
         }
+
+        // Enable keylog callback for kTLS key extraction
+        c.SSL_CTX_set_keylog_callback(ctx, keylogCallback);
 
         return TlsContext{ .ctx = ctx };
     }
@@ -125,6 +135,9 @@ pub const ClientTlsContext = struct {
             }
         }
 
+        // Enable keylog callback for kTLS key extraction
+        c.SSL_CTX_set_keylog_callback(ctx, keylogCallback);
+
         return ClientTlsContext{ .ctx = ctx };
     }
 
@@ -133,9 +146,192 @@ pub const ClientTlsContext = struct {
     }
 };
 
+// ============================================================================
+// kTLS key extraction — keylog callback + secret storage
+// ============================================================================
+
+/// TLS 1.3 traffic secrets captured during handshake via keylog callback.
+pub const KtlsSecrets = struct {
+    client_secret: [48]u8 = .{0} ** 48,
+    server_secret: [48]u8 = .{0} ** 48,
+    secret_len: u8 = 0, // 0 = not captured, 32 = SHA-256, 48 = SHA-384
+};
+
+/// SSL_CTX keylog callback — captures TLS 1.3 traffic secrets into per-TlsConn storage.
+/// For TLS 1.2, keys are extracted directly from the SSL session after handshake.
+fn keylogCallback(ssl: ?*const c.SSL, line: [*c]const u8) callconv(.c) void {
+    if (ssl == null or line == null) return;
+    const ptr = c.SSL_get_ex_data(@constCast(ssl), 0) orelse return;
+    const self: *TlsConn = @ptrCast(@alignCast(ptr));
+    const line_str = std.mem.span(line);
+
+    if (std.mem.startsWith(u8, line_str, "CLIENT_TRAFFIC_SECRET_0 ")) {
+        parseKeylogSecret(line_str["CLIENT_TRAFFIC_SECRET_0 ".len..], &self.ktls_secrets.client_secret, &self.ktls_secrets.secret_len);
+    } else if (std.mem.startsWith(u8, line_str, "SERVER_TRAFFIC_SECRET_0 ")) {
+        parseKeylogSecret(line_str["SERVER_TRAFFIC_SECRET_0 ".len..], &self.ktls_secrets.server_secret, &self.ktls_secrets.secret_len);
+    }
+}
+
+/// Parse "<client_random_hex> <secret_hex>" and store the secret bytes.
+fn parseKeylogSecret(rest: []const u8, out: *[48]u8, len: *u8) void {
+    // client_random is 32 bytes = 64 hex chars, then a space, then the secret
+    if (rest.len < 65) return;
+    const secret_hex = rest[65..];
+    const n = secret_hex.len / 2;
+    if (n == 0 or n > 48) return;
+    for (0..n) |i| {
+        out[i] = (hexVal(secret_hex[i * 2]) orelse return) << 4 | (hexVal(secret_hex[i * 2 + 1]) orelse return);
+    }
+    len.* = @intCast(n);
+}
+
+fn hexVal(ch: u8) ?u8 {
+    return switch (ch) {
+        '0'...'9' => ch - '0',
+        'a'...'f' => ch - 'a' + 10,
+        'A'...'F' => ch - 'A' + 10,
+        else => null,
+    };
+}
+
+// ============================================================================
+// kTLS cipher parameters
+// ============================================================================
+
+const CipherKind = enum { aes_gcm_128, aes_gcm_256, chacha20_poly1305 };
+
+const CipherParams = struct {
+    kind: CipherKind,
+    key_size: u8,
+    iv_size: u8, // full nonce length (12 for all supported ciphers)
+    salt_size: u8, // 4 for AES-GCM, 0 for ChaCha20
+    evp_md: *const c.EVP_MD,
+};
+
+/// Map SSL cipher suite ID to kTLS cipher parameters.
+fn getCipherParams(cipher_id: u32) ?CipherParams {
+    const sha256 = c.EVP_sha256() orelse return null;
+    const sha384 = c.EVP_sha384() orelse return null;
+    return switch (cipher_id & 0xFFFF) {
+        // TLS 1.3
+        0x1301 => .{ .kind = .aes_gcm_128, .key_size = 16, .iv_size = 12, .salt_size = 4, .evp_md = sha256 },
+        0x1302 => .{ .kind = .aes_gcm_256, .key_size = 32, .iv_size = 12, .salt_size = 4, .evp_md = sha384 },
+        0x1303 => .{ .kind = .chacha20_poly1305, .key_size = 32, .iv_size = 12, .salt_size = 0, .evp_md = sha256 },
+        // TLS 1.2 ECDHE-RSA / ECDHE-ECDSA AES-128-GCM
+        0xC02F, 0xC02B => .{ .kind = .aes_gcm_128, .key_size = 16, .iv_size = 12, .salt_size = 4, .evp_md = sha256 },
+        // TLS 1.2 ECDHE-RSA / ECDHE-ECDSA AES-256-GCM
+        0xC030, 0xC02C => .{ .kind = .aes_gcm_256, .key_size = 32, .iv_size = 12, .salt_size = 4, .evp_md = sha384 },
+        // TLS 1.2 ECDHE-RSA / ECDHE-ECDSA ChaCha20-Poly1305
+        0xCCA8, 0xCCA9 => .{ .kind = .chacha20_poly1305, .key_size = 32, .iv_size = 12, .salt_size = 0, .evp_md = sha256 },
+        else => null,
+    };
+}
+
+// ============================================================================
+// HKDF / PRF key derivation
+// ============================================================================
+
+/// HKDF-Expand-Label for TLS 1.3 (RFC 8446 §7.1).
+/// Derives key or IV from a traffic secret.
+fn hkdfExpandLabel(
+    evp_md: *const c.EVP_MD,
+    secret: []const u8,
+    comptime label: []const u8,
+    out: []u8,
+) !void {
+    const full_label = "tls13 " ++ label;
+    // HkdfLabel: length(2) + label_len(1) + label + context_len(1)
+    const info_len = 2 + 1 + full_label.len + 1;
+    var info: [info_len]u8 = undefined;
+    info[0] = @intCast((out.len >> 8) & 0xFF);
+    info[1] = @intCast(out.len & 0xFF);
+    info[2] = @intCast(full_label.len);
+    @memcpy(info[3 .. 3 + full_label.len], full_label);
+    info[3 + full_label.len] = 0; // empty context
+
+    // HKDF-Expand with N=1 (out.len <= hash_len): T(1) = HMAC(secret, info || 0x01)
+    var hmac_in: [info_len + 1]u8 = undefined;
+    @memcpy(hmac_in[0..info_len], &info);
+    hmac_in[info_len] = 0x01;
+
+    var hmac_out: [48]u8 = undefined; // max SHA-384
+    var hmac_len: c_uint = 0;
+    const result = c.HMAC(
+        evp_md,
+        secret.ptr,
+        @intCast(secret.len),
+        &hmac_in,
+        hmac_in.len,
+        &hmac_out,
+        &hmac_len,
+    );
+    if (result == null) return error.HkdfFailed;
+    if (hmac_len < out.len) return error.HkdfFailed;
+    @memcpy(out, hmac_out[0..out.len]);
+}
+
+/// TLS 1.2 PRF (RFC 5246 §5) — P_SHA256 based key expansion.
+/// Derives key_block from master secret + server_random + client_random.
+fn tls12Prf(
+    evp_md: *const c.EVP_MD,
+    secret: []const u8,
+    label: []const u8,
+    seed: []const u8,
+    out: []u8,
+) !void {
+    // A(0) = label + seed
+    // A(i) = HMAC(secret, A(i-1))
+    // P_hash = HMAC(secret, A(1) + label + seed) || HMAC(secret, A(2) + label + seed) || ...
+    const hash_len: usize = @intCast(c.EVP_MD_size(evp_md));
+    var a_buf: [48]u8 = undefined; // A(i), max SHA-384
+
+    // Compute A(1) = HMAC(secret, label + seed)
+    {
+        const ctx = c.HMAC_CTX_new() orelse return error.PrfFailed;
+        defer c.HMAC_CTX_free(ctx);
+        if (c.HMAC_Init_ex(ctx, secret.ptr, @intCast(secret.len), evp_md, null) != 1) return error.PrfFailed;
+        if (c.HMAC_Update(ctx, label.ptr, label.len) != 1) return error.PrfFailed;
+        if (c.HMAC_Update(ctx, seed.ptr, seed.len) != 1) return error.PrfFailed;
+        var a_len: c_uint = 0;
+        if (c.HMAC_Final(ctx, &a_buf, &a_len) != 1) return error.PrfFailed;
+    }
+
+    var written: usize = 0;
+    while (written < out.len) {
+        // P_hash block = HMAC(secret, A(i) + label + seed)
+        var p_buf: [48]u8 = undefined;
+        {
+            const ctx = c.HMAC_CTX_new() orelse return error.PrfFailed;
+            defer c.HMAC_CTX_free(ctx);
+            if (c.HMAC_Init_ex(ctx, secret.ptr, @intCast(secret.len), evp_md, null) != 1) return error.PrfFailed;
+            if (c.HMAC_Update(ctx, &a_buf, hash_len) != 1) return error.PrfFailed;
+            if (c.HMAC_Update(ctx, label.ptr, label.len) != 1) return error.PrfFailed;
+            if (c.HMAC_Update(ctx, seed.ptr, seed.len) != 1) return error.PrfFailed;
+            var p_len: c_uint = 0;
+            if (c.HMAC_Final(ctx, &p_buf, &p_len) != 1) return error.PrfFailed;
+        }
+
+        const chunk = @min(hash_len, out.len - written);
+        @memcpy(out[written .. written + chunk], p_buf[0..chunk]);
+        written += chunk;
+
+        if (written >= out.len) break;
+
+        // A(i+1) = HMAC(secret, A(i))
+        var new_a: [48]u8 = undefined;
+        var new_a_len: c_uint = 0;
+        const r = c.HMAC(evp_md, secret.ptr, @intCast(secret.len), &a_buf, hash_len, &new_a, &new_a_len);
+        if (r == null) return error.PrfFailed;
+        a_buf = new_a;
+    }
+}
+
+// ============================================================================
+// TlsConn — per-connection TLS state (handshake only after kTLS setup)
+// ============================================================================
+
 /// Unified per-connection TLS state (server or client mode).
-/// Decouples TLS record processing from async I/O — handler feeds/drains ciphertext,
-/// TLS engine reads/writes plaintext.
+/// After handshake, setupKtls() transfers keys to the kernel and this struct is freed.
 pub const TlsConn = struct {
     ssl: *c.SSL,
     // rbio/wbio ownership is transferred to SSL via SSL_set_bio.
@@ -145,17 +341,12 @@ pub const TlsConn = struct {
     state: State,
     encrypt_buf: []u8,
     mode: Mode,
+    ktls_secrets: KtlsSecrets = .{},
 
     pub const Mode = enum { server, client };
     const State = enum { handshaking, established };
 
     pub const HandshakeResult = enum { complete, want_read, failed };
-    pub const DecryptError = struct {
-        ssl_error: c_int,
-        msg: [256]u8 = undefined,
-        msg_len: usize = 0,
-    };
-    pub const DecryptResult = union(enum) { data: usize, want_read, zero_return, err: DecryptError };
 
     pub fn init(allocator: std.mem.Allocator, ssl_ctx: *c.SSL_CTX, mode: Mode) !TlsConn {
         const ssl = c.SSL_new(ssl_ctx) orelse return error.SslNewFailed;
@@ -192,6 +383,13 @@ pub const TlsConn = struct {
         };
     }
 
+    /// Re-register self-pointer in SSL ex_data after the TlsConn has been
+    /// moved (e.g. copied to a heap-allocated *TlsConn via allocator.create).
+    /// Must be called whenever the address of TlsConn changes.
+    pub fn fixupExData(self: *TlsConn) void {
+        _ = c.SSL_set_ex_data(self.ssl, 0, self);
+    }
+
     pub fn deinit(self: *TlsConn, allocator: std.mem.Allocator) void {
         allocator.free(self.encrypt_buf);
         c.SSL_free(self.ssl); // frees both BIOs
@@ -222,7 +420,7 @@ pub const TlsConn = struct {
     }
 
     /// Drain all pending ciphertext into encrypt_buf. Returns total bytes drained.
-    /// Suitable for handshake data and small sends where encrypt_buf is sufficient.
+    /// Used for handshake data where encrypt_buf is sufficient.
     pub fn drainAll(self: *TlsConn) usize {
         var total: usize = 0;
         while (self.needsWrite()) {
@@ -231,21 +429,6 @@ pub const TlsConn = struct {
             total += n;
         }
         return total;
-    }
-
-    /// Drain all pending ciphertext into a dynamically-allocated buffer.
-    /// Use for response data that may exceed encrypt_buf capacity.
-    pub fn drainAllAlloc(self: *TlsConn, allocator: std.mem.Allocator) ![]u8 {
-        const pending = c.BIO_ctrl_pending(self.wbio);
-        if (pending == 0) return &.{};
-        const buf = try allocator.alloc(u8, pending);
-        var total: usize = 0;
-        while (self.needsWrite()) {
-            const n = self.drainCiphertext(buf[total..]);
-            if (n == 0) break;
-            total += n;
-        }
-        return buf[0..total];
     }
 
     /// Drive the TLS handshake state machine.
@@ -276,62 +459,6 @@ pub const TlsConn = struct {
         return .failed;
     }
 
-    /// Check if SSL has data available without a kernel read.
-    /// Returns true if either:
-    /// - SSL has already-decrypted plaintext buffered (SSL_pending)
-    /// - The read BIO has unprocessed ciphertext from a previous feedCiphertext
-    pub fn hasPending(self: *TlsConn) bool {
-        return c.SSL_pending(self.ssl) > 0 or c.BIO_ctrl_pending(self.rbio) > 0;
-    }
-
-    /// Decrypt application data from the TLS engine.
-    /// Caller must have fed ciphertext via feedCiphertext() first.
-    pub fn decrypt(self: *TlsConn, out: []u8) DecryptResult {
-        const ret = c.SSL_read(self.ssl, out.ptr, @intCast(out.len));
-        if (ret > 0) return .{ .data = @intCast(ret) };
-        const ssl_err = c.SSL_get_error(self.ssl, ret);
-        if (ssl_err == c.SSL_ERROR_WANT_READ) return .want_read;
-        if (ssl_err == c.SSL_ERROR_ZERO_RETURN) {
-            std.log.info("tls decrypt: clean shutdown (SSL_ERROR_ZERO_RETURN)", .{});
-            return .zero_return;
-        }
-
-        // Build error details for caller
-        var de = DecryptError{ .ssl_error = ssl_err };
-
-        // Log and capture the ERR queue
-        var errbuf: [256]u8 = undefined;
-        while (true) {
-            const e = c.ERR_get_error();
-            if (e == 0) break;
-            c.ERR_error_string_n(e, &errbuf, errbuf.len);
-            const msg = std.mem.sliceTo(&errbuf, 0);
-            std.log.err("tls decrypt: SSL_ERROR={d} {s}", .{ ssl_err, msg });
-            // Capture first error message for the caller
-            if (de.msg_len == 0) {
-                @memcpy(de.msg[0..msg.len], msg);
-                de.msg_len = msg.len;
-            }
-        }
-        if (de.msg_len == 0) {
-            std.log.err("tls decrypt: SSL_ERROR={d} (no ERR queue details)", .{ssl_err});
-        }
-
-        return .{ .err = de };
-    }
-
-    /// Encrypt plaintext for sending. After this call, drainCiphertext()/drainAll()/drainAllAlloc()
-    /// to get the ciphertext that needs to be sent over the wire.
-    pub fn encrypt(self: *TlsConn, plaintext: []const u8) !void {
-        var written: usize = 0;
-        while (written < plaintext.len) {
-            const chunk: c_int = @intCast(@min(plaintext.len - written, TLS_RECORD_MAX_SIZE));
-            const ret = c.SSL_write(self.ssl, plaintext[written..].ptr, chunk);
-            if (ret <= 0) return error.SslWriteFailed;
-            written += @intCast(ret);
-        }
-    }
-
     pub fn isEstablished(self: *TlsConn) bool {
         return self.state == .established;
     }
@@ -339,22 +466,243 @@ pub const TlsConn = struct {
     pub fn needsWrite(self: *TlsConn) bool {
         return c.BIO_ctrl_pending(self.wbio) > 0;
     }
+
+    // ========================================================================
+    // kTLS setup — transfer keys to kernel after handshake
+    // ========================================================================
+
+    /// After handshake completes, extract negotiated keys and configure kTLS.
+    /// On success, the kernel handles all encrypt/decrypt — TlsConn can be freed.
+    /// On failure, returns error (caller should close the connection).
+    pub fn setupKtls(self: *TlsConn, fd: std.posix.socket_t) !void {
+        const ssl_version = c.SSL_version(self.ssl);
+        const cipher = c.SSL_get_current_cipher(self.ssl) orelse return error.KtlsNoCipher;
+        const cipher_id = c.SSL_CIPHER_get_id(cipher);
+        const params = getCipherParams(cipher_id) orelse {
+            std.log.warn("ktls: unsupported cipher 0x{x}, cannot enable kTLS", .{cipher_id & 0xFFFF});
+            return error.KtlsUnsupportedCipher;
+        };
+
+        // Derive TX and RX keys
+        var tx_key: [32]u8 = .{0} ** 32;
+        var tx_iv: [12]u8 = .{0} ** 12;
+        var rx_key: [32]u8 = .{0} ** 32;
+        var rx_iv: [12]u8 = .{0} ** 12;
+
+        if (ssl_version == c.TLS1_3_VERSION) {
+            try self.deriveTls13Keys(params, &tx_key, &tx_iv, &rx_key, &rx_iv);
+        } else if (ssl_version == c.TLS1_2_VERSION) {
+            try self.deriveTls12Keys(params, &tx_key, &tx_iv, &rx_key, &rx_iv);
+        } else {
+            return error.KtlsUnsupportedVersion;
+        }
+
+        const tls_version: u16 = @intCast(ssl_version);
+
+        // Enable TLS ULP on the socket
+        const ulp = [4]u8{ 't', 'l', 's', 0 };
+        std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, c.TCP_ULP, &ulp) catch |err| {
+            std.log.err("ktls: setsockopt TCP_ULP failed: {}", .{err});
+            return error.KtlsSetupFailed;
+        };
+
+        // Set TX and RX crypto info
+        switch (params.kind) {
+            .aes_gcm_128 => {
+                var tx_info = c.tls12_crypto_info_aes_gcm_128{
+                    .info = .{ .version = tls_version, .cipher_type = c.TLS_CIPHER_AES_GCM_128 },
+                    .iv = .{0} ** 8,
+                    .key = undefined,
+                    .salt = undefined,
+                    .rec_seq = .{0} ** 8,
+                };
+                @memcpy(&tx_info.key, tx_key[0..16]);
+                @memcpy(&tx_info.salt, tx_iv[0..4]);
+                @memcpy(&tx_info.iv, tx_iv[4..12]);
+
+                var rx_info = tx_info;
+                @memcpy(&rx_info.key, rx_key[0..16]);
+                @memcpy(&rx_info.salt, rx_iv[0..4]);
+                @memcpy(&rx_info.iv, rx_iv[4..12]);
+
+                try setsockoptTls(fd, c.TLS_TX, std.mem.asBytes(&tx_info));
+                try setsockoptTls(fd, c.TLS_RX, std.mem.asBytes(&rx_info));
+            },
+            .aes_gcm_256 => {
+                var tx_info = c.tls12_crypto_info_aes_gcm_256{
+                    .info = .{ .version = tls_version, .cipher_type = c.TLS_CIPHER_AES_GCM_256 },
+                    .iv = .{0} ** 8,
+                    .key = undefined,
+                    .salt = undefined,
+                    .rec_seq = .{0} ** 8,
+                };
+                @memcpy(&tx_info.key, tx_key[0..32]);
+                @memcpy(&tx_info.salt, tx_iv[0..4]);
+                @memcpy(&tx_info.iv, tx_iv[4..12]);
+
+                var rx_info = tx_info;
+                @memcpy(&rx_info.key, rx_key[0..32]);
+                @memcpy(&rx_info.salt, rx_iv[0..4]);
+                @memcpy(&rx_info.iv, rx_iv[4..12]);
+
+                try setsockoptTls(fd, c.TLS_TX, std.mem.asBytes(&tx_info));
+                try setsockoptTls(fd, c.TLS_RX, std.mem.asBytes(&rx_info));
+            },
+            .chacha20_poly1305 => {
+                var tx_info = c.tls12_crypto_info_chacha20_poly1305{
+                    .info = .{ .version = tls_version, .cipher_type = c.TLS_CIPHER_CHACHA20_POLY1305 },
+                    .iv = undefined,
+                    .key = undefined,
+                    .salt = .{},
+                    .rec_seq = .{0} ** 8,
+                };
+                @memcpy(&tx_info.key, tx_key[0..32]);
+                @memcpy(&tx_info.iv, tx_iv[0..12]);
+
+                var rx_info = tx_info;
+                @memcpy(&rx_info.key, rx_key[0..32]);
+                @memcpy(&rx_info.iv, rx_iv[0..12]);
+
+                try setsockoptTls(fd, c.TLS_TX, std.mem.asBytes(&tx_info));
+                try setsockoptTls(fd, c.TLS_RX, std.mem.asBytes(&rx_info));
+            },
+        }
+
+        // Scrub keys from memory
+        @memset(&tx_key, 0);
+        @memset(&tx_iv, 0);
+        @memset(&rx_key, 0);
+        @memset(&rx_iv, 0);
+        @memset(&self.ktls_secrets.client_secret, 0);
+        @memset(&self.ktls_secrets.server_secret, 0);
+
+        std.log.info("ktls: enabled for fd={d} cipher=0x{x} version=0x{x}", .{ fd, cipher_id & 0xFFFF, tls_version });
+    }
+
+    fn setsockoptTls(fd: std.posix.socket_t, direction: u32, info_bytes: []const u8) !void {
+        std.posix.setsockopt(fd, SOL_TLS, direction, info_bytes) catch |err| {
+            std.log.err("ktls: setsockopt SOL_TLS dir={d} failed: {}", .{ direction, err });
+            return error.KtlsSetupFailed;
+        };
+    }
+
+    /// Derive TLS 1.3 record keys from traffic secrets captured by keylog callback.
+    fn deriveTls13Keys(
+        self: *TlsConn,
+        params: CipherParams,
+        tx_key: *[32]u8,
+        tx_iv: *[12]u8,
+        rx_key: *[32]u8,
+        rx_iv: *[12]u8,
+    ) !void {
+        if (self.ktls_secrets.secret_len == 0) return error.KtlsNoSecrets;
+
+        // TX = sending direction: server sends with server_secret, client with client_secret
+        const tx_secret = if (self.mode == .server)
+            self.ktls_secrets.server_secret[0..self.ktls_secrets.secret_len]
+        else
+            self.ktls_secrets.client_secret[0..self.ktls_secrets.secret_len];
+
+        const rx_secret = if (self.mode == .server)
+            self.ktls_secrets.client_secret[0..self.ktls_secrets.secret_len]
+        else
+            self.ktls_secrets.server_secret[0..self.ktls_secrets.secret_len];
+
+        try hkdfExpandLabel(params.evp_md, tx_secret, "key", tx_key[0..params.key_size]);
+        try hkdfExpandLabel(params.evp_md, tx_secret, "iv", tx_iv);
+        try hkdfExpandLabel(params.evp_md, rx_secret, "key", rx_key[0..params.key_size]);
+        try hkdfExpandLabel(params.evp_md, rx_secret, "iv", rx_iv);
+    }
+
+    /// Derive TLS 1.2 record keys from master secret + randoms via PRF.
+    fn deriveTls12Keys(
+        self: *TlsConn,
+        params: CipherParams,
+        tx_key: *[32]u8,
+        tx_iv: *[12]u8,
+        rx_key: *[32]u8,
+        rx_iv: *[12]u8,
+    ) !void {
+        const session = c.SSL_get_session(self.ssl) orelse return error.KtlsNoSession;
+
+        // Extract master secret
+        var master_secret: [48]u8 = undefined;
+        const ms_len = c.SSL_SESSION_get_master_key(session, &master_secret, 48);
+        if (ms_len == 0) return error.KtlsNoMasterKey;
+
+        // Extract client and server randoms
+        var client_random: [32]u8 = undefined;
+        var server_random: [32]u8 = undefined;
+        _ = c.SSL_get_client_random(self.ssl, &client_random, 32);
+        _ = c.SSL_get_server_random(self.ssl, &server_random, 32);
+
+        // PRF seed = server_random + client_random (for key expansion)
+        var seed: [64]u8 = undefined;
+        @memcpy(seed[0..32], &server_random);
+        @memcpy(seed[32..64], &client_random);
+
+        // key_block = PRF(master_secret, "key expansion", seed)
+        // Layout: client_write_key | server_write_key | client_write_iv | server_write_iv
+        const fixed_iv_len: usize = params.salt_size; // 4 for AES-GCM, 0 for ChaCha20
+        const iv_len: usize = if (params.salt_size == 0) 12 else params.salt_size; // ChaCha20 gets full 12-byte IV
+        const key_block_len = @as(usize, params.key_size) * 2 + iv_len * 2;
+        var key_block: [128]u8 = undefined; // max needed
+        try tls12Prf(params.evp_md, master_secret[0..ms_len], "key expansion", &seed, key_block[0..key_block_len]);
+
+        // Parse key block
+        var off: usize = 0;
+        const client_key = key_block[off .. off + params.key_size];
+        off += params.key_size;
+        const server_key = key_block[off .. off + params.key_size];
+        off += params.key_size;
+        const client_iv_block = key_block[off .. off + iv_len];
+        off += iv_len;
+        const server_iv_block = key_block[off .. off + iv_len];
+
+        // Assign TX/RX based on mode
+        if (self.mode == .server) {
+            @memcpy(tx_key[0..params.key_size], server_key);
+            @memcpy(rx_key[0..params.key_size], client_key);
+            if (fixed_iv_len > 0) {
+                // AES-GCM: salt = fixed_iv (4 bytes), iv = zeros (kernel manages explicit nonce)
+                @memcpy(tx_iv[0..fixed_iv_len], server_iv_block[0..fixed_iv_len]);
+                @memcpy(rx_iv[0..fixed_iv_len], client_iv_block[0..fixed_iv_len]);
+            } else {
+                // ChaCha20: full 12-byte IV
+                @memcpy(tx_iv, server_iv_block[0..12]);
+                @memcpy(rx_iv, client_iv_block[0..12]);
+            }
+        } else {
+            @memcpy(tx_key[0..params.key_size], client_key);
+            @memcpy(rx_key[0..params.key_size], server_key);
+            if (fixed_iv_len > 0) {
+                @memcpy(tx_iv[0..fixed_iv_len], client_iv_block[0..fixed_iv_len]);
+                @memcpy(rx_iv[0..fixed_iv_len], server_iv_block[0..fixed_iv_len]);
+            } else {
+                @memcpy(tx_iv, client_iv_block[0..12]);
+                @memcpy(rx_iv, server_iv_block[0..12]);
+            }
+        }
+
+        // Scrub
+        @memset(&master_secret, 0);
+        @memset(&key_block, 0);
+    }
 };
 
-/// Free a heap-allocated TlsConn (deinit + destroy). Used by connection pool, handler cleanup, etc.
+/// Free a heap-allocated TlsConn (deinit + destroy). Used by handler cleanup, etc.
 pub fn freeTlsConn(allocator: std.mem.Allocator, tc: *TlsConn) void {
     tc.deinit(allocator);
     allocator.destroy(tc);
 }
 
-/// Per-worker TLS manager — owns the client TLS contexts and fd-to-TlsConn mapping.
-/// Extracted from LuaState to give TLS state a single, focused owner.
+/// Per-worker TLS manager — owns the client TLS contexts for outbound handshakes.
+/// After kTLS setup, TlsConn is freed — no fd-to-TlsConn mapping needed.
 pub const TlsManager = struct {
     allocator: std.mem.Allocator,
     client_tls_ctx: ClientTlsContext,
     insecure_tls_ctx: ClientTlsContext,
     custom_tls_ctx: ?ClientTlsContext,
-    tls_map: std.AutoHashMapUnmanaged(std.posix.socket_t, *TlsConn),
 
     pub fn init(allocator: std.mem.Allocator) !TlsManager {
         const client_tls_ctx = ClientTlsContext.init(.{ .verify = true }) catch return error.TlsInitFailed;
@@ -383,40 +731,77 @@ pub const TlsManager = struct {
             .client_tls_ctx = client_tls_ctx,
             .insecure_tls_ctx = insecure_tls_ctx,
             .custom_tls_ctx = custom_tls_ctx,
-            .tls_map = .{},
         };
     }
 
-    /// Ownership transfers to TlsManager.
-    pub fn registerTls(self: *TlsManager, fd: std.posix.socket_t, tls_conn: *TlsConn) !void {
-        try self.tls_map.put(self.allocator, fd, tls_conn);
-    }
-
-    /// Borrow — returns null for plain TCP.
-    pub fn getTls(self: *TlsManager, fd: std.posix.socket_t) ?*TlsConn {
-        return self.tls_map.get(fd);
-    }
-
-    /// Ownership transfers to caller. Used for pool transfer or manual cleanup.
-    pub fn detachTls(self: *TlsManager, fd: std.posix.socket_t) ?*TlsConn {
-        return if (self.tls_map.fetchRemove(fd)) |kv| kv.value else null;
-    }
-
-    /// Remove and free. Used on close paths.
-    pub fn removeTls(self: *TlsManager, fd: std.posix.socket_t) void {
-        if (self.tls_map.fetchRemove(fd)) |kv| {
-            freeTlsConn(self.allocator, kv.value);
-        }
-    }
-
     pub fn deinit(self: *TlsManager) void {
-        var tls_it = self.tls_map.iterator();
-        while (tls_it.next()) |entry| {
-            freeTlsConn(self.allocator, entry.value_ptr.*);
-        }
-        self.tls_map.deinit(self.allocator);
         self.client_tls_ctx.deinit();
         self.insecure_tls_ctx.deinit();
         if (self.custom_tls_ctx) |*ctx| ctx.deinit();
     }
 };
+
+// ============================================================================
+// Tests
+// ============================================================================
+
+test "hexVal decodes hex characters" {
+    try std.testing.expectEqual(@as(?u8, 0), hexVal('0'));
+    try std.testing.expectEqual(@as(?u8, 9), hexVal('9'));
+    try std.testing.expectEqual(@as(?u8, 10), hexVal('a'));
+    try std.testing.expectEqual(@as(?u8, 15), hexVal('f'));
+    try std.testing.expectEqual(@as(?u8, 10), hexVal('A'));
+    try std.testing.expectEqual(@as(?u8, 15), hexVal('F'));
+    try std.testing.expectEqual(@as(?u8, null), hexVal('g'));
+    try std.testing.expectEqual(@as(?u8, null), hexVal(' '));
+}
+
+test "parseKeylogSecret parses valid TLS 1.3 keylog line" {
+    // 64 hex chars (client_random) + space + 64 hex chars (32-byte secret)
+    const client_random_hex = "a" ** 64;
+    const secret_hex = "0102030405060708091011121314151617181920212223242526272829303132";
+    const rest = client_random_hex ++ " " ++ secret_hex;
+
+    var out: [48]u8 = .{0} ** 48;
+    var len: u8 = 0;
+    parseKeylogSecret(rest, &out, &len);
+
+    try std.testing.expectEqual(@as(u8, 32), len);
+    try std.testing.expectEqual(@as(u8, 0x01), out[0]);
+    try std.testing.expectEqual(@as(u8, 0x02), out[1]);
+}
+
+test "parseKeylogSecret rejects short input" {
+    var out: [48]u8 = .{0} ** 48;
+    var len: u8 = 0;
+    parseKeylogSecret("tooshort", &out, &len);
+    try std.testing.expectEqual(@as(u8, 0), len);
+}
+
+test "getCipherParams returns params for known ciphers" {
+    // TLS 1.3 AES-128-GCM
+    const p1 = getCipherParams(0x1301);
+    try std.testing.expect(p1 != null);
+    try std.testing.expectEqual(CipherKind.aes_gcm_128, p1.?.kind);
+    try std.testing.expectEqual(@as(u8, 16), p1.?.key_size);
+
+    // TLS 1.3 AES-256-GCM
+    const p2 = getCipherParams(0x1302);
+    try std.testing.expect(p2 != null);
+    try std.testing.expectEqual(CipherKind.aes_gcm_256, p2.?.kind);
+    try std.testing.expectEqual(@as(u8, 32), p2.?.key_size);
+
+    // TLS 1.3 ChaCha20
+    const p3 = getCipherParams(0x1303);
+    try std.testing.expect(p3 != null);
+    try std.testing.expectEqual(CipherKind.chacha20_poly1305, p3.?.kind);
+    try std.testing.expectEqual(@as(u8, 0), p3.?.salt_size);
+
+    // TLS 1.2 ECDHE-RSA-AES128-GCM
+    const p4 = getCipherParams(0xC02F);
+    try std.testing.expect(p4 != null);
+    try std.testing.expectEqual(CipherKind.aes_gcm_128, p4.?.kind);
+
+    // Unknown cipher
+    try std.testing.expect(getCipherParams(0xFFFF) == null);
+}

@@ -19,7 +19,6 @@ const io_request_mod = @import("io_request.zig");
 const TlsMode = io_request_mod.TlsMode;
 const ring = @import("ring.zig");
 const tls_mod = @import("tls.zig");
-const TlsConn = tls_mod.TlsConn;
 const TlsContext = tls_mod.TlsContext;
 const Lua = @import("luajit").Lua;
 const ws = @import("ws.zig");
@@ -32,7 +31,6 @@ const castUserdata = @import("helpers.zig").castUserdata;
 const conn_sse = @import("conn_sse.zig");
 const conn_ws = @import("conn_ws.zig");
 const cosocket = @import("cosocket.zig");
-const cosocket_ops = @import("cosocket_ops.zig");
 const error_response = @import("error_response.zig");
 const Server = @import("server.zig").Server;
 const WorkerMetrics = @import("metrics.zig").WorkerMetrics;
@@ -51,11 +49,10 @@ pub const SuspendedState = struct {
     coroutine_thread: *anyopaque,
     outbound_fd: std.posix.socket_t,
     pending_op: ring.IoEntry.Op,
-    outbound_tls: ?*TlsConn = null, // temporary, during handshake only
+    outbound_tls: ?*tls_mod.TlsConn = null, // temporary, during handshake only
 };
 
 const READ_BUFFER_SIZE = config.READ_BUFFER_SIZE;
-const CIPHERTEXT_BUFFER_SIZE = config.CIPHERTEXT_BUFFER_SIZE;
 const LARGE_RESPONSE_THRESHOLD = config.LARGE_RESPONSE_THRESHOLD;
 
 /// Per-request HTTP state — reset between keep-alive requests.
@@ -69,7 +66,7 @@ pub const HttpState = struct {
 
 /// Inbound TLS state — set once at connection init, persists across keep-alive.
 pub const TlsState = struct {
-    tls_conn: ?TlsConn = null,
+    tls_conn: ?tls_mod.TlsConn = null,
     ciphertext_buffer: ?LinearBuffer = null, // recv target for TLS connections
     tls_handshake_complete: bool = false, // flag for sendTlsData -> onTlsHandshakeWrite
 
@@ -88,7 +85,6 @@ pub const CosocketState = struct {
     pending_completions: u8 = 0,
     batch_completions: [ring.SubmissionRing.MAX_DEPTH]xev.Completion = undefined,
     batch_recv_bufs: [ring.SubmissionRing.MAX_DEPTH]?[]u8 = .{null} ** ring.SubmissionRing.MAX_DEPTH,
-    batch_tls_conns: [ring.SubmissionRing.MAX_DEPTH]?*TlsConn = .{null} ** ring.SubmissionRing.MAX_DEPTH,
     suspended: ?SuspendedState = null,
 };
 
@@ -295,7 +291,10 @@ pub const Connection = struct {
         return .disarm;
     }
 
-    /// Start reading from connection
+    /// Start reading from connection.
+    /// After kTLS setup, tls_conn is null and ciphertext_buffer is freed —
+    /// reads go directly to the plaintext read_buffer (kernel decrypts).
+    /// During TLS handshake (tls_conn non-null), reads target the ciphertext_buffer.
     pub fn startRead(self: *Connection) void {
         const buf = if (self.tls_state.ciphertext_buffer) |*cb| blk: {
             if (cb.availableWrite() == 0) {
@@ -347,18 +346,14 @@ pub const Connection = struct {
             return .disarm;
         }
 
-        // TLS path: decrypt ciphertext before processing
+        // TLS handshake path: tls_conn is non-null only during handshake.
+        // After kTLS setup, tls_conn is freed — reads fall through to plaintext.
         if (self.tls_state.tls_conn) |*tc| {
             var cb = &self.tls_state.ciphertext_buffer.?;
             cb.commitWrite(bytes_read);
             tc.feedCiphertext(cb.readSlice());
             cb.reset(); // BIO owns the data now
-
-            if (!tc.isEstablished()) {
-                conn_tls.handleTlsHandshake(self, tc);
-            } else {
-                conn_tls.handleTlsDecrypt(self, tc);
-            }
+            conn_tls.handleTlsHandshake(self, tc);
             return .disarm;
         }
 
@@ -550,41 +545,29 @@ pub const Connection = struct {
             std.log.debug("ws: response buf len={d} content=[{s}]", .{ response_buf.items.len, response_buf.items });
         }
 
-        if (!self.submitTlsAwareSend(response_buf.items, onWrite, false)) {
-            self.close();
-        }
+        self.submitSend(response_buf.items, onWrite, false);
     }
 
-    /// TLS-aware send: encrypt if TLS, optionally arena-dupe for stack-local buffers.
-    /// Returns false on allocation/encryption failure (caller decides error handling).
-    pub fn submitTlsAwareSend(self: *Connection, data: []const u8, callback: *const fn (?*anyopaque, *xev.Loop, *xev.Completion, xev.Result) xev.CallbackAction, arena_dupe: bool) bool {
+    /// Submit a send on this connection's socket.
+    /// After kTLS setup, all sends are plaintext — the kernel encrypts transparently.
+    /// If arena_dupe is true, data is copied into the arena (for stack-local buffers).
+    pub fn submitSend(self: *Connection, data: []const u8, callback: *const fn (?*anyopaque, *xev.Loop, *xev.Completion, xev.Result) xev.CallbackAction, arena_dupe: bool) void {
         const alloc = self.arena.allocator();
-        if (self.tls_state.tls_conn) |*tc| {
-            const ciphertext = cosocket_ops.tlsEncryptAlloc(tc, data, alloc) orelse return false;
-            self.write_completion = .{
-                .op = .{ .send = .{ .fd = self.socket, .buffer = .{ .slice = ciphertext } } },
-                .userdata = self,
-                .callback = callback,
-            };
-            self.loop.add(&self.write_completion);
-            return true;
-        }
-
-        const send_data = if (arena_dupe) alloc.dupe(u8, data) catch return false else data;
+        const send_data = if (arena_dupe) alloc.dupe(u8, data) catch {
+            self.close();
+            return;
+        } else data;
         self.write_completion = .{
             .op = .{ .send = .{ .fd = self.socket, .buffer = .{ .slice = send_data } } },
             .userdata = self,
             .callback = callback,
         };
         self.loop.add(&self.write_completion);
-        return true;
     }
 
     pub fn sendRawResponse(self: *Connection, text: []const u8) void {
         self.state = .writing;
-        if (!self.submitTlsAwareSend(text, onWrite, true)) {
-            self.close();
-        }
+        self.submitSend(text, onWrite, true);
     }
 
     pub fn send400BadRequest(self: *Connection) void {
@@ -684,7 +667,6 @@ pub const Connection = struct {
         } else {
             self.read_buffer.reset();
         }
-        if (self.tls_state.ciphertext_buffer) |*cb| cb.reset();
         std.log.debug("ws: starting WS read loop. buf_avail_read={d} buf_avail_write={d}", .{
             self.read_buffer.availableRead(),
             self.read_buffer.availableWrite(),
@@ -730,8 +712,7 @@ pub const Connection = struct {
             self.read_buffer.reset();
         }
 
-        // Reset ciphertext buffer but NOT tls_conn — TLS session persists across keep-alive
-        if (self.tls_state.ciphertext_buffer) |*cb| cb.reset();
+        // After kTLS, ciphertext_buffer is null — nothing to reset
 
         // Reset body tracking and timeout flag for next request on keep-alive
         self.http_state.body_bytes_received = 0;
