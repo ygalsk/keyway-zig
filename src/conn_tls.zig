@@ -53,10 +53,7 @@ pub fn handleTlsDecrypt(self: *Connection, tc: *TlsConn) void {
                     return;
                 }
             }
-            self.handleRequest() catch |err| {
-                std.log.err("[fd={d}] response dispatch failed err={}", .{ self.socket, err });
-                self.close();
-            };
+            self.handleRequest();
         },
         .want_read => self.startRead(),
         .zero_return, .err => self.close(),

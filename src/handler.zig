@@ -32,6 +32,7 @@ const castUserdata = @import("helpers.zig").castUserdata;
 const conn_sse = @import("conn_sse.zig");
 const conn_ws = @import("conn_ws.zig");
 const cosocket = @import("cosocket.zig");
+const cosocket_ops = @import("cosocket_ops.zig");
 const error_response = @import("error_response.zig");
 const Server = @import("server.zig").Server;
 const WorkerMetrics = @import("metrics.zig").WorkerMetrics;
@@ -334,12 +335,7 @@ pub const Connection = struct {
             }
         }
 
-        self.handleRequest() catch |err| {
-            std.log.err("[fd={d}] response dispatch failed err={}", .{ self.socket, err });
-            self.close();
-            return .disarm;
-        };
-
+        self.handleRequest();
         return .disarm;
     }
 
@@ -451,15 +447,21 @@ pub const Connection = struct {
     }
 
     /// Request lifecycle coordinator: parse → route → dispatch.
-    /// Each stage owns its error path and sends the appropriate HTTP error
-    /// response before returning an error to the caller.
-    pub fn handleRequest(self: *Connection) !void {
+    /// Each stage owns its error path — on failure a stage sends the
+    /// appropriate HTTP error response and returns an error.  The
+    /// coordinator catches those errors and returns normally so the
+    /// caller does NOT close the connection (the async write for the
+    /// error response is already in flight).
+    pub fn handleRequest(self: *Connection) void {
         self.state = .processing;
         self.http_state.request_start_ns = std.time.nanoTimestamp();
 
-        const request = try self.parseRequest();
-        const ref = try self.routeRequest(&request) orelse return;
-        try self.dispatchRequest(&request, ref);
+        const request = self.parseRequest() catch return;
+        const ref = (self.routeRequest(&request) catch return) orelse return;
+        self.dispatchRequest(&request, ref) catch |err| {
+            std.log.err("[fd={d}] dispatch failed err={}", .{ self.socket, err });
+            self.close();
+        };
     }
 
     /// Route stage: health check short-circuit, trie lookup, 404 on no match.
@@ -525,7 +527,7 @@ pub const Connection = struct {
     pub fn submitTlsAwareSend(self: *Connection, data: []const u8, callback: *const fn (?*anyopaque, *xev.Loop, *xev.Completion, xev.Result) xev.CallbackAction, arena_dupe: bool) bool {
         const alloc = self.arena.allocator();
         if (self.tls_state.tls_conn) |*tc| {
-            const ciphertext = cosocket.tlsEncryptAlloc(tc, data, alloc) orelse return false;
+            const ciphertext = cosocket_ops.tlsEncryptAlloc(tc, data, alloc) orelse return false;
             self.write_completion = .{
                 .op = .{ .send = .{ .fd = self.socket, .buffer = .{ .slice = ciphertext } } },
                 .userdata = self,
@@ -716,10 +718,7 @@ pub const Connection = struct {
 
         // If there's leftover data in the buffer (HTTP pipelining), process it now
         if (self.read_buffer.availableRead() > 0) {
-            self.handleRequest() catch |err| {
-                std.log.err("[fd={d}] pipelined response dispatch failed err={}", .{ self.socket, err });
-                self.close();
-            };
+            self.handleRequest();
         } else {
             self.read_buffer.reset();
             self.startRead();
