@@ -4,8 +4,8 @@
 //! and per-request state (params, query, I/O rings). The proactor contract:
 //! Lua sets state on HttpExchange, Zig submits all I/O via libxev.
 //!
-//! Lifecycle: accept → startRead → onRead → sendResponse → onWrite → (keep-alive or close)
-//! Protocol upgrades (WS, SSE) and cosocket yields branch from sendResponse.
+//! Lifecycle: accept → startRead → onRead → handleRequest → onWrite → (keep-alive or close)
+//! Protocol upgrades (WS, SSE) and cosocket yields branch from dispatchRequest.
 
 const std = @import("std");
 const xev = @import("xev");
@@ -334,7 +334,7 @@ pub const Connection = struct {
             }
         }
 
-        self.sendResponse() catch |err| {
+        self.handleRequest() catch |err| {
             std.log.err("[fd={d}] response dispatch failed err={}", .{ self.socket, err });
             self.close();
             return .disarm;
@@ -350,17 +350,45 @@ pub const Connection = struct {
         self.server.metrics.recordRequest(@intCast(@max(0, dur_us)), status >= 400);
     }
 
-    fn parseHttpRequest(self: *Connection) ?http.Request {
+    /// Parse stage: HTTP parse, query/param setup, Content-Length validation.
+    /// Returns the parsed request or an error (after sending the appropriate
+    /// error response / scheduling another read).
+    fn parseRequest(self: *Connection) !http.Request {
         const request_data = self.read_buffer.readSlice();
         var parser = http.Parser.init(self.arena.allocator());
-        return parser.parseRequest(request_data) catch |err| {
+        const request = parser.parseRequest(request_data) catch |err| {
             if (err == error.Incomplete) {
                 self.startRead();
             } else {
                 error_response.sendError(self, .client_error, "http parse failed");
             }
-            return null;
+            return err;
         };
+
+        const query_pos = std.mem.indexOfScalar(u8, request.path, '?');
+        const clean_path = if (query_pos) |qi| request.path[0..qi] else request.path;
+
+        self.http_state.request_method = request.method;
+        self.http_state.request_path = clean_path;
+        self.http_state.request_raw_len = request.raw_len;
+
+        // Reject oversized Content-Length before routing
+        if (http.getContentLength(&request)) |content_length| {
+            if (content_length > config.MAX_BODY_SIZE) {
+                self.logAccess(413);
+                error_response.sendErrorStatus(self, 413, "body exceeds size limit");
+                return error.HttpContentLengthOverflow;
+            }
+        }
+
+        // Parse query string and clear param cache for route matching
+        self.query_cache.clear();
+        if (query_pos) |qi| {
+            parseQueryString(request.path[qi + 1 ..], &self.query_cache);
+        }
+        self.param_cache.clear();
+
+        return request;
     }
 
     fn dispatchToHandler(self: *Connection, ref: i32, exchange: *HttpExchange, request: *const http.Request, clean_path: []const u8) !void {
@@ -422,54 +450,49 @@ pub const Connection = struct {
         error_response.sendErrorStatus(self, 404, "route not found");
     }
 
-    pub fn sendResponse(self: *Connection) !void {
+    /// Request lifecycle coordinator: parse → route → dispatch.
+    /// Each stage owns its error path and sends the appropriate HTTP error
+    /// response before returning an error to the caller.
+    pub fn handleRequest(self: *Connection) !void {
         self.state = .processing;
         self.http_state.request_start_ns = std.time.nanoTimestamp();
 
-        const request = self.parseHttpRequest() orelse return;
-        const alloc = self.arena.allocator();
+        const request = try self.parseRequest();
+        const ref = try self.routeRequest(&request) orelse return;
+        try self.dispatchRequest(&request, ref);
+    }
 
-        const query_pos = std.mem.indexOfScalar(u8, request.path, '?');
-        const clean_path = if (query_pos) |qi| request.path[0..qi] else request.path;
-
-        self.http_state.request_method = request.method;
-        self.http_state.request_path = clean_path;
-        self.http_state.request_raw_len = request.raw_len;
+    /// Route stage: health check short-circuit, trie lookup, 404 on no match.
+    /// Returns the Lua handler ref, or null after sending a response (health/404).
+    fn routeRequest(self: *Connection, request: *const http.Request) !?i32 {
+        const clean_path = self.http_state.request_path;
 
         // Health endpoint: handled before Lua routing (zero Lua overhead)
         if (std.mem.eql(u8, clean_path, "/health")) {
-            self.serveHealth(alloc);
-            return;
+            self.serveHealth(self.arena.allocator());
+            return null;
         }
 
-        // Reject oversized Content-Length before reading body or routing
-        if (http.getContentLength(&request)) |content_length| {
-            if (content_length > config.MAX_BODY_SIZE) {
-                self.logAccess(413);
-                error_response.sendErrorStatus(self, 413, "body exceeds size limit");
-                return;
-            }
-        }
-
-        self.query_cache.clear();
-        if (query_pos) |qi| {
-            parseQueryString(request.path[qi + 1 ..], &self.query_cache);
-        }
-
-        self.param_cache.clear();
         const lua_ref = self.router.match(request.method, clean_path, &self.param_cache) catch {
             error_response.sendError(self, .client_error, "route match error");
-            return;
+            return error.RouteMatchFailed;
         };
 
-        if (lua_ref) |ref| {
-            const exchange = try alloc.create(HttpExchange);
-            exchange.* = try HttpExchange.init(alloc, &request, &self.param_cache, &self.query_cache, clean_path);
-            try self.dispatchToHandler(ref, exchange, &request, clean_path);
-        } else {
+        if (lua_ref == null) {
             self.logAccess(404);
             self.send404NotFound();
         }
+        return lua_ref;
+    }
+
+    /// Dispatch stage: create HttpExchange, hand off to Lua handler.
+    /// Handles completed responses, coroutine yields, and protocol upgrades.
+    fn dispatchRequest(self: *Connection, request: *const http.Request, ref: i32) !void {
+        const alloc = self.arena.allocator();
+        const clean_path = self.http_state.request_path;
+        const exchange = try alloc.create(HttpExchange);
+        exchange.* = try HttpExchange.init(alloc, request, &self.param_cache, &self.query_cache, clean_path);
+        try self.dispatchToHandler(ref, exchange, request, clean_path);
     }
 
     /// Serialize response from exchange and submit write
@@ -693,7 +716,7 @@ pub const Connection = struct {
 
         // If there's leftover data in the buffer (HTTP pipelining), process it now
         if (self.read_buffer.availableRead() > 0) {
-            self.sendResponse() catch |err| {
+            self.handleRequest() catch |err| {
                 std.log.err("[fd={d}] pipelined response dispatch failed err={}", .{ self.socket, err });
                 self.close();
             };
