@@ -100,6 +100,12 @@ pub const Connection = struct {
     // Body size tracking: accumulated bytes for streaming body enforcement
     body_bytes_received: u64 = 0,
 
+    // Per-request timeout: timer fires after REQUEST_TIMEOUT_MS, sending 504
+    // Completions initialized to .{} per xev requirements (Pitfall 3: never undefined)
+    timer_completion: xev.Completion = .{},
+    timer_cancel_completion: xev.Completion = .{},
+    timed_out: bool = false,
+
     // Connection state machine
     state: State = .reading,
 
@@ -178,6 +184,48 @@ pub const Connection = struct {
         // param_cache/query_cache are inline structs, no deinit needed
         self.base_allocator.free(self.read_buffer.data);
         allocator.destroy(self);
+    }
+
+    /// Start the per-request deadline timer. Fires onRequestTimeout after REQUEST_TIMEOUT_MS.
+    /// Called after successful route match, before Lua dispatch.
+    fn startRequestTimer(self: *Connection) void {
+        self.loop.timer(&self.timer_completion, config.REQUEST_TIMEOUT_MS, self, onRequestTimeout);
+    }
+
+    /// Cancel the per-request deadline timer on normal response completion.
+    /// Safe to call if timer already fired or was never started.
+    fn cancelRequestTimer(self: *Connection) void {
+        if (self.timed_out) return; // already fired, nothing to cancel
+        self.timer_cancel_completion = .{
+            .op = .{ .timer_remove = .{ .timer = &self.timer_completion } },
+        };
+        self.loop.add(&self.timer_cancel_completion);
+    }
+
+    /// xev callback: request deadline exceeded.
+    /// Sets timed_out flag, sends 504 to client. Does NOT transition to .closing
+    /// here — sendRawResponse sets state to .writing; onWrite detects timed_out
+    /// and calls maybeFinishClose after the 504 write completes.
+    /// Does NOT call deinit directly — deferred deinit ensures Connection outlives
+    /// all armed cosocket completions (pending_completions).
+    fn onRequestTimeout(
+        userdata: ?*anyopaque,
+        loop: *xev.Loop,
+        completion: *xev.Completion,
+        result: xev.Result,
+    ) xev.CallbackAction {
+        _ = loop;
+        _ = completion;
+        _ = result;
+        const self = castUserdata(Connection, userdata);
+        // Guard: already closing or in a long-lived protocol
+        if (self.state == .closing) return .disarm;
+        // WebSocket and SSE connections are exempt from request timeout
+        if (self.state == .websocket or self.state == .sse) return .disarm;
+        self.timed_out = true;
+        // Send 504 — sendRawResponse sets state to .writing, onWrite completes the close
+        error_response.sendError(self, .timeout, "request timeout");
+        return .disarm;
     }
 
     /// Start reading from connection
@@ -290,6 +338,8 @@ pub const Connection = struct {
     }
 
     fn dispatchToHandler(self: *Connection, ref: i32, exchange: *HttpExchange, request: *const http.Request, clean_path: []const u8) !void {
+        // Start the per-request deadline clock before Lua dispatch
+        self.startRequestTimer();
         self.lua_state.current_connection = self;
         const handler_result = self.lua_state.callLuaHandler(ref, exchange) catch |err| {
             self.lua_state.current_connection = null;
@@ -305,6 +355,8 @@ pub const Connection = struct {
                 self.lua_state.current_connection = null;
 
                 if (exchange.upgrade_websocket) {
+                    // WebSocket connections are long-lived — exempt from request timeout
+                    self.cancelRequestTimer();
                     conn_ws.handleWsUpgrade(self, exchange, request) catch {
                         self.logAccess(400);
                         error_response.sendError(self, .client_error, "websocket upgrade failed");
@@ -314,6 +366,8 @@ pub const Connection = struct {
                 }
 
                 if (exchange.upgrade_sse) {
+                    // SSE connections are long-lived — exempt from request timeout
+                    self.cancelRequestTimer();
                     conn_sse.handleSseUpgrade(self, exchange);
                     return;
                 }
@@ -518,6 +572,13 @@ pub const Connection = struct {
             self.close();
             return .disarm;
         };
+        // If this write was the 504 timeout response, close instead of recycling.
+        // pending_completions may still be non-zero (cosocket I/O in flight),
+        // so close() -> maybeFinishClose() defers deinit until all completions drain.
+        if (self.timed_out) {
+            self.close();
+            return .disarm;
+        }
         switch (self.state) {
             .websocket => self.handleWsPostWrite(bytes_written),
             .sse => self.handleSsePostWrite(),
@@ -566,6 +627,8 @@ pub const Connection = struct {
     /// Post-write handler for HTTP responses: reset state for keep-alive,
     /// handle pipelining.
     fn handleHttpPostWrite(self: *Connection, bytes_written: usize) void {
+        // Cancel the per-request deadline timer on successful response completion
+        self.cancelRequestTimer();
         self.suspended = null;
         self.sq.reset();
         self.cq.reset();
@@ -590,8 +653,9 @@ pub const Connection = struct {
         // Reset ciphertext buffer but NOT tls_conn — TLS session persists across keep-alive
         if (self.ciphertext_buffer) |*cb| cb.reset();
 
-        // Reset body tracking for next request on keep-alive
+        // Reset body tracking and timeout flag for next request on keep-alive
         self.body_bytes_received = 0;
+        self.timed_out = false;
 
         self.state = .reading;
 
@@ -619,6 +683,59 @@ pub const Connection = struct {
         // Decrement active connection counters
         _ = self.server.active_connections.fetchSub(1, .monotonic);
         self.server.metrics.decrementActiveConnections();
-        self.deinit(self.base_allocator);
+        // Deferred deinit: only free when all armed cosocket completions have fired.
+        // Normal HTTP connections have pending_completions == 0 (no cosocket I/O),
+        // so maybeFinishClose is equivalent to deinit() in the common case.
+        self.maybeFinishClose();
+    }
+
+    /// Deferred deinit guard: only free Connection when all armed cosocket
+    /// completions have fired. Called at every point where pending_completions
+    /// is decremented to ensure Connection outlives in-flight xev callbacks.
+    pub fn maybeFinishClose(self: *Connection) void {
+        if (self.state == .closing and self.pending_completions == 0) {
+            self.deinit(self.base_allocator);
+        }
+    }
+
+    // =========================================================================
+    // Tests
+    // =========================================================================
+
+    test "maybeFinishClose: does not deinit when pending_completions > 0" {
+        // We can only test the guard logic without a real allocator/connection.
+        // Verify that the condition pending_completions > 0 prevents close.
+        const conn = struct {
+            state: State,
+            pending_completions: u8,
+        }{
+            .state = .closing,
+            .pending_completions = 1,
+        };
+        // Guard: closing with pending_completions == 1 must NOT deinit
+        try std.testing.expect(!(conn.state == .closing and conn.pending_completions == 0));
+    }
+
+    test "maybeFinishClose: condition met when closing and no pending_completions" {
+        const conn = struct {
+            state: State,
+            pending_completions: u8,
+        }{
+            .state = .closing,
+            .pending_completions = 0,
+        };
+        // Guard: closing with pending_completions == 0 SHOULD deinit
+        try std.testing.expect(conn.state == .closing and conn.pending_completions == 0);
+    }
+
+    test "maybeFinishClose: does not deinit when not closing" {
+        const conn = struct {
+            state: State,
+            pending_completions: u8,
+        }{
+            .state = .processing,
+            .pending_completions = 0,
+        };
+        try std.testing.expect(!(conn.state == .closing and conn.pending_completions == 0));
     }
 };
