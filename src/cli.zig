@@ -134,7 +134,7 @@ pub fn printHelp() void {
     const usage =
         \\Usage: keyway [OPTIONS]
         \\
-        \\Keyway - High-performance HTTP server (Zig + LuaJIT + io_uring)
+        \\Keyway - Programmable HTTP engine (Zig + LuaJIT + io_uring)
         \\
         \\Options:
         \\  --host <addr>       Listen address (default: 0.0.0.0, env: KEYWAY_HOST)

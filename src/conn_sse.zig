@@ -22,7 +22,7 @@ pub const SseState = struct {
     pub fn deinit(self: *SseState, conn: *Connection) void {
         if (self.registry) |reg| reg.unsubscribe(self.room, conn);
         conn.base_allocator.free(self.room);
-        for (self.send_queue.items) |queued| conn.base_allocator.free(queued);
+        for (self.send_queue.items[self.drain_index..]) |queued| conn.base_allocator.free(queued);
         self.send_queue.deinit(conn.base_allocator);
     }
 };

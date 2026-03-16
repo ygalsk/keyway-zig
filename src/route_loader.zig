@@ -1,6 +1,7 @@
 const std = @import("std");
 const Lua = @import("luajit").Lua;
-const Router = @import("router.zig").Router;
+const router_mod = @import("router.zig");
+const Router = router_mod.Router;
 
 // === Declarative Route Table Processing ===
 // Extracted from lua_api.zig — walks keyway.routes and registers with the Router.
@@ -189,4 +190,63 @@ fn registerRoute(
         };
         std.log.debug("route registered method={s} path={s} lua_ref={d} middleware={d}", .{ method, path, lua_ref, middleware.len });
     }
+}
+
+/// Process keyway.static table after script load.
+/// Registers static file serving routes with the router.
+pub fn processStaticTable(lua: *Lua, router: *Router) !void {
+    const keyway_type = lua.getGlobal("keyway");
+    if (keyway_type != .table) {
+        lua.pop(1);
+        return; // no keyway table — not an error
+    }
+
+    const static_type = lua.getField(-1, "static");
+    if (static_type != .table) {
+        lua.pop(2);
+        return; // no keyway.static — not an error, static serving is optional
+    }
+
+    // Iterate keyway.static entries: { ["/prefix"] = { root = "...", index = "..." } }
+    lua.pushNil();
+    while (lua.next(-2)) {
+        const key_cstr = lua.toString(-2) catch {
+            lua.pop(1);
+            continue;
+        };
+        const prefix = std.mem.span(key_cstr);
+
+        if (!lua.isTable(-1) or prefix.len == 0 or prefix[0] != '/') {
+            std.log.warn("keyway.static: ignoring invalid entry key={s}", .{prefix});
+            lua.pop(1);
+            continue;
+        }
+
+        // Read root (required)
+        const root_type = lua.getField(-1, "root");
+        const root_str = if (root_type == .string) std.mem.span(lua.toString(-1) catch "") else "";
+        lua.pop(1);
+
+        if (root_str.len == 0) {
+            std.log.warn("keyway.static[{s}]: missing 'root' field", .{prefix});
+            lua.pop(1);
+            continue;
+        }
+
+        // Read index (optional, defaults to "index.html")
+        const index_type = lua.getField(-1, "index");
+        const index_str = if (index_type == .string) std.mem.span(lua.toString(-1) catch "index.html") else "index.html";
+        lua.pop(1);
+
+        router.addStaticRoute(prefix, root_str, index_str) catch |err| {
+            std.log.err("keyway.static[{s}]: failed to register: {}", .{ prefix, err });
+            lua.pop(1);
+            continue;
+        };
+
+        std.log.info("static route registered prefix={s} root={s} index={s}", .{ prefix, root_str, index_str });
+        lua.pop(1); // pop value, keep key
+    }
+
+    lua.pop(2); // pop static + keyway
 }

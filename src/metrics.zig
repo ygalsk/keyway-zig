@@ -15,6 +15,7 @@ pub const WorkerMetrics = struct {
     request_count: std.atomic.Value(u64),
     error_count: std.atomic.Value(u64),
     active_connections: std.atomic.Value(u32),
+    rejected_connections: std.atomic.Value(u64),
     latency_sum_us: std.atomic.Value(u64),
     latency_min_us: std.atomic.Value(u64),
     latency_max_us: std.atomic.Value(u64),
@@ -25,6 +26,7 @@ pub const WorkerMetrics = struct {
             .request_count = std.atomic.Value(u64).init(0),
             .error_count = std.atomic.Value(u64).init(0),
             .active_connections = std.atomic.Value(u32).init(0),
+            .rejected_connections = std.atomic.Value(u64).init(0),
             .latency_sum_us = std.atomic.Value(u64).init(0),
             .latency_min_us = std.atomic.Value(u64).init(std.math.maxInt(u64)),
             .latency_max_us = std.atomic.Value(u64).init(0),
@@ -56,6 +58,11 @@ pub const WorkerMetrics = struct {
     pub fn decrementActiveConnections(self: *WorkerMetrics) void {
         _ = self.active_connections.fetchSub(1, .monotonic);
     }
+
+    /// Increment rejected connection count (called when over limit).
+    pub fn incrementRejectedConnections(self: *WorkerMetrics) void {
+        _ = self.rejected_connections.fetchAdd(1, .monotonic);
+    }
 };
 
 /// Point-in-time aggregated snapshot across all workers.
@@ -65,6 +72,7 @@ pub const AggregatedMetrics = struct {
     total_requests: u64,
     total_errors: u64,
     active_connections: u64,
+    rejected_connections: u64,
     latency_min_us: u64,
     latency_max_us: u64,
     latency_avg_us: u64,
@@ -75,6 +83,7 @@ pub fn aggregate(metrics: []const *WorkerMetrics, status: []const u8) Aggregated
     var total_requests: u64 = 0;
     var total_errors: u64 = 0;
     var active_connections: u64 = 0;
+    var rejected_connections: u64 = 0;
     var latency_sum: u64 = 0;
     var global_min: u64 = std.math.maxInt(u64);
     var global_max: u64 = 0;
@@ -83,6 +92,7 @@ pub fn aggregate(metrics: []const *WorkerMetrics, status: []const u8) Aggregated
         total_requests += m.request_count.load(.monotonic);
         total_errors += m.error_count.load(.monotonic);
         active_connections += m.active_connections.load(.monotonic);
+        rejected_connections += m.rejected_connections.load(.monotonic);
         latency_sum += m.latency_sum_us.load(.monotonic);
 
         const worker_min = m.latency_min_us.load(.monotonic);
@@ -101,6 +111,7 @@ pub fn aggregate(metrics: []const *WorkerMetrics, status: []const u8) Aggregated
         .total_requests = total_requests,
         .total_errors = total_errors,
         .active_connections = active_connections,
+        .rejected_connections = rejected_connections,
         .latency_min_us = min,
         .latency_max_us = global_max,
         .latency_avg_us = avg,
@@ -116,6 +127,7 @@ test "WorkerMetrics.init has correct defaults" {
     try std.testing.expectEqual(@as(u64, 0), m.request_count.raw);
     try std.testing.expectEqual(@as(u64, 0), m.error_count.raw);
     try std.testing.expectEqual(@as(u32, 0), m.active_connections.raw);
+    try std.testing.expectEqual(@as(u64, 0), m.rejected_connections.raw);
     try std.testing.expectEqual(@as(u64, 0), m.latency_sum_us.raw);
     try std.testing.expectEqual(std.math.maxInt(u64), m.latency_min_us.raw);
     try std.testing.expectEqual(@as(u64, 0), m.latency_max_us.raw);
@@ -185,6 +197,7 @@ test "aggregate across two workers" {
     try std.testing.expectEqual(@as(u64, 4), result.total_requests);
     try std.testing.expectEqual(@as(u64, 2), result.total_errors);
     try std.testing.expectEqual(@as(u64, 3), result.active_connections);
+    try std.testing.expectEqual(@as(u64, 0), result.rejected_connections);
     try std.testing.expectEqual(@as(u64, 100), result.latency_min_us); // global min
     try std.testing.expectEqual(@as(u64, 400), result.latency_max_us); // global max
     try std.testing.expectEqual(@as(u64, 250), result.latency_avg_us); // (100+300+200+400)/4

@@ -54,8 +54,9 @@ pub const SseRegistry = struct {
     fn broadcastLocal(self: *SseRegistry, room: []const u8, data: []const u8) void {
         const list = self.rooms.getPtr(room) orelse return;
 
-        // Format SSE event: "data: {payload}\n\n"
-        const formatted = std.fmt.allocPrint(self.allocator, "data: {s}\n\n", .{data}) catch return;
+        // Caller provides the SSE frame body (e.g. "data: ...\n" or "event: ...\ndata: ...\n").
+        // We append a single \n to terminate the SSE message.
+        const formatted = std.fmt.allocPrint(self.allocator, "{s}\n", .{data}) catch return;
         defer self.allocator.free(formatted);
 
         var i: usize = list.items.len;
@@ -151,6 +152,14 @@ pub const SseBroadcastBus = struct {
         slot.ready = true;
     }
 
+    /// Mark a worker slot as not ready and wake its notifier so it self-disarms.
+    /// Called during shutdown to release the armed poll completion.
+    pub fn disarmWorker(self: *SseBroadcastBus, worker_id: usize) void {
+        const slot = &self.slots[worker_id];
+        slot.ready = false;
+        slot.notifier.notify() catch {};
+    }
+
     /// Publish a message to all workers' inboxes and wake their event loops.
     pub fn publish(self: *SseBroadcastBus, room: []const u8, data: []const u8) void {
         for (self.slots[0..self.num_workers]) |*slot| {
@@ -210,6 +219,9 @@ pub const SseBroadcastBus = struct {
                     self.allocator.free(msg.data);
                 }
                 messages.deinit(self.allocator);
+
+                // During shutdown, slot.ready is cleared — don't re-arm.
+                if (!slot.ready) return .disarm;
 
                 // Re-arm the async watcher
                 slot.notifier.wait(loop, &slot.completion, SseBroadcastBus, self, onNotify);

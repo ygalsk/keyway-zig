@@ -99,6 +99,8 @@ fn luaExchangeNewIndex(lua: *Lua) callconv(.c) c_int {
             ex.upgrade_websocket = true;
         } else if (std.mem.eql(u8, val_str, "sse")) {
             ex.upgrade_sse = true;
+        } else if (std.mem.eql(u8, val_str, "stream")) {
+            ex.upgrade_stream = true;
         }
     } else if (std.mem.eql(u8, key_str, "sse_room")) {
         const val = lua.toString(3) catch return 0;

@@ -6,7 +6,10 @@ const LuaState = @import("lua_state.zig").LuaState;
 const bpf_reuseport = @import("bpf_reuseport.zig");
 const TlsContext = @import("tls.zig").TlsContext;
 const castUserdata = @import("helpers.zig").castUserdata;
-const SseRegistry = @import("sse.zig").SseRegistry;
+const sse = @import("sse.zig");
+const SseRegistry = sse.SseRegistry;
+const SseBroadcastBus = sse.SseBroadcastBus;
+const ShutdownCoordinator = @import("shutdown.zig").ShutdownCoordinator;
 const tuning = @import("config.zig");
 const WorkerMetrics = @import("metrics.zig").WorkerMetrics;
 
@@ -21,6 +24,9 @@ pub const Server = struct {
     socket: std.posix.socket_t,
     address: std.net.Address,
     accept_completion: xev.Completion,
+    accept_cancel_completion: xev.Completion = .{},
+    coordinator: ?*ShutdownCoordinator = null,
+    worker_id: usize = 0,
     router: *Router,
     lua_state: *LuaState,
     tls_ctx: ?TlsContext,
@@ -28,6 +34,7 @@ pub const Server = struct {
     metrics: *WorkerMetrics,
     all_worker_metrics: []const *WorkerMetrics = &.{},
     draining: bool = false,
+    connections: Connection.List = .{},
 
     /// Server configuration
     pub const Config = struct {
@@ -179,6 +186,14 @@ pub const Server = struct {
             return .disarm;
         }
 
+        // Connection limit: reject when over MAX_CONNECTIONS_PER_WORKER
+        if (self.metrics.active_connections.load(.monotonic) >= tuning.MAX_CONNECTIONS_PER_WORKER) {
+            std.posix.close(client_socket);
+            self.metrics.incrementRejectedConnections();
+            self.acceptNext();
+            return .disarm;
+        }
+
         // Set TCP_NODELAY to disable Nagle's algorithm (reduce latency)
         std.posix.setsockopt(
             client_socket,
@@ -231,14 +246,46 @@ pub const Server = struct {
         self.draining = true;
     }
 
-    /// Force-close all connections by closing the listen socket.
-    /// Armed completions on the listen fd will fail, cascading cleanup.
+    /// Force-close the listen socket and every tracked client connection.
+    /// Safe to call multiple times (guards against double-close).
     pub fn forceCloseAll(self: *Server) void {
-        // Closing the listen socket causes pending accept to fail.
-        // Individual connections will get errors on their next I/O.
-        std.posix.close(self.socket);
-        // Re-assign to invalid fd to prevent double-close in deinit
-        self.socket = -1;
+        // Cancel the pending accept completion via io_uring.
+        // Just closing the fd does NOT cancel pending io_uring ops — the accept
+        // would block the loop forever. The cancel op delivers ECANCELED to onAccept.
+        if (self.socket != -1) {
+            self.accept_cancel_completion = .{
+                .op = .{ .cancel = .{ .c = &self.accept_completion } },
+                .callback = onCancelComplete,
+            };
+            self.loop.add(&self.accept_cancel_completion);
+
+            // Wake SSE bus notifier so it can self-disarm (slot.ready is false)
+            if (self.sse_registry) |reg| {
+                if (reg.bus) |bus| {
+                    bus.disarmWorker(reg.worker_id);
+                }
+            }
+
+            // Wake shutdown async so it can self-disarm (sees socket == -1)
+            if (self.coordinator) |coord| {
+                coord.getAsync(self.worker_id).notify() catch {};
+            }
+
+            std.posix.close(self.socket);
+            self.socket = -1;
+        }
+        // Force-close every tracked connection.
+        // Advance iterator before close() since close -> deinit removes the node.
+        var it = self.connections.first;
+        while (it) |node| {
+            it = node.next;
+            const conn: *Connection = @alignCast(@fieldParentPtr("link", node));
+            conn.close();
+        }
+    }
+
+    fn onCancelComplete(_: ?*anyopaque, _: *xev.Loop, _: *xev.Completion, _: xev.Result) xev.CallbackAction {
+        return .disarm;
     }
 
     /// Clean up server resources

@@ -132,7 +132,7 @@ fn finish(self: *Connection, tls_conn: *TlsConn) void {
     // Free TlsConn — no longer needed after kTLS
     tls_mod.freeTlsConn(self.base_allocator, tls_conn);
     s.outbound_tls = null;
-    s.outbound_fd = 0;
+    s.outbound_fd = -1;
     s.pending_op = .none;
     self.cs.pending_completions -= 1;
     const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));

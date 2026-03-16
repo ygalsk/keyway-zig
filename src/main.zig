@@ -91,4 +91,5 @@ pub fn main() !void {
 comptime {
     _ = @import("metrics.zig");
     _ = @import("shutdown.zig");
+    _ = @import("ws.zig");
 }

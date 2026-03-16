@@ -30,11 +30,13 @@ const conn_tls = @import("conn_tls.zig");
 const castUserdata = @import("helpers.zig").castUserdata;
 const conn_sse = @import("conn_sse.zig");
 const conn_ws = @import("conn_ws.zig");
+const conn_stream = @import("conn_stream.zig");
 const cosocket = @import("cosocket.zig");
 const error_response = @import("error_response.zig");
 const Server = @import("server.zig").Server;
 const WorkerMetrics = @import("metrics.zig").WorkerMetrics;
 const metrics_mod = @import("metrics.zig");
+const static_mod = @import("static.zig");
 
 const ParamArray = params.ParamArray;
 const QueryArray = params.QueryArray;
@@ -90,7 +92,12 @@ pub const CosocketState = struct {
 
 /// Connection handler - manages HTTP request/response lifecycle
 pub const Connection = struct {
-    pub const State = enum { reading, processing, writing, websocket, sse, closing };
+    pub const State = enum { reading, processing, writing, websocket, sse, streaming, static_file, closing };
+    pub const List = std.DoublyLinkedList;
+
+    // Intrusive linked list node for Server.connections tracking.
+    // Enables forceCloseAll() to walk and close every live connection.
+    link: List.Node = .{},
 
     // Core coordinator fields
     base_allocator: std.mem.Allocator,
@@ -126,6 +133,12 @@ pub const Connection = struct {
     // SSE registry pointer: injected at init, copied into SseState at upgrade time
     sse_registry: ?*SseRegistry = null,
 
+    // Streaming: non-null when connection has been upgraded to chunked streaming
+    stream_state: ?conn_stream.StreamState = null,
+
+    // Static file: non-null when serving a static file
+    static_state: ?static_mod.StaticState = null,
+
     // Per-request timeout: timer fires after REQUEST_TIMEOUT_MS, sending 504
     // Completions initialized to .{} per xev requirements (Pitfall 3: never undefined)
     timer_completion: xev.Completion = .{},
@@ -135,6 +148,11 @@ pub const Connection = struct {
     // In-flight timer completions (timer + timer_remove). Guards maybeFinishClose
     // so Connection outlives all armed timer CQEs — prevents use-after-free.
     pending_timer_ops: u8 = 0,
+
+    // Header timeout: fires if complete headers aren't received within HEADER_TIMEOUT_MS
+    header_timer_completion: xev.Completion = .{},
+    header_timer_cancel_completion: xev.Completion = .{},
+    header_timer_armed: bool = false,
 
     // Connection state machine
     state: State = .reading,
@@ -179,6 +197,8 @@ pub const Connection = struct {
             .server = server,
         };
 
+        server.connections.append(&conn.link);
+
         return conn;
     }
 
@@ -188,6 +208,8 @@ pub const Connection = struct {
     }
 
     pub fn deinit(self: *Connection, allocator: std.mem.Allocator) void {
+        // Remove from server's connection tracking list
+        self.server.connections.remove(&self.link);
         // Clean up suspended coroutine state if connection closes mid-I/O
         if (self.cs.suspended) |s| {
             // Unref pinned coroutine to prevent Lua registry leak
@@ -195,7 +217,7 @@ pub const Connection = struct {
                 self.lua_state.lua.unref(Lua.PseudoIndex.Registry, s.coroutine_ref);
             }
             // Close leaked outbound fd
-            if (s.outbound_fd != 0) std.posix.close(s.outbound_fd);
+            if (s.outbound_fd != -1) std.posix.close(s.outbound_fd);
         }
         // Clean up WebSocket callback refs
         if (self.ws_state) |wss| {
@@ -204,6 +226,8 @@ pub const Connection = struct {
         }
         // Clean up SSE state
         if (self.sse_state) |*ss| ss.deinit(self);
+        // Clean up static file state
+        if (self.static_state) |*ss| ss.deinit(self.base_allocator);
         // Clean up TLS resources
         self.tls_state.deinit(self.base_allocator);
         std.posix.close(self.socket);
@@ -251,6 +275,70 @@ pub const Connection = struct {
         return .disarm;
     }
 
+    /// Start the header deadline timer. Fires onHeaderTimeout after HEADER_TIMEOUT_MS.
+    /// Called from startRead when beginning a new request (not mid-parse).
+    fn startHeaderTimer(self: *Connection) void {
+        if (self.header_timer_armed) return;
+        self.header_timer_armed = true;
+        self.pending_timer_ops += 1;
+        self.loop.timer(&self.header_timer_completion, config.HEADER_TIMEOUT_MS, self, onHeaderTimeout);
+    }
+
+    /// Cancel the header deadline timer on successful header parse.
+    fn cancelHeaderTimer(self: *Connection) void {
+        if (!self.header_timer_armed) return;
+        self.header_timer_armed = false;
+        self.pending_timer_ops += 1;
+        self.header_timer_cancel_completion = .{
+            .op = .{ .timer_remove = .{ .timer = &self.header_timer_completion } },
+            .userdata = self,
+            .callback = onHeaderTimerCancelComplete,
+        };
+        self.loop.add(&self.header_timer_cancel_completion);
+    }
+
+    fn onHeaderTimerCancelComplete(
+        userdata: ?*anyopaque,
+        loop: *xev.Loop,
+        completion: *xev.Completion,
+        result: xev.Result,
+    ) xev.CallbackAction {
+        _ = loop;
+        _ = completion;
+        _ = result;
+        const self = castUserdata(Connection, userdata);
+        self.pending_timer_ops -= 1;
+        self.maybeFinishClose();
+        return .disarm;
+    }
+
+    /// Header timeout fired — close without response (client is adversarial/slow).
+    fn onHeaderTimeout(
+        userdata: ?*anyopaque,
+        loop: *xev.Loop,
+        completion: *xev.Completion,
+        result: xev.Result,
+    ) xev.CallbackAction {
+        _ = loop;
+        _ = completion;
+        const self = castUserdata(Connection, userdata);
+        const trigger = result.timer catch {
+            self.pending_timer_ops -= 1;
+            self.maybeFinishClose();
+            return .disarm;
+        };
+        self.pending_timer_ops -= 1;
+        if (trigger == .cancel) {
+            self.maybeFinishClose();
+            return .disarm;
+        }
+        self.header_timer_armed = false;
+        if (self.state == .closing) return .disarm;
+        // Close without response — slowloris protection
+        self.close();
+        return .disarm;
+    }
+
     /// xev callback: request deadline exceeded.
     /// Sets timed_out flag, sends 504 to client. Does NOT transition to .closing
     /// here — sendRawResponse sets state to .writing; onWrite detects timed_out
@@ -283,8 +371,8 @@ pub const Connection = struct {
         self.timer_armed = false;
         // Guard: already closing or in a long-lived protocol
         if (self.state == .closing) return .disarm;
-        // WebSocket and SSE connections are exempt from request timeout
-        if (self.state == .websocket or self.state == .sse) return .disarm;
+        // WebSocket, SSE, and streaming connections are exempt from request timeout
+        if (self.state == .websocket or self.state == .sse or self.state == .streaming) return .disarm;
         self.timed_out = true;
         // Send 504 — sendRawResponse sets state to .writing, onWrite completes the close
         error_response.sendError(self, .timeout, "request timeout");
@@ -296,6 +384,10 @@ pub const Connection = struct {
     /// reads go directly to the plaintext read_buffer (kernel decrypts).
     /// During TLS handshake (tls_conn non-null), reads target the ciphertext_buffer.
     pub fn startRead(self: *Connection) void {
+        // Start header timeout for new requests (not mid-parse continuations)
+        if (!self.header_timer_armed and self.state == .reading) {
+            self.startHeaderTimer();
+        }
         const buf = if (self.tls_state.ciphertext_buffer) |*cb| blk: {
             if (cb.availableWrite() == 0) {
                 self.send400BadRequest();
@@ -454,13 +546,19 @@ pub const Connection = struct {
                 try self.writeResponse(exchange);
             },
             .yielded => {
+                // Stream upgrade: handler yields after ctx.upgrade = "stream"
+                if (exchange.upgrade_stream) {
+                    self.cancelRequestTimer();
+                    conn_stream.handleStreamUpgrade(self, exchange);
+                    return;
+                }
                 self.cs.suspended = .{
                     .completion = undefined,
                     .exchange = exchange,
                     .recv_buf = null,
                     .coroutine_ref = self.lua_state.coroutine_ref,
                     .coroutine_thread = @ptrCast(self.lua_state.coroutine_thread.?),
-                    .outbound_fd = 0,
+                    .outbound_fd = -1,
                     .pending_op = .none,
                 };
                 self.lua_state.coroutine_ref = 0;
@@ -485,6 +583,8 @@ pub const Connection = struct {
         self.http_state.request_start_ns = std.time.nanoTimestamp();
 
         const request = self.parseRequest() catch return;
+        // Headers received successfully — cancel header timeout
+        self.cancelHeaderTimer();
         const ref = (self.routeRequest(&request) catch return) orelse return;
         self.dispatchRequest(&request, ref) catch |err| {
             std.log.err("[fd={d}] dispatch failed err={}", .{ self.socket, err });
@@ -500,6 +600,16 @@ pub const Connection = struct {
         // Health endpoint: handled before Lua routing (zero Lua overhead)
         if (std.mem.eql(u8, clean_path, "/health")) {
             self.serveHealth(self.arena.allocator());
+            return null;
+        }
+
+        // Static file routes: handled before Lua routing (zero Lua overhead)
+        if (self.router.matchStatic(clean_path)) |match| {
+            if (!std.mem.eql(u8, request.method, "GET") and !std.mem.eql(u8, request.method, "HEAD")) {
+                error_response.sendErrorStatus(self, 405, "method not allowed for static file");
+                return null;
+            }
+            static_mod.serveStaticFile(self, request, match.route, match.suffix);
             return null;
         }
 
@@ -600,13 +710,14 @@ pub const Connection = struct {
 
         // Build full HTTP response in a single allocation (JSON body is small and bounded)
         const status_line: []const u8 = if (http_status == 200) "HTTP/1.1 200 OK" else "HTTP/1.1 503 Service Unavailable";
-        const json_fmt = "{{\"status\":\"{s}\",\"worker_count\":{d},\"total_requests\":{d},\"total_errors\":{d},\"active_connections\":{d},\"latency\":{{\"min_us\":{d},\"max_us\":{d},\"avg_us\":{d}}}}}";
+        const json_fmt = "{{\"status\":\"{s}\",\"worker_count\":{d},\"total_requests\":{d},\"total_errors\":{d},\"active_connections\":{d},\"rejected_connections\":{d},\"latency\":{{\"min_us\":{d},\"max_us\":{d},\"avg_us\":{d}}}}}";
         const json_args = .{
             agg.status,
             agg.worker_count,
             agg.total_requests,
             agg.total_errors,
             agg.active_connections,
+            agg.rejected_connections,
             agg.latency_min_us,
             agg.latency_max_us,
             agg.latency_avg_us,
@@ -645,6 +756,7 @@ pub const Connection = struct {
         switch (self.state) {
             .websocket => self.handleWsPostWrite(bytes_written),
             .sse => self.handleSsePostWrite(),
+            .streaming => conn_stream.handleStreamPostWrite(self),
             else => self.handleHttpPostWrite(bytes_written),
         }
         return .disarm;
@@ -688,7 +800,7 @@ pub const Connection = struct {
 
     /// Post-write handler for HTTP responses: reset state for keep-alive,
     /// handle pipelining.
-    fn handleHttpPostWrite(self: *Connection, bytes_written: usize) void {
+    pub fn handleHttpPostWrite(self: *Connection, bytes_written: usize) void {
         // Cancel the per-request deadline timer on successful response completion
         self.cancelRequestTimer();
         self.cs.suspended = null;
@@ -714,10 +826,11 @@ pub const Connection = struct {
 
         // After kTLS, ciphertext_buffer is null — nothing to reset
 
-        // Reset body tracking and timeout flag for next request on keep-alive
+        // Reset body tracking and timeout flags for next request on keep-alive
         self.http_state.body_bytes_received = 0;
         self.timed_out = false;
         self.timer_armed = false;
+        self.header_timer_armed = false;
 
         self.state = .reading;
 

@@ -51,21 +51,29 @@ pub fn handleWsUpgrade(conn: *Connection, exchange: *HttpExchange, request: *con
         .on_message_ref = exchange.ws_on_message_ref,
         .on_close_ref = exchange.ws_on_close_ref,
     };
-    conn.state = .websocket;
     // Clear exchange refs so they aren't double-freed
     exchange.ws_on_message_ref = 0;
     exchange.ws_on_close_ref = 0;
 
     conn.logAccess(101);
 
-    // Send 101 — onWrite dispatches via state enum to WS read loop
+    // Send 101 — writeResponseDirect sets state to .writing, so we set .websocket
+    // AFTER so onWrite dispatches to handleWsPostWrite (starts WS frame read loop).
     try conn.writeResponseDirect(&resp);
+    conn.state = .websocket;
 }
 
 /// Start reading WebSocket frames from the client.
 pub fn startWsRead(conn: *Connection) void {
     // Compact read buffer to reclaim consumed space before checking capacity
     conn.read_buffer.compact();
+
+    // If there's already data in the buffer (e.g., multiple frames in one TCP
+    // segment), process it before blocking on recv.
+    if (conn.read_buffer.availableRead() > 0) {
+        processWsFrames(conn);
+        return;
+    }
 
     // After kTLS, ciphertext_buffer is null — recv goes directly to read_buffer
     const buf = if (conn.tls_state.ciphertext_buffer) |*cb| blk: {
@@ -116,8 +124,19 @@ fn onWsRead(
         return .disarm;
     }
 
-    // After kTLS, recv data is already plaintext — kernel decrypts transparently
-    self.read_buffer.commitWrite(bytes_read);
+    // Commit to the buffer that actually received the data.
+    // With kTLS active, ciphertext_buffer is null and recv goes to read_buffer
+    // with kernel-transparent decryption. Pre-kTLS TLS connections would recv
+    // into ciphertext_buffer and need userspace decrypt — not yet supported for WS.
+    if (self.tls_state.ciphertext_buffer) |*cb| {
+        cb.commitWrite(bytes_read);
+        // TODO: userspace TLS decrypt path for WS (pre-kTLS connections)
+        std.log.err("ws: ciphertext_buffer recv not supported (need decrypt path)", .{});
+        self.close();
+        return .disarm;
+    } else {
+        self.read_buffer.commitWrite(bytes_read);
+    }
 
     processWsFrames(self);
     return .disarm;
@@ -212,17 +231,24 @@ fn dispatchWsMessage(conn: *Connection, payload: []const u8) void {
         return;
     };
 
+    // Set current_connection so cosocket/ring ops inside on_message work
+    conn.lua_state.current_connection = conn;
+
     // Dispatch via shared coroutine infrastructure
     const result = conn.lua_state.dispatchCoroutine(
         wss.on_message_ref,
         .{ .ws = .{ .message = payload_copy } },
     ) catch {
+        conn.lua_state.current_connection = null;
         startWsRead(conn);
         return;
     };
 
     switch (result) {
-        .completed => startWsRead(conn),
+        .completed => {
+            conn.lua_state.current_connection = null;
+            startWsRead(conn);
+        },
         .yielded => {
             // Bundle suspended state with a dummy exchange for the resumeHandler interface
             const alloc = conn.arena.allocator();
@@ -251,7 +277,7 @@ fn dispatchWsMessage(conn: *Connection, payload: []const u8) void {
                 .recv_buf = null,
                 .coroutine_ref = conn.lua_state.coroutine_ref,
                 .coroutine_thread = @ptrCast(conn.lua_state.coroutine_thread.?),
-                .outbound_fd = 0,
+                .outbound_fd = -1,
                 .pending_op = .none,
             };
             conn.lua_state.coroutine_ref = 0;
@@ -363,7 +389,7 @@ fn wsCompleteHandler(conn: *Connection) void {
         }
     }
 
-    if (s.outbound_fd != 0) std.posix.close(s.outbound_fd);
+    if (s.outbound_fd != -1) std.posix.close(s.outbound_fd);
     conn.cs.suspended = null;
 }
 

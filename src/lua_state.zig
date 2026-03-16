@@ -25,7 +25,7 @@ const SseRegistry = @import("sse.zig").SseRegistry;
 
 // zig-luajit marks resumeCoroutine as private — call C API directly.
 // Lua is an opaque type that maps 1:1 to lua_State*, so @ptrCast is safe.
-extern "c" fn lua_resume(L: *anyopaque, narg: c_int) c_int;
+pub extern "c" fn lua_resume(L: *anyopaque, narg: c_int) c_int;
 
 // Embedded stdlib modules — compiled into the binary at build time.
 // Registered as package.preload["keyway.*"] so require() resolves without disk I/O.
@@ -177,6 +177,12 @@ pub const LuaState = struct {
     /// Walks the nested table and registers routes with the radix router.
     pub fn processRouteTable(self: *LuaState, router: *Router) !void {
         try lua_api.processRouteTable(self.lua, router, self.allocator);
+    }
+
+    /// Process keyway.static declarative table after script load.
+    /// Registers static file serving routes with the router.
+    pub fn processStaticTable(self: *LuaState, router: *Router) !void {
+        try @import("route_loader.zig").processStaticTable(self.lua, router);
     }
 
     /// Call a Lua function by name

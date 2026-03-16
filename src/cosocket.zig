@@ -87,9 +87,9 @@ pub fn onOutboundComplete(
     if (self.timed_out) {
         if (self.cs.suspended) |*s| {
             // Close leaked outbound fd
-            if (s.outbound_fd != 0) {
+            if (s.outbound_fd != -1) {
                 std.posix.close(s.outbound_fd);
-                s.outbound_fd = 0;
+                s.outbound_fd = -1;
             }
             // Free recv buffer if allocated
             s.recv_buf = null;
@@ -399,9 +399,9 @@ fn batchCompletionCheck(self: *Connection) void {
                     self.lua_state.lua.unref(Lua.PseudoIndex.Registry, s.coroutine_ref);
                     s.coroutine_ref = 0;
                 }
-                if (s.outbound_fd != 0) {
+                if (s.outbound_fd != -1) {
                     std.posix.close(s.outbound_fd);
-                    s.outbound_fd = 0;
+                    s.outbound_fd = -1;
                 }
                 s.recv_buf = null;
                 if (s.outbound_tls) |tls_conn| {
@@ -442,7 +442,7 @@ pub fn completeHandler(self: *Connection) void {
     }
 
     // Safety net: close leaked outbound fd
-    if (s.outbound_fd != 0) std.posix.close(s.outbound_fd);
+    if (s.outbound_fd != -1) std.posix.close(s.outbound_fd);
 
     const exchange = s.exchange;
     self.cs.suspended = null;

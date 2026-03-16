@@ -14,7 +14,7 @@ Requires Zig 0.15.0+. Dependencies (libxev, zig-luajit) are fetched automaticall
 
 ## What Keyway Is
 
-Keyway is a high-performance HTTP server where Zig owns the execution engine (memory, I/O, event loop) and Lua expresses routing policy through a declarative interface. Tech stack: Zig, LuaJIT, libxev (io_uring), picohttpparser, eBPF.
+Keyway is a programmable HTTP engine where Zig owns the execution engine (memory, I/O, event loop) and Lua expresses routing policy through a declarative interface. Tech stack: Zig, LuaJIT, libxev (io_uring), picohttpparser, eBPF.
 
 The architecture is defined in MANIFEST.md — it is a non-negotiable design contract that all code must follow.
 
@@ -162,3 +162,41 @@ The entry point is `keyway.lua` (configurable via `--script`), loaded by each wo
 - **Simplicity First**: Make every change as simple as possible. Impact minimal code.
 - **No Laziness**: Find root causes. No temporary fixes. Senior developer standards.
 - **Minimal Impact**: Changes should only touch what's necessary. Avoid introducing bugs.
+
+## Design Context
+
+### Users
+Backend and infrastructure engineers building routing/gateway systems. They open the dashboard to observe live traffic, debug request flows, and verify that Keyway's primitives (cosocket, DNS, streaming, WebSocket) work correctly. They're used to dense data tools and want full visibility without hand-holding.
+
+### Brand Personality
+**Precise, Fast, Minimal.** Keyway is an engineering tool that earns trust through transparency and speed, not decoration. Every pixel serves a purpose.
+
+### Aesthetic Direction
+- **Visual tone**: Dense data dashboard in the style of Grafana/Datadog — dark theme, functional color coding, maximum information density without clutter
+- **Theme**: Dark mode only. Deep green-tinted blacks (`#0a0f0a` bg, `#141a14` surface) with kiwi green (`#73B44C`) as the singular accent
+- **Typography**: JetBrains Mono exclusively — monospace reinforces the systems-engineering identity
+- **Anti-references**: No generic SaaS aesthetic (rounded cards, pastel gradients, corporate feel). No cluttered IDE look (overwhelming panels, tiny unreadable text). No gratuitous animations or glassmorphism
+
+### Color System
+| Token | Value | Usage |
+|---|---|---|
+| `--accent` | `#73B44C` | Primary brand, success states, interactive highlights |
+| `--accent-light` | `#9CCC65` | Hover states, emphasis |
+| `--accent-dim` | `#4a7a2e` | Muted accent, borders on active elements |
+| `--blue` | `#5b9cf5` | POST method, redirects, fetch/send indicators |
+| `--yellow` | `#eab308` | PUT/PATCH, client errors (4xx) |
+| `--red` | `#e55` | DELETE, server errors (5xx), disconnected states |
+| `--purple` | `#c084fc` | WebSocket, streaming, broadcast events |
+
+### Design Principles
+1. **Data density over whitespace** — Show more information per pixel. Developers scan, they don't browse. Tight spacing, compact rows, no decorative padding.
+2. **Color is functional, not decorative** — Every color communicates state: method type, status code, worker affinity, connection health. Never use color for pure aesthetics.
+3. **No glow on non-clickable elements** — Hover effects only on interactive elements (buttons, clickable rows). Static content stays static.
+4. **No horizontal scroll** — Layout must fit the viewport. Fixed sidebar, flexible main content. Constrain content rather than overflow.
+5. **Confidence through visibility** — The dashboard should make the developer feel they can see everything happening in the system. Nothing hidden, nothing ambiguous.
+6. **Authoring is lightweight** — Script editing, deploy, and toggle workflows should feel fast and low-friction. No modal wizards or multi-step forms. Inline editing, immediate feedback, keyboard-driven where possible.
+
+### Frontend Stack
+- **Vite + vanilla TypeScript** — No framework (React/Vue/etc). Vanilla DOM manipulation.
+- **Tailwind CSS + daisyUI** — Use daisyUI defaults for component styling. Only override the color theme to match Keyway's palette. Don't fight default spacing/sizing.
+- **JetBrains Mono everywhere** — Override daisyUI's font stack globally. All text is monospace.

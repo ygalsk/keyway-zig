@@ -1,0 +1,40 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+@import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap");
+
+@layer base {
+  * {
+    font-family: "JetBrains Mono", monospace;
+  }
+
+  ::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+  }
+  ::-webkit-scrollbar-track {
+    background: #0a0f0a;
+  }
+  ::-webkit-scrollbar-thumb {
+    background: #2a322a;
+    border-radius: 3px;
+  }
+  ::-webkit-scrollbar-thumb:hover {
+    background: #3a423a;
+  }
+}
+
+@layer components {
+  .method-GET { color: #73B44C; }
+  .method-POST { color: #5b9cf5; }
+  .method-PUT, .method-PATCH { color: #eab308; }
+  .method-DELETE { color: #ee5555; }
+  .method-WS { color: #c084fc; }
+  .method-PROBE { color: #5b9cf5; }
+
+  .status-2xx { color: #73B44C; }
+  .status-3xx { color: #5b9cf5; }
+  .status-4xx { color: #eab308; }
+  .status-5xx { color: #ee5555; }
+}

@@ -111,7 +111,7 @@ pub const MAX_FRAME_OVERHEAD = 10;
 /// sec_key: the client's Sec-WebSocket-Key header value
 /// out: 28-byte buffer for the base64-encoded result
 pub fn computeAcceptKey(sec_key: []const u8, out: *[28]u8) void {
-    const magic = "258EAFA5-E914-47DA-95CA-5AB4F863B625";
+    const magic = "258EAFA5-E914-47DA-95CA-C5AB0DC85B11";
 
     var hasher = std.crypto.hash.Sha1.init(.{});
     hasher.update(sec_key);

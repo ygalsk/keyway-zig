@@ -46,6 +46,18 @@ pub const DRAIN_DEADLINE_MS: u64 = 30_000;
 /// Maximum HTTP request body size in bytes (1 MB). Bodies exceeding this get 413.
 pub const MAX_BODY_SIZE: u64 = 1_048_576;
 
+/// Maximum connections per worker before rejecting. Prevents OOM under connection flood.
+pub const MAX_CONNECTIONS_PER_WORKER: u32 = 10_000;
+
+/// Timeout for receiving complete HTTP headers (ms). Protects against slowloris attacks.
+pub const HEADER_TIMEOUT_MS: u64 = 10_000;
+
+/// Read buffer size for static file pread+send loop.
+pub const STATIC_READ_SIZE: usize = 65536;
+
+/// Maximum static file size (100 MB). Files larger than this get 413.
+pub const STATIC_MAX_SIZE: u64 = 100 * 1024 * 1024;
+
 comptime {
     // RING_DEPTH must be a power of 2 (ring buffer wrapping requires it)
     if (RING_DEPTH == 0 or (RING_DEPTH & (RING_DEPTH - 1)) != 0)
@@ -67,4 +79,10 @@ comptime {
         @compileError("DRAIN_DEADLINE_MS must be > 0");
     if (MAX_BODY_SIZE < 1024)
         @compileError("MAX_BODY_SIZE must be >= 1024");
+    if (MAX_CONNECTIONS_PER_WORKER == 0)
+        @compileError("MAX_CONNECTIONS_PER_WORKER must be > 0");
+    if (HEADER_TIMEOUT_MS == 0)
+        @compileError("HEADER_TIMEOUT_MS must be > 0");
+    if (STATIC_READ_SIZE < 4096)
+        @compileError("STATIC_READ_SIZE must be >= 4096");
 }

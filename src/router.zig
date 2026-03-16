@@ -69,10 +69,19 @@ const Node = struct {
     }
 };
 
+/// Static file route configuration (from keyway.static).
+pub const StaticRoute = struct {
+    prefix: []const u8,
+    root: []const u8,
+    real_root: []const u8, // resolved at registration (avoids per-request realpathAlloc)
+    index: []const u8,
+};
+
 /// Segment-level trie router — O(path_length) route matching
 pub const Router = struct {
     allocator: std.mem.Allocator,
     root: *Node,
+    static_routes: std.ArrayListUnmanaged(StaticRoute) = .{},
 
     /// Initialize radix router
     pub fn init(allocator: std.mem.Allocator) !Router {
@@ -81,6 +90,42 @@ pub const Router = struct {
             .allocator = allocator,
             .root = root,
         };
+    }
+
+    /// Register a static file serving route.
+    /// Resolves the real root path at registration time to avoid per-request realpathAlloc.
+    pub fn addStaticRoute(self: *Router, prefix: []const u8, root_dir: []const u8, index: []const u8) !void {
+        const prefix_copy = try self.allocator.dupe(u8, prefix);
+        const root_copy = try self.allocator.dupe(u8, root_dir);
+        const real_root = try std.fs.cwd().realpathAlloc(self.allocator, root_dir);
+        const index_copy = try self.allocator.dupe(u8, index);
+        try self.static_routes.append(self.allocator, .{
+            .prefix = prefix_copy,
+            .root = root_copy,
+            .real_root = real_root,
+            .index = index_copy,
+        });
+    }
+
+    const StaticMatch = struct { route: StaticRoute, suffix: []const u8 };
+
+    /// Match a path against static route prefixes (longest prefix wins).
+    /// Returns the StaticRoute and the path suffix after the prefix.
+    pub fn matchStatic(self: *const Router, path: []const u8) ?StaticMatch {
+        if (self.static_routes.items.len == 0) return null;
+        var best: ?StaticMatch = null;
+        for (self.static_routes.items) |sr| {
+            if (std.mem.startsWith(u8, path, sr.prefix)) {
+                const suffix = path[sr.prefix.len..];
+                // Suffix must be empty or start with '/'
+                if (suffix.len == 0 or suffix[0] == '/') {
+                    if (best == null or sr.prefix.len > best.?.route.prefix.len) {
+                        best = .{ .route = sr, .suffix = suffix };
+                    }
+                }
+            }
+        }
+        return best;
     }
 
     /// Add a route to the radix tree
@@ -201,6 +246,13 @@ pub const Router = struct {
 
     /// Clean up router resources
     pub fn deinit(self: *Router) void {
+        for (self.static_routes.items) |sr| {
+            self.allocator.free(sr.prefix);
+            self.allocator.free(sr.root);
+            self.allocator.free(sr.real_root);
+            self.allocator.free(sr.index);
+        }
+        self.static_routes.deinit(self.allocator);
         self.root.deinit();
     }
 };

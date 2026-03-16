@@ -1,10 +1,10 @@
 # Keyway
 
-A Zig-powered, Lua-controlled HTTP engine. Part of the [keystone-gateway.dev](https://keystone-gateway.dev) ecosystem.
+A programmable HTTP engine — Zig execution engine, Lua routing policy. Part of the [keystone-gateway.dev](https://keystone-gateway.dev) ecosystem.
 
 ## What is Keyway?
 
-Keyway is a high-performance HTTP server where Zig handles the execution engine and Lua expresses routing policy. The philosophy is **"dumb gateway, smart tenants"** -- Zig owns memory, I/O, and the event loop; Lua declares intent through a simple, organic interface.
+Keyway is a programmable HTTP engine where Zig owns the execution engine and Lua expresses routing policy. The philosophy is **"dumb gateway, smart tenants"** — Zig owns memory, I/O, and the event loop; Lua declares intent through a simple, organic interface.
 
 **Tech stack:** Zig, LuaJIT, libxev, picohttpparser, io_uring, eBPF
 

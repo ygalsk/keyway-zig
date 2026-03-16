@@ -170,6 +170,7 @@ pub const Worker = struct {
         // Load Lua handlers and process declarative route table
         try lua_state.loadScript(ctx.script_path);
         try lua_state.processRouteTable(&router);
+        try lua_state.processStaticTable(&router);
 
         if (router.isEmpty()) {
             std.log.warn("Worker {d}: no routes registered — all requests will 404", .{ctx.worker_id});
@@ -203,8 +204,11 @@ pub const Worker = struct {
                 .server = &server,
                 .coordinator = coord,
                 .drain_timer_completion = &drain_timer_completion,
+                .allocator = ctx.allocator,
             };
             async_watcher.wait(&loop, &shutdown_completion, ShutdownContext, shutdown_ctx, onShutdownSignal);
+            server.coordinator = coord;
+            server.worker_id = ctx.worker_id;
         }
 
         // Start accepting connections
@@ -225,6 +229,7 @@ const ShutdownContext = struct {
     server: *Server,
     coordinator: *ShutdownCoordinator,
     drain_timer_completion: *xev.Completion,
+    allocator: std.mem.Allocator,
 };
 
 /// xev.Async callback — fires on the worker's event loop when shutdown signal received.
@@ -237,9 +242,16 @@ fn onShutdownSignal(
     _ = r catch return .disarm;
     const ctx = ctx_opt orelse return .disarm;
 
+    // Already shut down (woken by forceCloseAll to self-disarm)
+    if (ctx.server.socket == -1) {
+        ctx.allocator.destroy(ctx);
+        return .disarm;
+    }
+
     if (ctx.coordinator.isForceShutdown()) {
         std.log.info("Force shutdown — closing all connections immediately", .{});
         ctx.server.forceCloseAll();
+        ctx.allocator.destroy(ctx);
         return .disarm;
     }
 
@@ -251,6 +263,8 @@ fn onShutdownSignal(
 
     if (active == 0) {
         std.log.info("Shutdown complete — no active connections", .{});
+        ctx.server.forceCloseAll();
+        ctx.allocator.destroy(ctx);
         return .disarm;
     }
 
@@ -273,8 +287,10 @@ fn onDrainDeadline(
         const remaining = server.metrics.active_connections.load(.monotonic);
         if (remaining > 0) {
             std.log.info("Drain deadline expired — force-closing {d} connections", .{remaining});
-            server.forceCloseAll();
         }
+        // Always call forceCloseAll — closes listen socket + any remaining connections.
+        // Idempotent: safe if force shutdown already ran.
+        server.forceCloseAll();
     }
     std.log.info("Shutdown complete", .{});
     return .disarm;

@@ -28,6 +28,9 @@ pub const HttpExchange = struct {
     upgrade_sse: bool = false,
     sse_room: []const u8 = "",
 
+    // === STREAM UPGRADE (chunked transfer encoding) ===
+    upgrade_stream: bool = false,
+
     // === INTERNAL ===
     allocator: std.mem.Allocator,
 

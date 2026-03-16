@@ -64,6 +64,14 @@ pub const TlsContext = struct {
             return error.KeyCertMismatch;
         }
 
+        // Disable session tickets for kTLS compatibility.
+        // TLS 1.3 NewSessionTicket records are sent post-handshake under
+        // server_traffic_secret_0, incrementing the TX sequence counter.
+        // kTLS is set up with rec_seq=0, so any tickets sent by OpenSSL
+        // before the kernel takes over cause a sequence mismatch → bad MAC.
+        // This is the same approach nginx uses for kTLS.
+        _ = c.SSL_CTX_set_num_tickets(ctx, 0);
+
         // Enable keylog callback for kTLS key extraction
         c.SSL_CTX_set_keylog_callback(ctx, keylogCallback);
 
@@ -499,6 +507,14 @@ pub const TlsConn = struct {
 
         const tls_version: u16 = @intCast(ssl_version);
 
+        // TLS 1.2: Finished was sent/received at seq=0 under the application keys,
+        // so kTLS must start at seq=1. TLS 1.3: application traffic keys are fresh
+        // (no records sent since we disabled session tickets), so seq=0 is correct.
+        var rec_seq = [_]u8{0} ** 8;
+        if (ssl_version == c.TLS1_2_VERSION) {
+            rec_seq[7] = 1; // big-endian sequence number = 1
+        }
+
         // Enable TLS ULP on the socket
         const ulp = [4]u8{ 't', 'l', 's', 0 };
         std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, c.TCP_ULP, &ulp) catch |err| {
@@ -514,7 +530,7 @@ pub const TlsConn = struct {
                     .iv = .{0} ** 8,
                     .key = undefined,
                     .salt = undefined,
-                    .rec_seq = .{0} ** 8,
+                    .rec_seq = rec_seq,
                 };
                 @memcpy(&tx_info.key, tx_key[0..16]);
                 @memcpy(&tx_info.salt, tx_iv[0..4]);
@@ -534,7 +550,7 @@ pub const TlsConn = struct {
                     .iv = .{0} ** 8,
                     .key = undefined,
                     .salt = undefined,
-                    .rec_seq = .{0} ** 8,
+                    .rec_seq = rec_seq,
                 };
                 @memcpy(&tx_info.key, tx_key[0..32]);
                 @memcpy(&tx_info.salt, tx_iv[0..4]);
@@ -554,7 +570,7 @@ pub const TlsConn = struct {
                     .iv = undefined,
                     .key = undefined,
                     .salt = .{},
-                    .rec_seq = .{0} ** 8,
+                    .rec_seq = rec_seq,
                 };
                 @memcpy(&tx_info.key, tx_key[0..32]);
                 @memcpy(&tx_info.iv, tx_iv[0..12]);

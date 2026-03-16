@@ -1,6 +1,6 @@
 # MANIFEST.md — Keyway Architectural Contract
 
-This document is the authoritative design contract for the Keyway server. All code must conform to these rules. Deviations require explicit justification and approval.
+This document is the authoritative design contract for Keyway, a programmable HTTP engine. All code must conform to these rules. Deviations require explicit justification and approval.
 
 ## 1. Execution Model: Proactor
 
@@ -54,7 +54,7 @@ Accept → Read → Parse → Route → Execute → Respond → Reuse
 
 5. **Execute** — `LuaState.callLuaHandler` creates a Lua coroutine (`lua_newthread` + `lua_resume`), passes `HttpExchange` userdata. The handler reads request data and sets response fields on `ctx`. If the handler calls cosocket APIs, the coroutine yields and Zig submits the I/O; on completion, Zig resumes the coroutine.
 
-6. **Respond** — `HttpExchange.toResponse` builds the `Response`, `Response.serialize` writes headers + body into the send buffer, libxev async send transmits it. Special paths: SSE upgrade (`conn_sse`), WebSocket upgrade (`conn_ws`).
+6. **Respond** — `HttpExchange.toResponse` builds the `Response`, `Response.serialize` writes headers + body into the send buffer, libxev async send transmits it. Special paths: SSE upgrade (`conn_sse`), WebSocket upgrade (`conn_ws`), chunked streaming (`conn_stream`). Static file routes (`static.zig`) short-circuit before Lua dispatch — served entirely in Zig with ETag/Last-Modified caching.
 
 7. **Reuse** — Arena reset + buffer reset for HTTP/1.1 keep-alive. The `Connection` is ready for the next request on the same socket.
 
@@ -108,6 +108,15 @@ Cosocket connections are pooled per-worker in `ConnectionPool`, keyed by destina
 | `ws.zig` | WebSocket frame parsing (low-level) |
 | `conn_sse.zig` | SSE upgrade, per-connection send, disconnect watch |
 | `sse.zig` | `SseRegistry` (per-worker room→subscribers), `SseBroadcastBus` (cross-worker pub/sub) |
+| `conn_stream.zig` | Chunked transfer encoding streaming — yield-to-flush abstraction |
+| `static.zig` | Static file serving — pread+send with ETag/Last-Modified caching |
+| `shutdown.zig` | Graceful shutdown coordination (running → draining → force_shutdown) |
+| `cli.zig` | CLI argument parsing with environment variable fallback |
+| `error_response.zig` | Unified error response model — ErrorCategory → status/body/log-level |
+| `cosocket_tls.zig` | Outbound cosocket TLS handshake state machine (client-side) |
+| `cosocket_ops.zig` | Interpret functions for cosocket completion results |
+| `helpers.zig` | Shared utility: `castUserdata` for xev callback pointer casts |
+| `metrics.zig` | Per-worker atomic metrics for health monitoring |
 | `bpf_reuseport.zig` | Classic BPF program generation for SO_REUSEPORT worker affinity |
 | `log.zig` | Custom log formatting |
 

@@ -103,6 +103,21 @@ pub const Response = struct {
         break :blk table;
     };
 
+    /// Serialize HTTP response headers with Transfer-Encoding: chunked (no Content-Length, no body).
+    /// Used for streaming responses where body is sent as subsequent chunks.
+    pub fn serializeChunkedHeaders(self: *Response, writer: anytype) !void {
+        const code: usize = @min(self.status, status_lines.len - 1);
+        try writer.writeAll(status_lines[code]);
+
+        if (self.headers) |h| {
+            for (h.items) |header| {
+                try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
+            }
+        }
+
+        try writer.writeAll("Transfer-Encoding: chunked\r\n\r\n");
+    }
+
     /// Serialize response to HTTP/1.1 format
     pub fn serialize(self: *Response, writer: anytype) !void {
         // Status line — single memcpy from comptime table
@@ -328,6 +343,23 @@ fn getHeader(req: *const Request, name: []const u8) ?[]const u8 {
     return Parser.getHeader(req, name);
 }
 
+/// Encode data as a chunked transfer encoding chunk: "{hex_len}\r\n{data}\r\n"
+pub fn encodeChunk(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
+    // Format: hex_length\r\ndata\r\n
+    const hex_len = std.fmt.count("{x}", .{data.len});
+    const total = hex_len + 2 + data.len + 2;
+    const buf = try allocator.alloc(u8, total);
+    var fbs = std.io.fixedBufferStream(buf);
+    const writer = fbs.writer();
+    writer.print("{x}\r\n", .{data.len}) catch unreachable;
+    writer.writeAll(data) catch unreachable;
+    writer.writeAll("\r\n") catch unreachable;
+    return buf;
+}
+
+/// Terminal chunk for chunked transfer encoding.
+pub const terminal_chunk = "0\r\n\r\n";
+
 /// Extract Content-Length from parsed request headers.
 /// Returns null if header is missing or value is malformed.
 pub fn getContentLength(request: *const Request) ?u64 {
@@ -394,4 +426,39 @@ test "getContentLength is case-insensitive" {
         .raw_len = 0,
     };
     try std.testing.expectEqual(@as(u64, 5678), getContentLength(&request).?);
+}
+
+test "encodeChunk produces correct wire format" {
+    const allocator = std.testing.allocator;
+    const chunk = try encodeChunk(allocator, "Hello");
+    defer allocator.free(chunk);
+    try std.testing.expectEqualStrings("5\r\nHello\r\n", chunk);
+}
+
+test "encodeChunk with larger data" {
+    const allocator = std.testing.allocator;
+    const data = "a" ** 256;
+    const chunk = try encodeChunk(allocator, data);
+    defer allocator.free(chunk);
+    try std.testing.expect(std.mem.startsWith(u8, chunk, "100\r\n")); // 256 = 0x100
+    try std.testing.expect(std.mem.endsWith(u8, chunk, "\r\n"));
+}
+
+test "serializeChunkedHeaders omits Content-Length" {
+    const allocator = std.testing.allocator;
+    var response = Response.init(allocator);
+    defer response.deinit();
+    response.status = 200;
+    try response.addHeader("Content-Type", "application/x-ndjson");
+
+    var buf = std.ArrayList(u8).initCapacity(allocator, 0) catch unreachable;
+    defer buf.deinit(allocator);
+    try response.serializeChunkedHeaders(buf.writer(allocator));
+
+    const result = buf.items;
+    try std.testing.expect(std.mem.startsWith(u8, result, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, result, "Content-Type: application/x-ndjson") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Transfer-Encoding: chunked") != null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Content-Length") == null);
+    try std.testing.expect(std.mem.endsWith(u8, result, "\r\n\r\n"));
 }

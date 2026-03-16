@@ -92,7 +92,10 @@ pub const CompletionRing = struct {
     pub const MAX_DEPTH = config.RING_DEPTH;
 
     pub inline fn push(self: *CompletionRing, entry: CQEntry) void {
-        std.debug.assert(self.tail < MAX_DEPTH);
+        if (self.tail >= MAX_DEPTH) {
+            std.log.err("CompletionRing overflow: tail={d} max={d}", .{ self.tail, MAX_DEPTH });
+            return;
+        }
         self.entries[self.tail] = entry;
         self.tail += 1;
     }

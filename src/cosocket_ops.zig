@@ -65,7 +65,7 @@ pub fn pushErrorTable(thread: *Lua, category: ErrorCategory, msg: [:0]const u8) 
 pub fn interpretConnect(thread: *Lua, s: *SuspendedState, result: xev.Result) InterpretResult {
     _ = result.connect catch {
         std.posix.close(s.outbound_fd);
-        s.outbound_fd = 0;
+        s.outbound_fd = -1;
         s.pending_op = .none;
         pushErrorTable(thread, .upstream_error, "connection refused");
         return .{ .nresults = 2 };
@@ -73,12 +73,12 @@ pub fn interpretConnect(thread: *Lua, s: *SuspendedState, result: xev.Result) In
     if (s.pending_op == .pool_connect) {
         thread.pushInteger(@intCast(s.outbound_fd));
         thread.pushInteger(0);
-        s.outbound_fd = 0;
+        s.outbound_fd = -1;
         s.pending_op = .none;
         return .{ .nresults = 2 };
     }
     thread.pushInteger(@intCast(s.outbound_fd));
-    s.outbound_fd = 0;
+    s.outbound_fd = -1;
     s.pending_op = .none;
     return .{ .nresults = 1 };
 }
@@ -122,7 +122,7 @@ pub fn interpretClose(thread: *Lua, s: *SuspendedState, result: xev.Result) Inte
         pushErrorTable(thread, .upstream_error, "close failed");
         return .{ .nresults = 2 };
     };
-    s.outbound_fd = 0;
+    s.outbound_fd = -1;
     thread.pushInteger(1);
     return .{ .nresults = 1 };
 }
@@ -181,7 +181,7 @@ pub fn submitUdpConnect(self: *Connection, conn: anytype) void {
     s.outbound_fd = sock;
     const addr = std.net.Address.parseIp4(conn.host, conn.port) catch {
         std.posix.close(sock);
-        s.outbound_fd = 0;
+        s.outbound_fd = -1;
         cosocket.resumeWithError(self, .upstream_error, "udp_connect: invalid address");
         return;
     };
