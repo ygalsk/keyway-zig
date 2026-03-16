@@ -10,11 +10,11 @@ local _conditions = {}   -- event-driven: [{id, check_fn, activate_script_id}]
 local _loaded = false
 local _seeded = false
 
--- Seed Redis from scripts.json on first load (if key doesn't exist)
+-- Seed Redis with defaults on first load (if key doesn't exist)
 local function seed_if_needed()
     if _seeded then return end
     _seeded = true
-    pcall(scripts_store.seed_from_file)
+    pcall(scripts_store.seed_from_defaults)
 end
 
 -- Reload all scripts from persistence, recompile
