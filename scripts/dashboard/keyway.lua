@@ -12,7 +12,32 @@ local probe = require("scripts.dashboard.lib.probe")
 local scripts_store = require("scripts.dashboard.lib.scripts_store")
 local dispatch = require("scripts.dashboard.lib.dispatch")
 local hooks_store = require("scripts.dashboard.lib.hooks_store")
-local http_self = require("scripts.dashboard.lib.http_self")
+
+-- Local HTTP request helper (uses keyway.socket which is ring-based, yields properly)
+local function self_request(host_hdr, port, method, path)
+    local tcp = socket.tcp()
+    tcp:settimeout(5000)
+    local ok, err = tcp:connect("127.0.0.1", port)
+    if not ok then return nil, "connect failed: " .. (err or "unknown") end
+    tcp:send(string.format("%s %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", method, path, host_hdr))
+    local status_line = tcp:receive("*l")
+    if not status_line then tcp:close(); return nil, "no response" end
+    local status_code = tonumber(status_line:match("^HTTP/%S+ (%d+)")) or 0
+    local headers, content_length = {}, nil
+    while true do
+        local line = tcp:receive("*l")
+        if not line or line == "" then break end
+        local name, value = line:match("^([^:]+):%s*(.-)%s*$")
+        if name then
+            headers[#headers + 1] = { name, value }
+            if name:lower() == "content-length" then content_length = tonumber(value) end
+        end
+    end
+    local body = ""
+    if content_length and content_length > 0 then body = tcp:receive(content_length) or "" end
+    tcp:close()
+    return status_code, headers, body
+end
 
 -- ─── Per-Worker Counters ──────────────────────────────────────────────
 local counters = {
@@ -239,7 +264,7 @@ keyway.routes = {
             local host_hdr = response.get_header(ctx, "Host") or "localhost:8080"
             local port = tonumber(host_hdr:match(":(%d+)$")) or 8080
 
-            local status, _, body = http_self.request(host_hdr, port, "GET", "/health")
+            local status, _, body = self_request(host_hdr, port, "GET", "/health")
             if not status then
                 response.json_response(ctx, 200, { status = "error", error = "health check failed" })
                 return
@@ -321,7 +346,7 @@ keyway.routes = {
             local port = tonumber(host_hdr:match(":(%d+)$")) or 8080
 
             local t0 = response.now_us()
-            local status_code, _, resp_body = http_self.request(host_hdr, port, "GET", path)
+            local status_code, _, resp_body = self_request(host_hdr, port, "GET", path)
             local timing = math.floor(response.now_us() - t0)
             if not status_code then
                 response.json_response(ctx, 200, { error = resp_body or "request failed" })
