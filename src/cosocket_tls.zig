@@ -123,15 +123,14 @@ pub fn onRecvComplete(
 fn finish(self: *Connection, tls_conn: *TlsConn) void {
     const s = &self.cs.suspended.?;
 
-    // Enable kTLS — kernel handles encrypt/decrypt from here
-    tls_conn.setupKtls(s.outbound_fd) catch {
-        failHandshake(self, "sslhandshake: ktls setup failed");
-        return;
-    };
-
-    // Free TlsConn — no longer needed after kTLS
-    tls_mod.freeTlsConn(self.base_allocator, tls_conn);
-    s.outbound_tls = null;
+    // Try kTLS — kernel handles encrypt/decrypt if available
+    if (tls_conn.setupKtls(s.outbound_fd)) |_| {
+        // kTLS active — free TlsConn, kernel handles crypto
+        s.cleanupTls(self.base_allocator);
+    } else |_| {
+        // kTLS unavailable — keep TlsConn alive for userspace encrypt/decrypt
+        std.log.info("ktls: unavailable for fd={d}, using userspace TLS", .{s.outbound_fd});
+    }
     s.outbound_fd = -1;
     s.pending_op = .none;
     self.cs.pending_completions -= 1;
@@ -184,8 +183,5 @@ fn failHandshake(self: *Connection, msg: [:0]const u8) void {
 /// Clean up TLS resources on handshake failure.
 pub fn cleanup(self: *Connection) void {
     const s = &self.cs.suspended.?;
-    if (s.outbound_tls) |tls_conn| {
-        tls_mod.freeTlsConn(self.base_allocator, tls_conn);
-        s.outbound_tls = null;
-    }
+    s.cleanupTls(self.base_allocator);
 }

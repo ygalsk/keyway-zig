@@ -77,6 +77,7 @@ fn sendTlsData(self: *Connection, handshake_complete: bool) void {
         .userdata = self,
         .callback = onTlsHandshakeWrite,
     };
+    self.pending_io_ops += 1;
     self.loop.add(&self.write_completion);
 }
 
@@ -91,10 +92,7 @@ pub fn onTlsHandshakeWrite(
     _ = completion;
 
     const self = castUserdata(Connection, userdata);
-    _ = result.send catch {
-        self.close();
-        return .disarm;
-    };
+    _ = self.handleSendCompletion(result) orelse return .disarm;
 
     const handshake_complete = self.tls_state.tls_handshake_complete;
     self.tls_state.tls_handshake_complete = false;

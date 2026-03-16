@@ -80,10 +80,7 @@ fn onStreamWrite(
     _ = loop;
     _ = completion;
     const self = castUserdata(Connection, userdata);
-    _ = result.send catch {
-        self.close();
-        return .disarm;
-    };
+    _ = self.handleSendCompletion(result) orelse return .disarm;
     handleStreamPostWrite(self);
     return .disarm;
 }
@@ -169,10 +166,7 @@ fn onTerminalWrite(
     _ = loop;
     _ = completion;
     const self = castUserdata(Connection, userdata);
-    _ = result.send catch {
-        self.close();
-        return .disarm;
-    };
+    _ = self.handleSendCompletion(result) orelse return .disarm;
     // Reuse handleHttpPostWrite for keep-alive/pipelining reset
     self.handleHttpPostWrite(0);
     return .disarm;

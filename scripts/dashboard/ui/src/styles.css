@@ -2,9 +2,50 @@
 @tailwind components;
 @tailwind utilities;
 
-@import url("https://fonts.googleapis.com/css2?family=JetBrains+Mono:wght@400;500;600;700&display=swap");
+@font-face {
+  font-family: "JetBrains Mono";
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+  src: url("/__keyway/dashboard/fonts/JetBrainsMono-Regular.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+  src: url("/__keyway/dashboard/fonts/JetBrainsMono-Medium.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-weight: 600;
+  font-style: normal;
+  font-display: swap;
+  src: url("/__keyway/dashboard/fonts/JetBrainsMono-SemiBold.woff2") format("woff2");
+}
+@font-face {
+  font-family: "JetBrains Mono";
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+  src: url("/__keyway/dashboard/fonts/JetBrainsMono-Bold.woff2") format("woff2");
+}
 
 @layer base {
+  :root {
+    --kw-accent: #73B44C;
+    --kw-accent-light: #9CCC65;
+    --kw-accent-dim: #4a7a2e;
+    --kw-blue: #5b9cf5;
+    --kw-yellow: #eab308;
+    --kw-red: #ee5555;
+    --kw-purple: #c084fc;
+    --kw-bg: #0a0f0a;
+    --kw-surface: #141a14;
+    --kw-border: #1a221a;
+    --kw-text: #c8ccc8;
+  }
+
   * {
     font-family: "JetBrains Mono", monospace;
   }
@@ -14,7 +55,7 @@
     height: 6px;
   }
   ::-webkit-scrollbar-track {
-    background: #0a0f0a;
+    background: var(--kw-bg);
   }
   ::-webkit-scrollbar-thumb {
     background: #2a322a;
@@ -23,18 +64,99 @@
   ::-webkit-scrollbar-thumb:hover {
     background: #3a423a;
   }
+
+  /* Firefox scrollbar */
+  * {
+    scrollbar-width: thin;
+    scrollbar-color: #2a322a var(--kw-bg);
+  }
 }
 
 @layer components {
-  .method-GET { color: #73B44C; }
-  .method-POST { color: #5b9cf5; }
-  .method-PUT, .method-PATCH { color: #eab308; }
-  .method-DELETE { color: #ee5555; }
-  .method-WS { color: #c084fc; }
-  .method-PROBE { color: #5b9cf5; }
+  .method-GET { color: var(--kw-accent); }
+  .method-POST { color: var(--kw-blue); }
+  .method-PUT, .method-PATCH { color: var(--kw-yellow); }
+  .method-DELETE { color: var(--kw-red); }
+  .method-WS { color: var(--kw-purple); }
+  .method-PROBE { color: var(--kw-blue); }
 
-  .status-2xx { color: #73B44C; }
-  .status-3xx { color: #5b9cf5; }
-  .status-4xx { color: #eab308; }
-  .status-5xx { color: #ee5555; }
+  .status-2xx { color: var(--kw-accent); }
+  .status-3xx { color: var(--kw-blue); }
+  .status-4xx { color: var(--kw-yellow); }
+  .status-5xx { color: var(--kw-red); }
+
+  .json-key { color: #6b9e3e; }
+  .json-string { color: rgba(255,255,255,0.55); }
+  .json-number { color: var(--kw-blue); }
+  .json-boolean { color: var(--kw-yellow); }
+  .json-null { color: rgba(255,255,255,0.3); }
+
+  /* View transition */
+  .view-enter {
+    animation: view-fade-in 150ms ease-out;
+  }
+
+  /* Traffic row entrance */
+  .row-enter {
+    animation: row-slide-in 200ms ease-out;
+  }
+
+  @keyframes view-fade-in {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  @keyframes row-slide-in {
+    from { opacity: 0; transform: translateY(-2px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  /* Sparkline entrance */
+  .sparkline-enter {
+    animation: sparkline-reveal 300ms ease-out;
+  }
+
+  @keyframes sparkline-reveal {
+    from { clip-path: inset(0 100% 0 0); }
+    to { clip-path: inset(0 0 0 0); }
+  }
+
+  /* Loading skeleton pulse */
+  .skeleton-pulse {
+    background: linear-gradient(90deg, var(--kw-surface) 25%, var(--kw-border) 50%, var(--kw-surface) 75%);
+    background-size: 200% 100%;
+    animation: skeleton-shimmer 1.5s ease-in-out infinite;
+  }
+
+  @keyframes skeleton-shimmer {
+    0% { background-position: 200% 0; }
+    100% { background-position: -200% 0; }
+  }
+
+  /* Connection status pulse */
+  .status-connecting {
+    animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
+  }
+
+  /* Lua syntax highlighting */
+  .hl-overlay { color: var(--kw-text); }
+  .hl-keyword { color: var(--kw-purple); font-weight: 500; }
+  .hl-string { color: var(--kw-accent); }
+  .hl-comment { color: rgba(255,255,255,0.25); font-style: italic; }
+  .hl-number { color: var(--kw-blue); }
+  .hl-error-line { background: rgba(238, 85, 85, 0.15); display: inline-block; width: 100%; }
+
+  /* Action feedback flash */
+  .flash-success { animation: flash-green 400ms ease-out; }
+  .flash-error { animation: flash-red 400ms ease-out; }
+
+  @keyframes flash-green {
+    0% { background-color: rgba(115, 180, 76, 0.2); }
+    100% { background-color: transparent; }
+  }
+
+  @keyframes flash-red {
+    0% { background-color: rgba(238, 85, 85, 0.2); }
+    100% { background-color: transparent; }
+  }
 }

@@ -57,6 +57,20 @@ pub fn pushErrorTable(thread: *Lua, category: ErrorCategory, msg: [:0]const u8) 
 }
 
 // ============================================================================
+// Shared TLS helpers
+// ============================================================================
+
+/// Encrypt data for outbound send if TLS is active, then arena-dupe.
+/// Returns the send-ready data (encrypted or plain, arena-duped), or null on failure.
+pub fn encryptForSend(alloc: std.mem.Allocator, tls_conn: ?*TlsConn, data: []const u8) ?[]const u8 {
+    if (tls_conn) |tc| {
+        const ct = tc.sslWrite(data) orelse return null;
+        return alloc.dupe(u8, ct) catch null;
+    }
+    return alloc.dupe(u8, data) catch null;
+}
+
+// ============================================================================
 // Interpret functions — shared by onOutboundComplete (single-shot path)
 // ============================================================================
 
@@ -95,7 +109,7 @@ pub fn interpretSend(thread: *Lua, result: xev.Result) InterpretResult {
 }
 
 /// Interpret a recv completion.
-/// After kTLS, recv data is already plaintext — no decryption needed.
+/// After kTLS, recv data is already plaintext. With userspace TLS, decrypt here.
 pub fn interpretRecv(
     thread: *Lua,
     s: *SuspendedState,
@@ -107,7 +121,17 @@ pub fn interpretRecv(
         return .{ .nresults = 2 };
     };
     if (s.recv_buf) |buf| {
-        thread.pushLString(buf[0..bytes_read]);
+        // Userspace TLS: decrypt ciphertext received from the wire
+        if (s.outbound_tls) |tls_conn| {
+            const plaintext = tls_conn.sslRead(buf[0..bytes_read], buf) orelse {
+                s.recv_buf = null;
+                pushErrorTable(thread, .upstream_error, "recv: TLS decrypt failed");
+                return .{ .nresults = 2 };
+            };
+            thread.pushLString(plaintext);
+        } else {
+            thread.pushLString(buf[0..bytes_read]);
+        }
     } else {
         thread.pushNil();
     }
@@ -117,12 +141,14 @@ pub fn interpretRecv(
 
 /// Interpret a close completion.
 /// On failure: pushes error table. On success: pushes 1.
-pub fn interpretClose(thread: *Lua, s: *SuspendedState, result: xev.Result) InterpretResult {
+/// Frees userspace TLS state if present.
+pub fn interpretClose(conn: *Connection, thread: *Lua, s: *SuspendedState, result: xev.Result) InterpretResult {
     _ = result.close catch {
         pushErrorTable(thread, .upstream_error, "close failed");
         return .{ .nresults = 2 };
     };
     s.outbound_fd = -1;
+    s.cleanupTls(conn.base_allocator);
     thread.pushInteger(1);
     return .{ .nresults = 1 };
 }
@@ -197,12 +223,12 @@ pub fn submitUdpConnect(self: *Connection, conn: anytype) void {
 /// Submit plaintext send — kernel encrypts if kTLS is active.
 pub fn submitSend(self: *Connection, snd: anytype) void {
     const s = &self.cs.suspended.?;
-    const data = self.arena.allocator().dupe(u8, snd.data) catch {
-        cosocket.resumeWithError(self, .server_error, "send: arena alloc failed");
+    const send_data = encryptForSend(self.arena.allocator(), s.outbound_tls, snd.data) orelse {
+        cosocket.resumeWithError(self, .upstream_error, "send: encrypt/alloc failed");
         return;
     };
     s.completion = .{
-        .op = .{ .send = .{ .fd = snd.fd, .buffer = .{ .slice = data } } },
+        .op = .{ .send = .{ .fd = snd.fd, .buffer = .{ .slice = send_data } } },
         .userdata = self,
         .callback = cosocket.onOutboundComplete,
     };

@@ -283,10 +283,7 @@ fn onStaticHeadersSent(
     _ = loop;
     _ = completion;
     const self = castUserdata(Connection, userdata);
-    _ = result.send catch {
-        self.close();
-        return .disarm;
-    };
+    _ = self.handleSendCompletion(result) orelse return .disarm;
     sendNextChunk(self);
     return .disarm;
 }
@@ -332,10 +329,7 @@ fn onStaticChunkSent(
     _ = loop;
     _ = completion;
     const self = castUserdata(Connection, userdata);
-    _ = result.send catch {
-        self.close();
-        return .disarm;
-    };
+    _ = self.handleSendCompletion(result) orelse return .disarm;
     sendNextChunk(self);
     return .disarm;
 }

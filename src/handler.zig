@@ -51,7 +51,15 @@ pub const SuspendedState = struct {
     coroutine_thread: *anyopaque,
     outbound_fd: std.posix.socket_t,
     pending_op: ring.IoEntry.Op,
-    outbound_tls: ?*tls_mod.TlsConn = null, // temporary, during handshake only
+    outbound_tls: ?*tls_mod.TlsConn = null, // during handshake; persists if kTLS unavailable
+
+    /// Free outbound TLS conn and null the pointer. Safe to call when outbound_tls is null.
+    pub fn cleanupTls(self: *SuspendedState, alloc: std.mem.Allocator) void {
+        if (self.outbound_tls) |tc| {
+            tls_mod.freeTlsConn(alloc, tc);
+            self.outbound_tls = null;
+        }
+    }
 };
 
 const READ_BUFFER_SIZE = config.READ_BUFFER_SIZE;
@@ -153,6 +161,10 @@ pub const Connection = struct {
     header_timer_completion: xev.Completion = .{},
     header_timer_cancel_completion: xev.Completion = .{},
     header_timer_armed: bool = false,
+
+    // In-flight read/write io_uring ops. Guards maybeFinishClose so Connection
+    // outlives pending recv/send completions — prevents use-after-free / EFAULT.
+    pending_io_ops: u8 = 0,
 
     // Connection state machine
     state: State = .reading,
@@ -411,6 +423,7 @@ pub const Connection = struct {
             .userdata = self,
             .callback = onRead,
         };
+        self.pending_io_ops += 1;
         self.loop.add(&self.read_completion);
     }
 
@@ -424,14 +437,18 @@ pub const Connection = struct {
         _ = completion;
 
         const self = castUserdata(Connection, userdata);
+        self.pending_io_ops -= 1;
 
         const bytes_read = result.recv catch |err| {
+            if (self.state == .closing) { self.maybeFinishClose(); return .disarm; }
             if (err != error.EOF) {
                 std.log.err("[fd={d}] recv failed err={}", .{ self.socket, err });
             }
             self.close();
             return .disarm;
         };
+
+        if (self.state == .closing) { self.maybeFinishClose(); return .disarm; }
 
         if (bytes_read == 0) {
             self.close();
@@ -672,6 +689,7 @@ pub const Connection = struct {
             .userdata = self,
             .callback = callback,
         };
+        self.pending_io_ops += 1;
         self.loop.add(&self.write_completion);
     }
 
@@ -741,11 +759,7 @@ pub const Connection = struct {
         _ = loop;
         _ = completion;
         const self = castUserdata(Connection, userdata);
-        const bytes_written = result.send catch |err| {
-            std.log.err("[fd={d}] send failed err={}", .{ self.socket, err });
-            self.close();
-            return .disarm;
-        };
+        const bytes_written = self.handleSendCompletion(result) orelse return .disarm;
         // If this write was the 504 timeout response, close instead of recycling.
         // pending_completions may still be non-zero (cosocket I/O in flight),
         // so close() -> maybeFinishClose() defers deinit until all completions drain.
@@ -863,8 +877,25 @@ pub const Connection = struct {
     /// Deferred deinit guard: only free Connection when all armed cosocket
     /// completions have fired. Called at every point where pending_completions
     /// is decremented to ensure Connection outlives in-flight xev callbacks.
+    /// Handle send completion boilerplate: decrement pending_io_ops, check for
+    /// send errors, check closing state. Returns bytes sent on success, or null
+    /// if the caller should return .disarm (error or closing).
+    pub fn handleSendCompletion(self: *Connection, result: xev.Result) ?usize {
+        self.pending_io_ops -= 1;
+        const bytes = result.send catch {
+            if (self.state == .closing) {
+                self.maybeFinishClose();
+            } else {
+                self.close();
+            }
+            return null;
+        };
+        if (self.state == .closing) { self.maybeFinishClose(); return null; }
+        return bytes;
+    }
+
     pub fn maybeFinishClose(self: *Connection) void {
-        if (self.state == .closing and self.cs.pending_completions == 0 and self.pending_timer_ops == 0) {
+        if (self.state == .closing and self.cs.pending_completions == 0 and self.pending_timer_ops == 0 and self.pending_io_ops == 0) {
             self.deinit(self.base_allocator);
         }
     }

@@ -16,6 +16,21 @@ pub const TLS_RECORD_MAX_SIZE = config.TLS_RECORD_MAX_SIZE;
 // kTLS setsockopt constants
 const SOL_TLS: i32 = 282;
 
+// SSL_OP_NO_TICKET = SSL_OP_BIT(14) — Zig's C translator can't evaluate the macro.
+const SSL_OP_NO_TICKET: c_ulong = 1 << 14;
+
+/// Decode errno from a raw Linux syscall return value.
+/// Raw syscalls return -errno as usize on failure. std.posix.errno() doesn't
+/// reliably decode all values (e.g. small negative values can slip through),
+/// so we decode manually: negate the signed value to get the errno integer.
+fn syscallErrno(rc: usize) std.posix.E {
+    const signed: isize = @bitCast(rc);
+    if (signed < 0 and signed > -4096) {
+        return @enumFromInt(@as(u16, @intCast(-signed)));
+    }
+    return .SUCCESS;
+}
+
 /// Per-worker TLS context wrapping SSL_CTX.
 /// One per worker thread — shares config across all connections on that worker.
 pub const TlsContext = struct {
@@ -142,6 +157,13 @@ pub const ClientTlsContext = struct {
                 return error.KeyCertMismatch;
             }
         }
+
+        // Disable TLS 1.2 session tickets — outbound connections are short-lived
+        // and don't benefit from session resumption. For TLS 1.3, this option has
+        // no effect (ticket emission is server-controlled); TLS 1.3 outbound
+        // connections use full userspace TLS instead of kTLS to handle
+        // post-handshake NewSessionTicket records gracefully.
+        _ = c.SSL_CTX_set_options(ctx, SSL_OP_NO_TICKET);
 
         // Enable keylog callback for kTLS key extraction
         c.SSL_CTX_set_keylog_callback(ctx, keylogCallback);
@@ -476,14 +498,48 @@ pub const TlsConn = struct {
     }
 
     // ========================================================================
+    // Userspace encrypt/decrypt — fallback when kTLS is unavailable
+    // ========================================================================
+
+    /// Encrypt plaintext via SSL_write and return the ciphertext slice
+    /// (points into encrypt_buf). Returns null on SSL error.
+    pub fn sslWrite(self: *TlsConn, plaintext: []const u8) ?[]const u8 {
+        const ret = c.SSL_write(self.ssl, plaintext.ptr, @intCast(plaintext.len));
+        if (ret <= 0) return null;
+        const total = self.drainAll();
+        if (total == 0) return null;
+        return self.encrypt_buf[0..total];
+    }
+
+    /// Decrypt ciphertext: feed it into the read BIO, then SSL_read plaintext
+    /// into the provided buffer. Returns the plaintext slice, or null on error.
+    pub fn sslRead(self: *TlsConn, ciphertext: []const u8, out: []u8) ?[]const u8 {
+        self.feedCiphertext(ciphertext);
+        const ret = c.SSL_read(self.ssl, out.ptr, @intCast(out.len));
+        if (ret <= 0) return null;
+        return out[0..@intCast(ret)];
+    }
+
+    // ========================================================================
     // kTLS setup — transfer keys to kernel after handshake
     // ========================================================================
 
     /// After handshake completes, extract negotiated keys and configure kTLS.
     /// On success, the kernel handles all encrypt/decrypt — TlsConn can be freed.
-    /// On failure, returns error (caller should close the connection).
+    /// On failure, returns error (caller should keep TlsConn for userspace TLS).
     pub fn setupKtls(self: *TlsConn, fd: std.posix.socket_t) !void {
         const ssl_version = c.SSL_version(self.ssl);
+
+        // TLS 1.3 client: skip kTLS entirely. Remote servers send NewSessionTicket
+        // post-handshake records that kTLS RX can't deliver via plain recv() — the
+        // kernel returns EIO for non-application-data records. SSL_OP_NO_TICKET only
+        // affects TLS 1.2; for 1.3, ticket emission is server-controlled. Draining
+        // via SSL_read before kTLS setup is racy (tickets may arrive later).
+        // Full userspace TLS handles post-handshake messages transparently.
+        if (ssl_version == c.TLS1_3_VERSION and self.mode == .client) {
+            return error.KtlsUnsupportedVersion;
+        }
+
         const cipher = c.SSL_get_current_cipher(self.ssl) orelse return error.KtlsNoCipher;
         const cipher_id = c.SSL_CIPHER_get_id(cipher);
         const params = getCipherParams(cipher_id) orelse {
@@ -507,20 +563,37 @@ pub const TlsConn = struct {
 
         const tls_version: u16 = @intCast(ssl_version);
 
-        // TLS 1.2: Finished was sent/received at seq=0 under the application keys,
-        // so kTLS must start at seq=1. TLS 1.3: application traffic keys are fresh
-        // (no records sent since we disabled session tickets), so seq=0 is correct.
-        var rec_seq = [_]u8{0} ** 8;
+        // Record sequence numbers for kTLS.
+        // TX: always 0 — we haven't sent any application records yet.
+        // RX: TLS 1.2 Finished was at seq=0 under application keys → start at 1.
+        //     TLS 1.3 server: set_num_tickets(0) prevents post-handshake sends → 0.
+        //     TLS 1.3 client: excluded above (full userspace TLS).
+        var tx_rec_seq = [_]u8{0} ** 8;
+        var rx_rec_seq = [_]u8{0} ** 8;
         if (ssl_version == c.TLS1_2_VERSION) {
-            rec_seq[7] = 1; // big-endian sequence number = 1
+            tx_rec_seq[7] = 1;
+            rx_rec_seq[7] = 1;
         }
 
-        // Enable TLS ULP on the socket
+        // Enable TLS ULP on the socket.
+        // Use raw syscall because std.posix.setsockopt doesn't handle ENOENT
+        // (returned when the tls kernel module isn't loaded), causing a noisy
+        // unexpectedErrno stack dump even though we handle the error.
+        // Check rc != 0 explicitly — errno() only detects negative values in
+        // (-4096, 0), so a positive non-zero rc would slip through as SUCCESS.
         const ulp = [4]u8{ 't', 'l', 's', 0 };
-        std.posix.setsockopt(fd, std.posix.IPPROTO.TCP, c.TCP_ULP, &ulp) catch |err| {
-            std.log.err("ktls: setsockopt TCP_ULP failed: {}", .{err});
+        const rc = std.os.linux.setsockopt(fd, std.posix.IPPROTO.TCP, c.TCP_ULP, &ulp, ulp.len);
+        if (rc != 0) {
+            const e = syscallErrno(rc);
+            if (e == .NOENT) {
+                std.log.warn("ktls: tls kernel module not loaded (ENOENT from TCP_ULP) — run 'modprobe tls'", .{});
+            } else {
+                std.log.err("ktls: TCP_ULP setsockopt failed: errno={d} ({s}) fd={d}", .{
+                    @intFromEnum(e), @tagName(e), fd,
+                });
+            }
             return error.KtlsSetupFailed;
-        };
+        }
 
         // Set TX and RX crypto info
         switch (params.kind) {
@@ -530,13 +603,14 @@ pub const TlsConn = struct {
                     .iv = .{0} ** 8,
                     .key = undefined,
                     .salt = undefined,
-                    .rec_seq = rec_seq,
+                    .rec_seq = tx_rec_seq,
                 };
                 @memcpy(&tx_info.key, tx_key[0..16]);
                 @memcpy(&tx_info.salt, tx_iv[0..4]);
                 @memcpy(&tx_info.iv, tx_iv[4..12]);
 
                 var rx_info = tx_info;
+                rx_info.rec_seq = rx_rec_seq;
                 @memcpy(&rx_info.key, rx_key[0..16]);
                 @memcpy(&rx_info.salt, rx_iv[0..4]);
                 @memcpy(&rx_info.iv, rx_iv[4..12]);
@@ -550,13 +624,14 @@ pub const TlsConn = struct {
                     .iv = .{0} ** 8,
                     .key = undefined,
                     .salt = undefined,
-                    .rec_seq = rec_seq,
+                    .rec_seq = tx_rec_seq,
                 };
                 @memcpy(&tx_info.key, tx_key[0..32]);
                 @memcpy(&tx_info.salt, tx_iv[0..4]);
                 @memcpy(&tx_info.iv, tx_iv[4..12]);
 
                 var rx_info = tx_info;
+                rx_info.rec_seq = rx_rec_seq;
                 @memcpy(&rx_info.key, rx_key[0..32]);
                 @memcpy(&rx_info.salt, rx_iv[0..4]);
                 @memcpy(&rx_info.iv, rx_iv[4..12]);
@@ -570,12 +645,13 @@ pub const TlsConn = struct {
                     .iv = undefined,
                     .key = undefined,
                     .salt = .{},
-                    .rec_seq = rec_seq,
+                    .rec_seq = tx_rec_seq,
                 };
                 @memcpy(&tx_info.key, tx_key[0..32]);
                 @memcpy(&tx_info.iv, tx_iv[0..12]);
 
                 var rx_info = tx_info;
+                rx_info.rec_seq = rx_rec_seq;
                 @memcpy(&rx_info.key, rx_key[0..32]);
                 @memcpy(&rx_info.iv, rx_iv[0..12]);
 
@@ -596,10 +672,22 @@ pub const TlsConn = struct {
     }
 
     fn setsockoptTls(fd: std.posix.socket_t, direction: u32, info_bytes: []const u8) !void {
-        std.posix.setsockopt(fd, SOL_TLS, direction, info_bytes) catch |err| {
-            std.log.err("ktls: setsockopt SOL_TLS dir={d} failed: {}", .{ direction, err });
+        // Use raw syscall with explicit rc != 0 check, matching the TCP_ULP path.
+        // std.posix.setsockopt uses errno() which misses positive non-zero rc values.
+        const rc = std.os.linux.setsockopt(
+            fd,
+            SOL_TLS,
+            direction,
+            @ptrCast(info_bytes.ptr),
+            @intCast(info_bytes.len),
+        );
+        if (rc != 0) {
+            const e = syscallErrno(rc);
+            std.log.err("ktls: setsockopt SOL_TLS dir={d} failed: errno={d} ({s}) fd={d}", .{
+                direction, @intFromEnum(e), @tagName(e), fd,
+            });
             return error.KtlsSetupFailed;
-        };
+        }
     }
 
     /// Derive TLS 1.3 record keys from traffic secrets captured by keylog callback.

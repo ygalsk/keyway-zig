@@ -34,6 +34,7 @@ const castUserdata = @import("helpers.zig").castUserdata;
 
 const cosocket_ops = @import("cosocket_ops.zig");
 const cosocket_tls = @import("cosocket_tls.zig");
+const conn_ws = @import("conn_ws.zig");
 
 // ============================================================================
 // Shared error infrastructure
@@ -99,10 +100,7 @@ pub fn onOutboundComplete(
                 s.coroutine_ref = 0;
             }
             // Clean up TLS conn if mid-handshake
-            if (s.outbound_tls) |tls_conn| {
-                tls_mod.freeTlsConn(self.base_allocator, tls_conn);
-                s.outbound_tls = null;
-            }
+            s.cleanupTls(self.base_allocator);
             self.cs.suspended = null;
         }
         self.maybeFinishClose();
@@ -120,7 +118,7 @@ pub fn onOutboundComplete(
     else if (op == .recv)
         cosocket_ops.interpretRecv(thread, s, result)
     else if (op == .close)
-        cosocket_ops.interpretClose(thread, s, result)
+        cosocket_ops.interpretClose(self, thread, s, result)
     else blk: {
         cosocket_ops.pushErrorTable(thread, .server_error, "unknown outbound op");
         break :blk cosocket_ops.InterpretResult{ .nresults = 2 };
@@ -140,7 +138,12 @@ pub fn dispatchResume(self: *Connection, thread: *Lua, nresults: c_int, exchange
     self.lua_state.current_connection = self;
     const resume_result = self.lua_state.resumeHandler(@ptrCast(thread), nresults, exchange) catch {
         self.lua_state.current_connection = null;
-        self.send500InternalError();
+        // WebSocket: can't send HTTP 500 on a WS connection — return to read loop
+        if (self.state == .websocket) {
+            completeHandler(self);
+        } else {
+            self.send500InternalError();
+        }
         return;
     };
 
@@ -150,7 +153,15 @@ pub fn dispatchResume(self: *Connection, thread: *Lua, nresults: c_int, exchange
             completeHandler(self);
         },
         .yielded => {
-            dispatchIo(self);
+            // WebSocket: route through routeWsYield which handles the fd=0
+            // ws:send() convention. Without this, ws:send() after a ring batch
+            // (e.g. Redis cosocket I/O) would be dispatched as a raw send on
+            // fd=0 (stdin) → ENOTSOCK.
+            if (self.state == .websocket) {
+                conn_ws.routeWsYield(self);
+            } else {
+                dispatchIo(self);
+            }
         },
     }
 }
@@ -191,15 +202,13 @@ fn drainSubmissionRing(self: *Connection) void {
                 io_index += 1;
             },
             .send => |snd| {
-                // Arena-dupe send_data before async submission (Lua string lifetime safety)
-                const duped = self.arena.allocator().dupe(u8, snd.data) catch {
-                    self.cs.cq.push(.{ .result = -1, .err_msg = "send: arena alloc failed", .err_category = .server_error });
+                const send_data = cosocket_ops.encryptForSend(self.arena.allocator(), s.outbound_tls, snd.data) orelse {
+                    self.cs.cq.push(.{ .result = -1, .err_msg = "send: encrypt/alloc failed", .err_category = .upstream_error });
                     io_index += 1;
                     continue;
                 };
-                // Plaintext send — kernel encrypts if kTLS is active
                 self.cs.batch_completions[io_index] = .{
-                    .op = .{ .send = .{ .fd = snd.fd, .buffer = .{ .slice = duped } } },
+                    .op = .{ .send = .{ .fd = snd.fd, .buffer = .{ .slice = send_data } } },
                     .userdata = self,
                     .callback = onBatchComplete,
                 };
@@ -235,7 +244,9 @@ fn drainSubmissionRing(self: *Connection) void {
                 io_index += 1;
             },
             .setkeepalive => |k| {
-                // Always synchronous — put fd into pool (no TLS state to transfer after kTLS)
+                // Free userspace TLS state — can't pool non-kTLS connections
+                s.cleanupTls(self.base_allocator);
+                // Always synchronous — put fd into pool
                 self.lua_state.pool.put(
                     k.pool_name,
                     k.fd,
@@ -363,7 +374,19 @@ pub fn onBatchComplete(
             return .disarm;
         };
         if (self.cs.batch_recv_bufs[sqe_index]) |buf| {
-            // Plaintext data — kernel already decrypted if kTLS is active
+            // Userspace TLS: decrypt ciphertext from the wire
+            if (self.cs.suspended) |*ss| {
+                if (ss.outbound_tls) |tls_conn| {
+                    if (tls_conn.sslRead(buf[0..bytes_read], buf)) |pt| {
+                        self.cs.cq.push(.{ .result = @intCast(pt.len), .buf = pt });
+                    } else {
+                        self.cs.cq.push(.{ .result = -1, .err_msg = "recv: TLS decrypt failed", .err_category = .upstream_error });
+                    }
+                    self.cs.batch_recv_bufs[sqe_index] = null;
+                    batchCompletionCheck(self);
+                    return .disarm;
+                }
+            }
             self.cs.cq.push(.{ .result = @intCast(bytes_read), .buf = buf[0..bytes_read] });
         } else {
             self.cs.cq.push(.{ .result = -1, .err_msg = "recv: no buffer", .err_category = .server_error });
@@ -376,6 +399,8 @@ pub fn onBatchComplete(
             batchCompletionCheck(self);
             return .disarm;
         };
+        // Free userspace TLS state if present
+        if (self.cs.suspended) |*ss| ss.cleanupTls(self.base_allocator);
         self.cs.cq.push(.{ .result = 1 });
     } else {
         const classified = classifyOpError(op);
@@ -404,10 +429,7 @@ fn batchCompletionCheck(self: *Connection) void {
                     s.outbound_fd = -1;
                 }
                 s.recv_buf = null;
-                if (s.outbound_tls) |tls_conn| {
-                    tls_mod.freeTlsConn(self.base_allocator, tls_conn);
-                    s.outbound_tls = null;
-                }
+                s.cleanupTls(self.base_allocator);
                 self.cs.suspended = null;
             }
         }
@@ -428,6 +450,7 @@ fn batchCompletionCheck(self: *Connection) void {
 
 /// Handler finished after one or more yield/resume cycles.
 /// Return coroutine to cache, serialize response, submit write.
+/// For WebSocket connections, returns to WS read loop instead of HTTP response.
 pub fn completeHandler(self: *Connection) void {
     const s = self.cs.suspended orelse return;
 
@@ -441,12 +464,20 @@ pub fn completeHandler(self: *Connection) void {
         }
     }
 
-    // Safety net: close leaked outbound fd
-    if (s.outbound_fd != -1) std.posix.close(s.outbound_fd);
+    // Safety net: close leaked outbound fd (use raw syscall — std.posix.close
+    // treats EBADF as unreachable, but double-close is a legitimate cleanup race)
+    if (s.outbound_fd != -1) _ = std.os.linux.close(s.outbound_fd);
 
-    const exchange = s.exchange;
     self.cs.suspended = null;
 
+    // WebSocket: return to WS read loop instead of serializing HTTP response
+    if (self.state == .websocket) {
+        self.lua_state.current_connection = null;
+        conn_ws.startWsRead(self);
+        return;
+    }
+
+    const exchange = s.exchange;
     self.logAccess(exchange.status);
     self.writeResponse(exchange) catch {
         self.send500InternalError();

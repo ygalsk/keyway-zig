@@ -81,6 +81,7 @@ pub fn startSseDisconnectWatch(self: *Connection) void {
         .userdata = self,
         .callback = onSseDisconnect,
     };
+    self.pending_io_ops += 1;
     self.loop.add(&ss.disconnect_completion);
 }
 
@@ -94,12 +95,15 @@ fn onSseDisconnect(
     _ = loop;
     _ = completion;
     const self = castUserdata(Connection, userdata);
+    self.pending_io_ops -= 1;
     const bytes = result.recv catch {
+        if (self.state == .closing) { self.maybeFinishClose(); return .disarm; }
         self.close();
         return .disarm;
     };
     // EOF (0 bytes) or unexpected client data — close the SSE connection
     _ = bytes;
+    if (self.state == .closing) { self.maybeFinishClose(); return .disarm; }
     self.close();
     return .disarm;
 }
@@ -150,10 +154,7 @@ fn onSseSendComplete(
     _ = loop;
     _ = completion;
     const self = castUserdata(Connection, userdata);
-    _ = result.send catch {
-        self.close();
-        return .disarm;
-    };
+    _ = self.handleSendCompletion(result) orelse return .disarm;
     drainSseQueue(self);
     return .disarm;
 }
@@ -170,10 +171,7 @@ fn onWrite(
     _ = loop;
     _ = completion;
     const self = castUserdata(Connection, userdata);
-    _ = result.send catch {
-        self.close();
-        return .disarm;
-    };
+    _ = self.handleSendCompletion(result) orelse return .disarm;
     // SSE headers sent — start watching for client disconnect
     startSseDisconnectWatch(self);
     return .disarm;

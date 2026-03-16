@@ -49,6 +49,10 @@ local counters = {
     stream_tests   = 0,
 }
 
+-- ─── Per-Route Metrics (static routes from keyway.routes) ────────────
+-- Key: "METHOD /pattern" → { hits, errors, total_latency_us }
+local _route_metrics = {}
+
 -- ─── Helpers ──────────────────────────────────────────────────────────
 
 local function esc(s)
@@ -83,6 +87,7 @@ end
 local _request_count = 0
 
 local function access_log_middleware(ctx, next)
+    dispatch._last_error = nil
     local t0 = response.now_us()
     next()
     local latency_us = math.floor(response.now_us() - t0)
@@ -108,6 +113,9 @@ local function access_log_middleware(ctx, next)
     -- Check for hook capture (set by M_capture_hook)
     local hook_id = ctx._hook_id or nil
 
+    -- Capture dispatch error (from Phase 1 error propagation)
+    local error_message = dispatch._last_error
+
     pcall(response.broadcast_event, "keyway:access", {
         method = method,
         path = ctx.path or "--",
@@ -119,7 +127,30 @@ local function access_log_middleware(ctx, next)
         header_count = header_count,
         scripts = matched_scripts,
         hook_id = hook_id,
+        error_message = error_message,
     })
+
+    -- Track per-route metrics for static routes
+    local path = ctx.path or ""
+    -- Match against registered static route patterns
+    for pattern, methods in pairs(keyway.routes) do
+        if type(methods) == "table" and pattern ~= "middleware" and methods[method] then
+            -- Check if path matches pattern (exact or param substitution)
+            local pat_regex = "^" .. pattern:gsub("{[^}]+}", "[^/]+") .. "$"
+            if path:match(pat_regex) then
+                local key = method .. " " .. pattern
+                local rm = _route_metrics[key]
+                if not rm then
+                    rm = { hits = 0, errors = 0, total_latency_us = 0 }
+                    _route_metrics[key] = rm
+                end
+                rm.hits = rm.hits + 1
+                if status >= 400 then rm.errors = rm.errors + 1 end
+                rm.total_latency_us = rm.total_latency_us + latency_us
+                break
+            end
+        end
+    end
 
     -- Periodic event condition evaluation
     _request_count = _request_count + 1
@@ -146,6 +177,139 @@ end
 -- ─── Initialize Script Engine ────────────────────────────────────────
 -- Reload is lazy: dispatch.dispatch checks _loaded on first request.
 -- No startup call needed (cosocket yields require a handler coroutine).
+
+-- ─── Shared Helpers ──────────────────────────────────────────────
+
+local function ws_reply(ws, tbl)
+    ws:send(cjson.encode(tbl))
+end
+
+local function ws_error(ws, cmd, msg)
+    ws_reply(ws, { cmd = cmd, error = msg })
+end
+
+local function mw_name(mw, index, prefix)
+    local name = (prefix or "mw_") .. index
+    local info = debug.getinfo(mw, "n")
+    if info and info.name then name = info.name end
+    return name
+end
+
+local function scripts_with_metrics()
+    local all = scripts_store.list()
+    for _, s in ipairs(all) do
+        local rt = dispatch.get_metrics(s.id)
+        if rt then s.metrics = rt end
+    end
+    return all
+end
+
+--- Iterate static routes in keyway.routes, calling cb(pattern, methods_table, mw_names, http_methods).
+local function each_static_route(cb, mw_prefix)
+    for pattern, methods in pairs(keyway.routes) do
+        if type(methods) == "table" and pattern ~= "middleware" then
+            local mw_names = {}
+            if methods.middleware then
+                for j, mw in ipairs(methods.middleware) do
+                    mw_names[#mw_names + 1] = mw_name(mw, j, mw_prefix)
+                end
+            end
+            local http_methods = {}
+            for method, _ in pairs(methods) do
+                if type(method) == "string" and method:match("^%u+$") then
+                    http_methods[#http_methods + 1] = method
+                end
+            end
+            cb(pattern, methods, mw_names, http_methods)
+        end
+    end
+end
+
+-- ─── WebSocket Command Dispatch ──────────────────────────────────
+
+local ws_commands = {}
+
+ws_commands.ping = function(ws, _)
+    ws_reply(ws, { cmd = "pong", ts = math.floor(response.now_us()), worker_id = keyway.worker_id })
+end
+
+ws_commands.info = function(ws, _)
+    ws_reply(ws, {
+        cmd = "info",
+        worker_id = keyway.worker_id,
+        ts = math.floor(response.now_us()),
+        counters = counters,
+    })
+end
+
+ws_commands.scripts = function(ws, _)
+    ws_reply(ws, { cmd = "scripts", scripts = scripts_with_metrics() })
+end
+
+ws_commands.hooks = function(ws, _)
+    ws_reply(ws, { cmd = "hooks", hooks = hooks_store.list() })
+end
+
+ws_commands.trigger = function(ws, msg)
+    local id = msg.id
+    if not id then return ws_error(ws, "trigger", "id required") end
+    local script = scripts_store.get(id)
+    if not script then return ws_error(ws, "trigger", "not found") end
+    local fn, compile_err = scripts_store.compile(script.code)
+    if not fn then return ws_error(ws, "trigger", compile_err) end
+    local mock_ctx = {
+        method = "GET", path = script.pattern, body = "",
+        status = 200, headers = {}, request_headers = {}, params = {},
+    }
+    local t0 = response.now_us()
+    local function err_handler(e) return debug.traceback(tostring(e), 2) end
+    local run_ok, run_err
+    if script.type == "middleware" then
+        run_ok, run_err = xpcall(fn, err_handler, mock_ctx, function() end)
+    else
+        run_ok, run_err = xpcall(fn, err_handler, mock_ctx)
+    end
+    local elapsed = math.floor(response.now_us() - t0)
+    ws_reply(ws, {
+        cmd = "trigger", id = id,
+        success = run_ok,
+        error = run_ok and nil or run_err,
+        result = { status = mock_ctx.status, body = mock_ctx.body, headers = mock_ctx.headers },
+        timing_us = elapsed,
+    })
+end
+
+ws_commands.routes = function(ws, _)
+    ws_reply(ws, { cmd = "routes", routes = dispatch.list_routes() })
+end
+
+ws_commands.lua = function(ws, msg)
+    local code = msg.code
+    if not code or code == "" then return ws_error(ws, "lua", "code required") end
+    local fn, compile_err = loadstring("return " .. code)
+    if not fn then
+        fn, compile_err = loadstring(code)
+    end
+    if not fn then return ws_error(ws, "lua", compile_err) end
+    local ok, result = pcall(fn)
+    if ok then
+        ws_reply(ws, { cmd = "lua", result = tostring(result) })
+    else
+        ws_error(ws, "lua", tostring(result))
+    end
+end
+
+ws_commands.send_hook = function(ws, msg)
+    local id = msg.id
+    local body = msg.body or ""
+    if not id then return ws_error(ws, "send_hook", "id required") end
+    if not hooks_store.exists(id) then return ws_error(ws, "send_hook", "hook not found") end
+    hooks_store.capture(id, {
+        method = "WS", path = "/h/" .. id,
+        headers = {}, body = body,
+    })
+    ws_reply(ws, { cmd = "send_hook", ok = true, id = id })
+end
 
 -- ─── Static Mount ────────────────────────────────────────────────────
 
@@ -175,80 +339,14 @@ keyway.routes = {
                 counters.ws_messages = counters.ws_messages + 1
                 local ok, msg = pcall(cjson.decode, ws.message)
                 if not ok then
-                    ws:send(cjson.encode({ error = "invalid json" }))
+                    ws_reply(ws, { error = "invalid json" })
                     return
                 end
-                local cmd = msg.cmd
-                if cmd == "ping" then
-                    ws:send(cjson.encode({ cmd = "pong", ts = math.floor(response.now_us()), worker_id = keyway.worker_id }))
-                elseif cmd == "info" then
-                    ws:send(cjson.encode({
-                        cmd = "info",
-                        worker_id = keyway.worker_id,
-                        ts = math.floor(response.now_us()),
-                        counters = counters,
-                    }))
-                elseif cmd == "scripts" then
-                    local all = scripts_store.list()
-                    for _, s in ipairs(all) do
-                        local rt = dispatch.get_metrics(s.id)
-                        if rt then s.metrics = rt end
-                    end
-                    ws:send(cjson.encode({ cmd = "scripts", scripts = all }))
-                elseif cmd == "hooks" then
-                    local all = hooks_store.list()
-                    ws:send(cjson.encode({ cmd = "hooks", hooks = all }))
-                elseif cmd == "trigger" then
-                    local id = msg.id
-                    if not id then
-                        ws:send(cjson.encode({ cmd = "trigger", error = "id required" }))
-                    else
-                        local script = scripts_store.get(id)
-                        if not script then
-                            ws:send(cjson.encode({ cmd = "trigger", error = "not found" }))
-                        else
-                            local fn, compile_err = scripts_store.compile(script.code)
-                            if not fn then
-                                ws:send(cjson.encode({ cmd = "trigger", error = compile_err }))
-                            else
-                                local mock_ctx = {
-                                    method = "GET", path = script.pattern, body = "",
-                                    status = 200, headers = {}, request_headers = {}, params = {},
-                                }
-                                local t0 = response.now_us()
-                                local run_ok, run_err
-                                if script.type == "middleware" then
-                                    run_ok, run_err = pcall(fn, mock_ctx, function() end)
-                                else
-                                    run_ok, run_err = pcall(fn, mock_ctx)
-                                end
-                                local elapsed = math.floor(response.now_us() - t0)
-                                ws:send(cjson.encode({
-                                    cmd = "trigger", id = id,
-                                    success = run_ok,
-                                    error = run_ok and nil or tostring(run_err),
-                                    result = { status = mock_ctx.status, body = mock_ctx.body, headers = mock_ctx.headers },
-                                    timing_us = elapsed,
-                                }))
-                            end
-                        end
-                    end
-                elseif cmd == "send_hook" then
-                    local id = msg.id
-                    local body = msg.body or ""
-                    if not id then
-                        ws:send(cjson.encode({ cmd = "send_hook", error = "id required" }))
-                    elseif not hooks_store.exists(id) then
-                        ws:send(cjson.encode({ cmd = "send_hook", error = "hook not found" }))
-                    else
-                        hooks_store.capture(id, {
-                            method = "WS", path = "/h/" .. id,
-                            headers = {}, body = body,
-                        })
-                        ws:send(cjson.encode({ cmd = "send_hook", ok = true, id = id }))
-                    end
+                local handler = ws_commands[msg.cmd]
+                if handler then
+                    handler(ws, msg)
                 else
-                    ws:send(cjson.encode({ error = "unknown command: " .. tostring(cmd) }))
+                    ws_reply(ws, { error = "unknown command: " .. tostring(msg.cmd) })
                 end
             end
             ctx.on_close = function()
@@ -382,17 +480,76 @@ keyway.routes = {
         end,
     },
 
+    -- Route listing (with middleware chain info)
+    ["/__keyway/api/routes"] = {
+        GET = function(ctx)
+            local routes = dispatch.list_routes()
+            each_static_route(function(pattern, _, mw_names, http_methods)
+                for _, method in ipairs(http_methods) do
+                    local key = method .. " " .. pattern
+                    local rm = _route_metrics[key]
+                    local hits = rm and rm.hits or 0
+                    local errors = rm and rm.errors or 0
+                    local avg = (rm and hits > 0) and math.floor(rm.total_latency_us / hits) or 0
+                    routes[#routes + 1] = {
+                        method = method,
+                        pattern = pattern,
+                        handler = "keyway.lua",
+                        middleware = mw_names,
+                        hits = hits,
+                        errors = errors,
+                        avg_latency_us = avg,
+                    }
+                end
+            end)
+            response.json_response(ctx, 200, { routes = routes })
+        end,
+    },
+
+    -- Effective config — compiled route table with resolved middleware chains
+    ["/__keyway/api/config/effective"] = {
+        GET = function(ctx)
+            local effective = {
+                global_middleware = {},
+                routes = {},
+                scripts = {},
+            }
+            -- Global middleware from keyway.routes.middleware
+            if keyway.routes.middleware then
+                for i, mw in ipairs(keyway.routes.middleware) do
+                    effective.global_middleware[#effective.global_middleware + 1] = mw_name(mw, i, "global_mw_")
+                end
+            end
+            -- Static routes
+            each_static_route(function(pattern, _, mw_names, http_methods)
+                effective.routes[#effective.routes + 1] = {
+                    pattern = pattern,
+                    methods = http_methods,
+                    middleware = mw_names,
+                }
+            end, "route_mw_")
+            -- Script-defined routes
+            local script_routes = dispatch.list_routes()
+            for _, r in ipairs(script_routes) do
+                effective.scripts[#effective.scripts + 1] = {
+                    method = r.method,
+                    pattern = r.pattern,
+                    handler = r.handler,
+                    hits = r.hits,
+                    errors = r.errors,
+                }
+            end
+            -- Sort routes by pattern
+            table.sort(effective.routes, function(a, b) return a.pattern < b.pattern end)
+            response.json_response(ctx, 200, effective)
+        end,
+    },
+
     -- ─── Scripts API ─────────────────────────────────────────────
 
     ["/__keyway/api/scripts"] = {
         GET = function(ctx)
-            local scripts = scripts_store.list()
-            -- Merge runtime metrics
-            for _, s in ipairs(scripts) do
-                local rt = dispatch.get_metrics(s.id)
-                if rt then s.metrics = rt end
-            end
-            response.json_response(ctx, 200, { scripts = scripts })
+            response.json_response(ctx, 200, { scripts = scripts_with_metrics() })
         end,
         POST = function(ctx)
             local body, err = response.parse_json_body(ctx)
@@ -491,16 +648,17 @@ keyway.routes = {
             }
             local next_called = false
             local t0 = response.now_us()
+            local function err_handler(e) return debug.traceback(tostring(e), 2) end
             local run_ok, run_err
             if script.type == "middleware" then
-                run_ok, run_err = pcall(fn, mock_ctx, function() next_called = true end)
+                run_ok, run_err = xpcall(fn, err_handler, mock_ctx, function() next_called = true end)
             else
-                run_ok, run_err = pcall(fn, mock_ctx)
+                run_ok, run_err = xpcall(fn, err_handler, mock_ctx)
             end
             local elapsed = math.floor(response.now_us() - t0)
             response.json_response(ctx, 200, {
                 success = run_ok,
-                error = run_ok and nil or tostring(run_err),
+                error = run_ok and nil or run_err,
                 result = {
                     status = mock_ctx.status,
                     body = mock_ctx.body,
@@ -543,9 +701,19 @@ keyway.routes = {
                 return
             end
             response.json_response(ctx, 200, {
-                hook = { id = hook.id, created_at = hook.created_at, request_count = #hook.requests },
+                hook = { id = hook.id, name = hook.name, created_at = hook.created_at, request_count = #hook.requests, config = hook.config },
                 requests = hook.requests,
             })
+        end,
+        PUT = function(ctx)
+            local body = response.parse_json_body(ctx)
+            if not body then return end
+            local hook = hooks_store.update(ctx.params.id, body)
+            if not hook then
+                response.json_not_found(ctx)
+                return
+            end
+            response.json_response(ctx, 200, { hook = hook })
         end,
         DELETE = function(ctx)
             local ok = hooks_store.delete(ctx.params.id)
@@ -676,7 +844,8 @@ keyway.routes = {
 
 function M_capture_hook(ctx)
     local id = ctx.params.id
-    if not hooks_store.exists(id) then
+    local hook = hooks_store.get(id)
+    if not hook then
         response.json_response(ctx, 404, { error = "hook not found" })
         return
     end
@@ -694,5 +863,12 @@ function M_capture_hook(ctx)
         headers = headers,
         body = ctx.body or "",
     })
-    response.json_response(ctx, 200, { captured = true })
+    -- Use hook config for response
+    local cfg = hook.config or {}
+    local resp_status = cfg.response_status or 200
+    local resp_body = cfg.response_body or '{"captured":true}'
+    local resp_ct = cfg.response_content_type or "application/json"
+    ctx.status = resp_status
+    ctx.headers["Content-Type"] = resp_ct
+    ctx.body = resp_body
 end

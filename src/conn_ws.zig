@@ -95,6 +95,7 @@ pub fn startWsRead(conn: *Connection) void {
         .userdata = conn,
         .callback = onWsRead,
     };
+    conn.pending_io_ops += 1;
     conn.loop.add(&conn.read_completion);
 }
 
@@ -109,12 +110,16 @@ fn onWsRead(
     _ = completion;
 
     const self = castUserdata(Connection, userdata);
+    self.pending_io_ops -= 1;
 
     const bytes_read = result.recv catch |err| {
+        if (self.state == .closing) { self.maybeFinishClose(); return .disarm; }
         std.log.err("ws recv failed err={} eof={}", .{ err, @intFromBool(err == error.EOF) });
         self.close();
         return .disarm;
     };
+
+    if (self.state == .closing) { self.maybeFinishClose(); return .disarm; }
 
     std.log.debug("ws: recv got {d} bytes", .{bytes_read});
 
@@ -226,6 +231,12 @@ fn dispatchWsMessage(conn: *Connection, payload: []const u8) void {
 
     _ = conn.arena.reset(.retain_capacity);
 
+    // After WS upgrade, request_method/request_path are stale slices into the
+    // overwritten read buffer. Set stable string literals so error logging
+    // (e.g. error_response.sendError) doesn't read garbage.
+    conn.http_state.request_method = "WS";
+    conn.http_state.request_path = "/ws";
+
     const payload_copy = conn.arena.allocator().dupe(u8, payload) catch {
         conn.close();
         return;
@@ -283,7 +294,7 @@ fn dispatchWsMessage(conn: *Connection, payload: []const u8) void {
             conn.lua_state.coroutine_ref = 0;
             conn.lua_state.coroutine_thread = null;
 
-            submitWsSend(conn);
+            routeWsYield(conn);
         },
     }
 }
@@ -337,11 +348,7 @@ fn onWsSendComplete(
     _ = completion;
 
     const self = castUserdata(Connection, userdata);
-
-    _ = result.send catch {
-        self.close();
-        return .disarm;
-    };
+    _ = self.handleSendCompletion(result) orelse return .disarm;
 
     // Resume coroutine with success
     const s = &self.cs.suspended.?;
@@ -351,46 +358,33 @@ fn onWsSendComplete(
     return .disarm;
 }
 
+/// Route a WS coroutine yield to the correct I/O path.
+/// Ring batch (SQ has entries) vs WS send (pending_io) vs cosocket single-shot.
+pub fn routeWsYield(conn: *Connection) void {
+    if (conn.lua_state.pending_io != null and conn.cs.sq.len() == 0) {
+        submitWsSend(conn);
+    } else {
+        cosocket.dispatchIo(conn);
+    }
+}
+
 /// Resume WS coroutine and handle result.
 fn wsDispatchResume(conn: *Connection, thread: *Lua, nresults: c_int) void {
     conn.lua_state.current_connection = conn;
     const s = &conn.cs.suspended.?;
     const resume_result = conn.lua_state.resumeHandler(@ptrCast(thread), nresults, s.exchange) catch {
-        conn.lua_state.current_connection = null;
-        wsCompleteHandler(conn);
-        startWsRead(conn);
+        cosocket.completeHandler(conn);
         return;
     };
 
     switch (resume_result) {
         .completed => {
-            conn.lua_state.current_connection = null;
-            wsCompleteHandler(conn);
-            startWsRead(conn);
+            cosocket.completeHandler(conn);
         },
         .yielded => {
-            // Another ws:send yield
-            submitWsSend(conn);
+            routeWsYield(conn);
         },
     }
-}
-
-/// Clean up suspended state after WS handler completes.
-fn wsCompleteHandler(conn: *Connection) void {
-    const s = conn.cs.suspended orelse return;
-
-    // Return coroutine thread to cache
-    if (s.coroutine_ref != 0) {
-        if (conn.lua_state.cached_thread_ref == 0) {
-            conn.lua_state.cached_thread_ref = s.coroutine_ref;
-            conn.lua_state.cached_thread = @ptrCast(@alignCast(s.coroutine_thread));
-        } else {
-            conn.lua_state.lua.unref(Lua.PseudoIndex.Registry, s.coroutine_ref);
-        }
-    }
-
-    if (s.outbound_fd != -1) std.posix.close(s.outbound_fd);
-    conn.cs.suspended = null;
 }
 
 /// Send a WS frame directly (for pong, close responses).
@@ -412,10 +406,7 @@ fn onWsControlSent(
     _ = loop;
     _ = completion;
     const self = castUserdata(Connection, userdata);
-    _ = result.send catch {
-        self.close();
-        return .disarm;
-    };
+    _ = self.handleSendCompletion(result) orelse return .disarm;
     processWsFrames(self);
     return .disarm;
 }
@@ -439,6 +430,8 @@ fn onWsCloseSent(
     _ = completion;
     _ = result;
     const self = castUserdata(Connection, userdata);
+    self.pending_io_ops -= 1;
+    if (self.state == .closing) { self.maybeFinishClose(); return .disarm; }
     self.close();
     return .disarm;
 }

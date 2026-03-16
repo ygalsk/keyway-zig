@@ -1,13 +1,16 @@
--- hooks_store.lua — Webhook capture (in-memory + SSE broadcast)
+-- hooks_store.lua — Webhook capture (Redis-persisted metadata + in-memory captures + SSE broadcast)
 local cjson = require("cjson")
 local response = require("keyway.response")
+local redis = require("scripts.dashboard.lib.redis_ring")
 local ffi = require("ffi")
 
 local M = {}
 
--- In-memory storage (per-worker)
-local _hooks = {}       -- id -> { created_at, requests[] }
+local REDIS_KEY = "kw:hooks"
 local MAX_CAPTURES = 50
+
+-- In-memory capture storage (ephemeral, real-time)
+local _captures = {}    -- id -> { request_data[] }
 
 -- Generate 8-char hex ID
 pcall(ffi.cdef, [[int open(const char *path, int flags); long read(int fd, void *buf, long count); int close(int fd);]])
@@ -25,27 +28,73 @@ local function generate_id()
     return table.concat(hex)
 end
 
+-- Load all hooks metadata from Redis
+local function load_hooks()
+    local data, err = redis.get(REDIS_KEY)
+    if not data then return {} end
+    local ok, hooks = pcall(cjson.decode, data)
+    if not ok or type(hooks) ~= "table" then return {} end
+    return hooks
+end
+
+-- Save all hooks metadata to Redis
+local function save_hooks(hooks)
+    return redis.set(REDIS_KEY, cjson.encode(hooks))
+end
+
 function M.create()
+    local hooks = load_hooks()
     local id = generate_id()
-    _hooks[id] = {
+    local hook = {
         id = id,
+        name = "",
         created_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-        requests = {},
+        config = {
+            response_status = 200,
+            response_body = '{"captured":true}',
+            response_content_type = "application/json",
+        },
     }
-    return _hooks[id]
+    hooks[#hooks + 1] = hook
+    save_hooks(hooks)
+    _captures[id] = {}
+    return hook
+end
+
+function M.update(id, fields)
+    local hooks = load_hooks()
+    for i, h in ipairs(hooks) do
+        if h.id == id then
+            if fields.name ~= nil then h.name = fields.name end
+            if fields.config then
+                local cfg = h.config or {}
+                if fields.config.response_status ~= nil then cfg.response_status = fields.config.response_status end
+                if fields.config.response_body ~= nil then cfg.response_body = fields.config.response_body end
+                if fields.config.response_content_type ~= nil then cfg.response_content_type = fields.config.response_content_type end
+                h.config = cfg
+            end
+            hooks[i] = h
+            save_hooks(hooks)
+            return h
+        end
+    end
+    return nil
 end
 
 function M.exists(id)
-    return _hooks[id] ~= nil
+    local hooks = load_hooks()
+    for _, h in ipairs(hooks) do
+        if h.id == id then return true end
+    end
+    return false
 end
 
 function M.capture(id, request_data)
-    local hook = _hooks[id]
-    if not hook then return false end
+    if not _captures[id] then _captures[id] = {} end
     request_data.ts = os.date("!%Y-%m-%dT%H:%M:%SZ")
-    table.insert(hook.requests, 1, request_data)
-    if #hook.requests > MAX_CAPTURES then
-        hook.requests[MAX_CAPTURES + 1] = nil
+    table.insert(_captures[id], 1, request_data)
+    if #_captures[id] > MAX_CAPTURES then
+        _captures[id][MAX_CAPTURES + 1] = nil
     end
     -- Broadcast capture event via SSE
     pcall(response.broadcast_html, "hook:" .. id, "capture", cjson.encode(request_data))
@@ -53,31 +102,45 @@ function M.capture(id, request_data)
 end
 
 function M.get(id)
-    return _hooks[id]
+    local hooks = load_hooks()
+    for _, h in ipairs(hooks) do
+        if h.id == id then
+            h.requests = _captures[id] or {}
+            return h
+        end
+    end
+    return nil
 end
 
 function M.list()
+    local hooks = load_hooks()
     local result = {}
-    for id, h in pairs(_hooks) do
+    for _, h in ipairs(hooks) do
+        local caps = _captures[h.id] or {}
         result[#result + 1] = {
-            id = id,
+            id = h.id,
+            name = h.name or "",
             created_at = h.created_at,
-            request_count = #h.requests,
+            capture_count = #caps,
+            config = h.config,
         }
     end
     return result
 end
 
 function M.get_requests(id)
-    local hook = _hooks[id]
-    if not hook then return nil end
-    return hook.requests
+    return _captures[id]
 end
 
 function M.delete(id)
-    if _hooks[id] then
-        _hooks[id] = nil
-        return true
+    local hooks = load_hooks()
+    for i, h in ipairs(hooks) do
+        if h.id == id then
+            table.remove(hooks, i)
+            save_hooks(hooks)
+            _captures[id] = nil
+            return true
+        end
     end
     return false
 end

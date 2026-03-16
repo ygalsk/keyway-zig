@@ -75,6 +75,13 @@ end
 
 -- Last matched scripts — populated during dispatch, read by access_log_middleware
 M._last_matched = {}
+-- Last error from dispatch — populated on pcall failure, read by access_log_middleware
+M._last_error = nil
+
+-- Error handler for xpcall — captures traceback
+local function _err_handler(e)
+    return debug.traceback(tostring(e), 2)
+end
 
 -- Global middleware — registered once at startup, runs on every request
 function M.dispatch(ctx, next)
@@ -91,10 +98,13 @@ function M.dispatch(ctx, next)
         M._last_matched[#M._last_matched + 1] = { id = h.id, name = h.name }
         h.metrics.calls = h.metrics.calls + 1
         local t0 = response.now_us()
-        local ok, err = pcall(h.fn, ctx)
+        local ok, err = xpcall(h.fn, _err_handler, ctx)
         local elapsed = response.now_us() - t0
         h.metrics.avg_latency_us = math.floor((h.metrics.avg_latency_us * (h.metrics.calls - 1) + elapsed) / h.metrics.calls)
-        if not ok then h.metrics.errors = h.metrics.errors + 1 end
+        if not ok then
+            h.metrics.errors = h.metrics.errors + 1
+            M._last_error = err
+        end
         return
     end
 
@@ -109,12 +119,15 @@ function M.dispatch(ctx, next)
                 mw.metrics.calls = mw.metrics.calls + 1
                 local t0 = response.now_us()
                 local called_next = false
-                local ok, err = pcall(mw.fn, ctx, function()
+                local ok, err = xpcall(mw.fn, _err_handler, ctx, function()
                     called_next = true
                 end)
                 local elapsed = response.now_us() - t0
                 mw.metrics.avg_latency_us = math.floor((mw.metrics.avg_latency_us * (mw.metrics.calls - 1) + elapsed) / mw.metrics.calls)
-                if not ok then mw.metrics.errors = mw.metrics.errors + 1 end
+                if not ok then
+                    mw.metrics.errors = mw.metrics.errors + 1
+                    M._last_error = err
+                end
                 if not called_next then return end
             end
         end
@@ -158,6 +171,43 @@ function M.get_metrics(id)
         if mw.id == id then return mw.metrics end
     end
     return nil
+end
+
+-- List all registered routes (compiled handlers + middleware)
+function M.list_routes()
+    if not _loaded then
+        seed_if_needed()
+        M.reload()
+    end
+    local routes = {}
+    -- Handlers
+    for key, h in pairs(_handlers) do
+        local method, path = key:match("^(%u+)%s+(.+)$")
+        if method and path then
+            routes[#routes + 1] = {
+                method = method,
+                pattern = path,
+                handler = h.name or "anonymous",
+                middleware = {},
+                hits = h.metrics and h.metrics.calls or 0,
+                errors = h.metrics and h.metrics.errors or 0,
+                avg_latency_us = h.metrics and h.metrics.avg_latency_us or 0,
+            }
+        end
+    end
+    -- Middleware as pseudo-routes
+    for _, mw in ipairs(_middleware) do
+        routes[#routes + 1] = {
+            method = "MW",
+            pattern = mw.pattern,
+            handler = mw.name or "anonymous",
+            middleware = {},
+            hits = mw.metrics and mw.metrics.calls or 0,
+            errors = mw.metrics and mw.metrics.errors or 0,
+            avg_latency_us = mw.metrics and mw.metrics.avg_latency_us or 0,
+        }
+    end
+    return routes
 end
 
 return M

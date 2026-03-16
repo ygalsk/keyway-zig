@@ -7,11 +7,19 @@
     "dev": "bunx --bun tailwindcss -i src/styles.css -o ../public/styles.css --watch",
     "build": "bun run build:css && bun run build:js",
     "build:css": "bunx --bun tailwindcss -i src/styles.css -o ../public/styles.css --minify",
-    "build:js": "bun build src/main.ts --outdir ../public --minify --entry-naming [name].js"
+    "build:js": "bun run build.ts"
   },
   "devDependencies": {
-    "tailwindcss": "^3.4.0",
+    "@babel/core": "^7.29.0",
+    "@babel/plugin-syntax-typescript": "^7.28.6",
+    "@babel/plugin-transform-typescript": "^7.28.6",
+    "babel-preset-solid": "^1.9.10",
     "daisyui": "^4.12.0",
+    "tailwindcss": "^3.4.0",
     "typescript": "^5.5.0"
+  },
+  "dependencies": {
+    "@solidjs/router": "^0.15.4",
+    "solid-js": "^1.9.11"
   }
 }

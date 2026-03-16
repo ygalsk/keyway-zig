@@ -282,6 +282,19 @@ pub const Server = struct {
             const conn: *Connection = @alignCast(@fieldParentPtr("link", node));
             conn.close();
         }
+
+        // Pass 2: shutdown sockets of connections stuck with pending I/O.
+        // After close(), connections without pending ops were deinited and removed
+        // from the list. Remaining connections have pending io_uring operations
+        // that prevent cleanup. Shutting down the socket causes those operations
+        // to complete (recv returns 0, send fails), triggering their callbacks
+        // which decrement counters and call maybeFinishClose() -> deinit().
+        it = self.connections.first;
+        while (it) |node| {
+            it = node.next;
+            const conn: *Connection = @alignCast(@fieldParentPtr("link", node));
+            std.posix.shutdown(conn.socket, .both) catch {};
+        }
     }
 
     fn onCancelComplete(_: ?*anyopaque, _: *xev.Loop, _: *xev.Completion, _: xev.Result) xev.CallbackAction {
