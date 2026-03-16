@@ -118,6 +118,7 @@ export function Traffic(props: { onNavigate?: (path: string, ctx?: Record<string
   const s = state();
   const [filters, setFilters] = createSignal<TrafficFilters>(defaultFilters());
   const [expanded, setExpanded] = createSignal<number | null>(null);
+  const [pausedSnapshot, setPausedSnapshot] = createSignal<TrafficEntry[]>([]);
 
   // Check for navigation context
   onMount(() => {
@@ -131,7 +132,7 @@ export function Traffic(props: { onNavigate?: (path: string, ctx?: Record<string
     if (ctxPath) setFilters(f => ({ ...f, path_pattern: ctxPath }));
   });
 
-  const traffic = () => filters().paused ? s.traffic() : s.traffic();
+  const traffic = () => filters().paused ? pausedSnapshot() : s.traffic();
   const filtered = createMemo(() => {
     const f = filters();
     return traffic().filter(e => matchesFilter(e, f)).slice(0, MAX_ROWS);
@@ -148,6 +149,10 @@ export function Traffic(props: { onNavigate?: (path: string, ctx?: Record<string
   }
 
   function togglePause() {
+    const wasPaused = filters().paused;
+    if (!wasPaused) {
+      setPausedSnapshot(s.traffic());
+    }
     setFilters(f => ({ ...f, paused: !f.paused }));
   }
 

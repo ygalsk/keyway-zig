@@ -49,36 +49,11 @@ function M.create()
         id = id,
         name = "",
         created_at = os.date("!%Y-%m-%dT%H:%M:%SZ"),
-        config = {
-            response_status = 200,
-            response_body = '{"captured":true}',
-            response_content_type = "application/json",
-        },
     }
     hooks[#hooks + 1] = hook
     save_hooks(hooks)
     _captures[id] = {}
     return hook
-end
-
-function M.update(id, fields)
-    local hooks = load_hooks()
-    for i, h in ipairs(hooks) do
-        if h.id == id then
-            if fields.name ~= nil then h.name = fields.name end
-            if fields.config then
-                local cfg = h.config or {}
-                if fields.config.response_status ~= nil then cfg.response_status = fields.config.response_status end
-                if fields.config.response_body ~= nil then cfg.response_body = fields.config.response_body end
-                if fields.config.response_content_type ~= nil then cfg.response_content_type = fields.config.response_content_type end
-                h.config = cfg
-            end
-            hooks[i] = h
-            save_hooks(hooks)
-            return h
-        end
-    end
-    return nil
 end
 
 function M.exists(id)
@@ -122,7 +97,6 @@ function M.list()
             name = h.name or "",
             created_at = h.created_at,
             capture_count = #caps,
-            config = h.config,
         }
     end
     return result

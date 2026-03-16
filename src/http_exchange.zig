@@ -14,6 +14,9 @@ pub const HttpExchange = struct {
     query: *const params_mod.QueryArray,
     body: []const u8,
 
+    // === PEER INFO ===
+    remote_addr: []const u8 = "",
+
     // === RESPONSE (write-only from Lua) ===
     status: u16 = 200,
     response_headers: std.ArrayList(http.Header),

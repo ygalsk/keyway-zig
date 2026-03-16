@@ -7,7 +7,7 @@ local M = {}
 
 local REDIS_KEY = "kw:scripts"
 
--- Sandbox environment for user scripts
+-- Sandbox environment for user scripts — computation + JSON + response helpers, no I/O
 local function make_sandbox()
     return {
         string = string, table = table, math = math,
@@ -15,10 +15,9 @@ local function make_sandbox()
         pairs = pairs, ipairs = ipairs, type = type,
         pcall = pcall, xpcall = xpcall, error = error,
         select = select, unpack = unpack,
+        os = { time = os.time, clock = os.clock },
+        print = function() end, -- no-op for script debugging
         cjson = cjson,
-        -- Keyway modules
-        socket = require("keyway.socket"),
-        dns = require("keyway.dns"),
         response = response,
     }
 end
@@ -92,7 +91,6 @@ function M.create(params)
         priority = params.priority or 0,
         enabled = false,
         code = params.code or "return function(ctx, next) next() end",
-        trigger_condition = params.trigger_condition,
         metrics = { calls = 0, errors = 0, avg_latency_us = 0 },
         created_at = now,
         updated_at = now,
@@ -119,7 +117,6 @@ function M.update(id, params)
             if params.pattern then s.pattern = params.pattern end
             if params.priority ~= nil then s.priority = params.priority end
             if params.code then s.code = params.code end
-            if params.trigger_condition ~= nil then s.trigger_condition = params.trigger_condition end
             s.updated_at = tostring(math.floor(response.now_us() / 1000000))
             scripts[i] = s
             M.save(scripts)

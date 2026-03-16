@@ -67,8 +67,29 @@ export function startMetricPolling(): void {
       s.pushMetricSnapshot(m);
     } catch { /* ignore after retries exhausted */ }
   }
-  poll();
-  metricTimer = setInterval(poll, 5000);
+
+  function startTimer() {
+    if (metricTimer) return;
+    poll();
+    metricTimer = setInterval(poll, 5000);
+  }
+
+  function pauseTimer() {
+    if (metricTimer) {
+      clearInterval(metricTimer);
+      metricTimer = null;
+    }
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) {
+      pauseTimer();
+    } else {
+      startTimer();
+    }
+  });
+
+  startTimer();
 }
 
 export function stopMetricPolling(): void {
@@ -196,10 +217,6 @@ export async function deleteHook(id: string): Promise<void> {
 
 export async function fetchHookCaptures(id: string): Promise<{ hook: object; requests: object[] }> {
   return api(`/__keyway/api/hooks/${id}`);
-}
-
-export async function updateHook(id: string, fields: Record<string, unknown>): Promise<void> {
-  await api(`/__keyway/api/hooks/${id}`, { method: "PUT", body: JSON.stringify(fields) });
 }
 
 // ─── Effective Config ───────────────────────────────────

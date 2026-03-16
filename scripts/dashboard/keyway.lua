@@ -34,7 +34,18 @@ local function self_request(host_hdr, port, method, path)
         end
     end
     local body = ""
-    if content_length and content_length > 0 then body = tcp:receive(content_length) or "" end
+    if content_length and content_length > 0 then
+        body = tcp:receive(content_length) or ""
+    else
+        -- No Content-Length: read until EOF (Connection: close)
+        local chunks = {}
+        while true do
+            local chunk, chunk_err = tcp:receive(4096)
+            if not chunk then break end
+            chunks[#chunks + 1] = chunk
+        end
+        if #chunks > 0 then body = table.concat(chunks) end
+    end
     tcp:close()
     return status_code, headers, body
 end
@@ -81,13 +92,25 @@ local function extract_path_id(path, prefix)
     return id
 end
 
+-- ─── Localhost Guard ─────────────────────────────────────────────────
+-- Restricts /__keyway/ paths to localhost only.
+
+local function localhost_guard(ctx, next)
+    if ctx.path and ctx.path:match("^/__keyway/") then
+        local addr = ctx.remote_addr or ""
+        if addr ~= "127.0.0.1" and addr ~= "::1" then
+            ctx.status = 403
+            ctx.body = "Forbidden"
+            return
+        end
+    end
+    next()
+end
+
 -- ─── Access Log Middleware ────────────────────────────────────────────
 -- Broadcasts JSON event per request via SSE.
 
-local _request_count = 0
-
 local function access_log_middleware(ctx, next)
-    dispatch._last_error = nil
     local t0 = response.now_us()
     next()
     local latency_us = math.floor(response.now_us() - t0)
@@ -113,9 +136,6 @@ local function access_log_middleware(ctx, next)
     -- Check for hook capture (set by M_capture_hook)
     local hook_id = ctx._hook_id or nil
 
-    -- Capture dispatch error (from Phase 1 error propagation)
-    local error_message = dispatch._last_error
-
     pcall(response.broadcast_event, "keyway:access", {
         method = method,
         path = ctx.path or "--",
@@ -127,7 +147,6 @@ local function access_log_middleware(ctx, next)
         header_count = header_count,
         scripts = matched_scripts,
         hook_id = hook_id,
-        error_message = error_message,
     })
 
     -- Track per-route metrics for static routes
@@ -136,7 +155,7 @@ local function access_log_middleware(ctx, next)
     for pattern, methods in pairs(keyway.routes) do
         if type(methods) == "table" and pattern ~= "middleware" and methods[method] then
             -- Check if path matches pattern (exact or param substitution)
-            local pat_regex = "^" .. pattern:gsub("{[^}]+}", "[^/]+") .. "$"
+            local pat_regex = "^" .. pattern:gsub("([%.%-%+%%%^%$%(%)%[%]%*%?])", "%%%1"):gsub("{[^}]+}", "[^/]+") .. "$"
             if path:match(pat_regex) then
                 local key = method .. " " .. pattern
                 local rm = _route_metrics[key]
@@ -152,14 +171,6 @@ local function access_log_middleware(ctx, next)
         end
     end
 
-    -- Periodic event condition evaluation
-    _request_count = _request_count + 1
-    if _request_count % 100 == 0 then
-        pcall(dispatch.evaluate_conditions, {
-            total_requests = _request_count,
-            error_rate = (counters.http_probes > 0) and 0 or 0,
-        })
-    end
 end
 
 -- ─── Test Middleware ──────────────────────────────────────────────────
@@ -195,14 +206,6 @@ local function mw_name(mw, index, prefix)
     return name
 end
 
-local function scripts_with_metrics()
-    local all = scripts_store.list()
-    for _, s in ipairs(all) do
-        local rt = dispatch.get_metrics(s.id)
-        if rt then s.metrics = rt end
-    end
-    return all
-end
 
 --- Iterate static routes in keyway.routes, calling cb(pattern, methods_table, mw_names, http_methods).
 local function each_static_route(cb, mw_prefix)
@@ -243,7 +246,7 @@ ws_commands.info = function(ws, _)
 end
 
 ws_commands.scripts = function(ws, _)
-    ws_reply(ws, { cmd = "scripts", scripts = scripts_with_metrics() })
+    ws_reply(ws, { cmd = "scripts", scripts = scripts_store.list() })
 end
 
 ws_commands.hooks = function(ws, _)
@@ -320,7 +323,7 @@ keyway.static = {
 -- ─── Routes ──────────────────────────────────────────────────────────
 
 keyway.routes = {
-    middleware = { access_log_middleware, dispatch.dispatch },
+    middleware = { localhost_guard, access_log_middleware, dispatch.dispatch },
 
     -- Dashboard: SSE event stream
     ["/__keyway/events"] = {
@@ -549,7 +552,7 @@ keyway.routes = {
 
     ["/__keyway/api/scripts"] = {
         GET = function(ctx)
-            response.json_response(ctx, 200, { scripts = scripts_with_metrics() })
+            response.json_response(ctx, 200, { scripts = scripts_store.list() })
         end,
         POST = function(ctx)
             local body, err = response.parse_json_body(ctx)
@@ -566,8 +569,6 @@ keyway.routes = {
                 response.json_not_found(ctx)
                 return
             end
-            local rt = dispatch.get_metrics(script.id)
-            if rt then script.metrics = rt end
             response.json_response(ctx, 200, { script = script })
         end,
         PUT = function(ctx)
@@ -670,17 +671,6 @@ keyway.routes = {
         end,
     },
 
-    ["/__keyway/api/scripts/{id}/metrics"] = {
-        GET = function(ctx)
-            local metrics = dispatch.get_metrics(ctx.params.id)
-            if not metrics then
-                response.json_not_found(ctx)
-                return
-            end
-            response.json_response(ctx, 200, { metrics = metrics })
-        end,
-    },
-
     -- ─── Hooks API ───────────────────────────────────────────────
 
     ["/__keyway/api/hooks"] = {
@@ -701,19 +691,9 @@ keyway.routes = {
                 return
             end
             response.json_response(ctx, 200, {
-                hook = { id = hook.id, name = hook.name, created_at = hook.created_at, request_count = #hook.requests, config = hook.config },
+                hook = { id = hook.id, name = hook.name, created_at = hook.created_at, request_count = #hook.requests },
                 requests = hook.requests,
             })
-        end,
-        PUT = function(ctx)
-            local body = response.parse_json_body(ctx)
-            if not body then return end
-            local hook = hooks_store.update(ctx.params.id, body)
-            if not hook then
-                response.json_not_found(ctx)
-                return
-            end
-            response.json_response(ctx, 200, { hook = hook })
         end,
         DELETE = function(ctx)
             local ok = hooks_store.delete(ctx.params.id)
@@ -844,8 +824,7 @@ keyway.routes = {
 
 function M_capture_hook(ctx)
     local id = ctx.params.id
-    local hook = hooks_store.get(id)
-    if not hook then
+    if not hooks_store.exists(id) then
         response.json_response(ctx, 404, { error = "hook not found" })
         return
     end
@@ -863,12 +842,7 @@ function M_capture_hook(ctx)
         headers = headers,
         body = ctx.body or "",
     })
-    -- Use hook config for response
-    local cfg = hook.config or {}
-    local resp_status = cfg.response_status or 200
-    local resp_body = cfg.response_body or '{"captured":true}'
-    local resp_ct = cfg.response_content_type or "application/json"
-    ctx.status = resp_status
-    ctx.headers["Content-Type"] = resp_ct
-    ctx.body = resp_body
+    ctx.status = 200
+    ctx.headers["Content-Type"] = "application/json"
+    ctx.body = '{"captured":true}'
 end

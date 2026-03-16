@@ -116,6 +116,10 @@ pub const Connection = struct {
     lua_state: *LuaState,
     server: *Server,
 
+    // Peer address (formatted string, e.g. "127.0.0.1"), persists across keep-alive
+    peer_addr_buf: [64]u8 = undefined,
+    peer_addr_len: u8 = 0,
+
     // Completions (must have stable address!)
     read_completion: xev.Completion,
     write_completion: xev.Completion,
@@ -208,6 +212,38 @@ pub const Connection = struct {
             .sse_registry = sse_registry,
             .server = server,
         };
+
+        // Resolve peer address from socket using properly-aligned storage
+        var peer_storage: std.posix.sockaddr.storage = undefined;
+        const peer_sa: *std.posix.sockaddr = @ptrCast(&peer_storage);
+        var peer_sa_len: std.posix.socklen_t = @sizeOf(std.posix.sockaddr.storage);
+        if (std.posix.getpeername(socket, peer_sa, &peer_sa_len)) {
+            const formatted: []const u8 = switch (peer_sa.family) {
+                std.posix.AF.INET => blk: {
+                    const addr4: *const std.posix.sockaddr.in = @ptrCast(@alignCast(peer_sa));
+                    const bytes = @as(*const [4]u8, @ptrCast(&addr4.addr));
+                    break :blk std.fmt.bufPrint(&conn.peer_addr_buf, "{d}.{d}.{d}.{d}", .{ bytes[0], bytes[1], bytes[2], bytes[3] }) catch "";
+                },
+                std.posix.AF.INET6 => blk: {
+                    const addr6: *const std.posix.sockaddr.in6 = @ptrCast(@alignCast(peer_sa));
+                    const bytes = @as(*const [16]u8, @ptrCast(&addr6.addr));
+                    // Check for IPv4-mapped IPv6 (::ffff:x.x.x.x)
+                    const is_v4_mapped = std.mem.eql(u8, bytes[0..12], &[_]u8{ 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0xff, 0xff });
+                    if (is_v4_mapped) {
+                        break :blk std.fmt.bufPrint(&conn.peer_addr_buf, "{d}.{d}.{d}.{d}", .{ bytes[12], bytes[13], bytes[14], bytes[15] }) catch "";
+                    }
+                    // Check for loopback (::1)
+                    const is_loopback = std.mem.eql(u8, bytes[0..15], &([_]u8{0} ** 15)) and bytes[15] == 1;
+                    if (is_loopback) {
+                        break :blk std.fmt.bufPrint(&conn.peer_addr_buf, "::1", .{}) catch "";
+                    }
+                    // Other IPv6 — leave empty (safe default: denied by localhost guard)
+                    break :blk "";
+                },
+                else => "",
+            };
+            conn.peer_addr_len = @intCast(formatted.len);
+        } else |_| {}
 
         server.connections.append(&conn.link);
 
@@ -649,6 +685,7 @@ pub const Connection = struct {
         const clean_path = self.http_state.request_path;
         const exchange = try alloc.create(HttpExchange);
         exchange.* = try HttpExchange.init(alloc, request, &self.param_cache, &self.query_cache, clean_path);
+        exchange.remote_addr = self.peer_addr_buf[0..self.peer_addr_len];
         try self.dispatchToHandler(ref, exchange, request, clean_path);
     }
 

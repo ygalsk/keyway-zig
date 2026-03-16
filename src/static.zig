@@ -80,8 +80,8 @@ fn formatHttpDate(buf: *[29]u8, epoch_secs: i64) void {
     const year_day = epoch_day.calculateYearDay();
     const month_day = year_day.calculateMonthDay();
 
-    // Day of week: Jan 1 1970 was Thursday (index 0)
-    const dow_idx: usize = @intCast(@mod(@as(i64, @intCast(epoch_day.day)) + 4, 7));
+    // Day of week: Jan 1 1970 was Thursday (days[0])
+    const dow_idx: usize = @intCast(@mod(@as(i64, @intCast(epoch_day.day)), 7));
 
     _ = std.fmt.bufPrint(buf, "{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
         days[dow_idx],

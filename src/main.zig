@@ -87,9 +87,30 @@ pub fn main() !void {
 }
 
 // Pull all modules into the test runner's import graph.
-// Modules not transitively imported from main must be listed here.
+// Zig's lazy compilation only discovers tests in modules reached by
+// the comptime/runtime code path. Explicitly referencing every test-bearing
+// module here ensures `zig build test` runs the full suite.
 comptime {
+    _ = @import("bpf_reuseport.zig");
+    _ = @import("buffer.zig");
+    _ = @import("cli.zig");
+    _ = @import("connection_pool.zig");
+    _ = @import("cosocket.zig");
+    _ = @import("cosocket_ops.zig");
+    _ = @import("error_response.zig");
+    _ = @import("handler.zig");
+    _ = @import("helpers.zig");
+    _ = @import("http.zig");
+    _ = @import("log.zig");
+    _ = @import("lua_state.zig");
     _ = @import("metrics.zig");
+    _ = @import("params.zig");
+    _ = @import("ring.zig");
+    _ = @import("router.zig");
+    _ = @import("server.zig");
     _ = @import("shutdown.zig");
+    _ = @import("sse.zig");
+    _ = @import("static.zig");
+    _ = @import("tls.zig");
     _ = @import("ws.zig");
 }

@@ -63,6 +63,8 @@ fn luaExchangeIndex(lua: *Lua) callconv(.c) c_int {
         pushHeadersProxy(lua, ex);
     } else if (std.mem.eql(u8, key_str, "request_headers")) {
         pushRequestHeadersTable(lua, ex.headers);
+    } else if (std.mem.eql(u8, key_str, "remote_addr")) {
+        lua.pushLString(ex.remote_addr);
     } else {
         lua.pushNil();
     }

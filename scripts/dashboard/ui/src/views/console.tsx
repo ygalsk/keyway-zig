@@ -87,14 +87,20 @@ export function ConsoleCore() {
     return true;
   }
 
-  // WS response handler
+  // WS response handler — track last processed index to avoid dropping messages
+  let lastProcessedIndex = 0;
   createEffect(() => {
     const msgs = s.wsMessages();
-    if (!msgs.length) return;
-    const latest = msgs[msgs.length - 1];
-    if (latest.cmd || latest.error || latest.routes || latest.scripts || latest.result) {
-      addEntry({ type: "response", text: JSON.stringify(latest), ts: Date.now() });
+    if (!msgs.length) { lastProcessedIndex = 0; return; }
+    // Process all messages from lastProcessedIndex forward
+    const startIdx = Math.max(lastProcessedIndex, 0);
+    for (let i = startIdx; i < msgs.length; i++) {
+      const msg = msgs[i];
+      if (msg.cmd || msg.error || msg.routes || msg.scripts || msg.result) {
+        addEntry({ type: "response", text: JSON.stringify(msg), ts: Date.now() });
+      }
     }
+    lastProcessedIndex = msgs.length;
   });
 
   type CmdHandler = (arg: string) => void | Promise<void>;

@@ -1,12 +1,11 @@
--- dispatch.lua — Script dispatch middleware + event condition evaluator
+-- dispatch.lua — Script dispatch middleware
 local scripts_store = require("scripts.dashboard.lib.scripts_store")
 local response = require("keyway.response")
 
 local M = {}
 
-local _handlers = {}     -- "METHOD /path" -> {fn, id, enabled, name, metrics}
-local _middleware = {}    -- ordered: [{pattern, fn, id, enabled, priority, name, metrics}]
-local _conditions = {}   -- event-driven: [{id, check_fn, activate_script_id}]
+local _handlers = {}     -- "METHOD /path" -> {fn, id, enabled, name}
+local _middleware = {}    -- ordered: [{pattern, fn, id, enabled, priority, name}]
 local _loaded = false
 local _seeded = false
 
@@ -21,7 +20,6 @@ end
 function M.reload()
     _handlers = {}
     _middleware = {}
-    _conditions = {}
 
     local scripts = scripts_store.load()
     for _, s in ipairs(scripts) do
@@ -29,59 +27,35 @@ function M.reload()
             local fn, err = scripts_store.compile(s.code)
             if fn then
                 if s.type == "handler" then
-                    -- Handler: pattern is "METHOD /path" or just "/path" (all methods)
                     local method, path = s.pattern:match("^(%u+)%s+(.+)$")
                     if not method then
-                        -- Default to GET if no method specified
                         method = "GET"
                         path = s.pattern
                     end
                     local key = method .. " " .. path
                     _handlers[key] = {
-                        fn = fn, id = s.id, enabled = true,
-                        name = s.name, metrics = s.metrics,
+                        fn = fn, id = s.id, enabled = true, name = s.name,
                     }
                 else
-                    -- Middleware: pattern is Lua pattern for path matching
                     _middleware[#_middleware + 1] = {
                         pattern = s.pattern, fn = fn, id = s.id,
-                        enabled = true, priority = s.priority or 0,
-                        name = s.name, metrics = s.metrics,
+                        enabled = true, priority = s.priority or 0, name = s.name,
                     }
-                end
-
-                -- Parse trigger conditions
-                if s.trigger_condition and s.trigger_condition ~= "" then
-                    local cond_fn, cond_err = loadstring("return function(m) return " .. s.trigger_condition .. " end")
-                    if cond_fn then
-                        local ok, check = pcall(cond_fn)
-                        if ok and type(check) == "function" then
-                            _conditions[#_conditions + 1] = {
-                                id = s.id,
-                                check_fn = check,
-                                activate_script_id = s.id,
-                            }
-                        end
-                    end
                 end
             end
         end
     end
 
-    -- Sort middleware by priority (higher first)
-    table.sort(_middleware, function(a, b) return a.priority > b.priority end)
+    -- Sort middleware by priority (higher first), stable tiebreaker by id
+    table.sort(_middleware, function(a, b)
+        if a.priority ~= b.priority then return a.priority > b.priority end
+        return (a.id or "") < (b.id or "")
+    end)
     _loaded = true
 end
 
 -- Last matched scripts — populated during dispatch, read by access_log_middleware
 M._last_matched = {}
--- Last error from dispatch — populated on pcall failure, read by access_log_middleware
-M._last_error = nil
-
--- Error handler for xpcall — captures traceback
-local function _err_handler(e)
-    return debug.traceback(tostring(e), 2)
-end
 
 -- Global middleware — registered once at startup, runs on every request
 function M.dispatch(ctx, next)
@@ -96,15 +70,7 @@ function M.dispatch(ctx, next)
     local h = _handlers[key]
     if h and h.enabled then
         M._last_matched[#M._last_matched + 1] = { id = h.id, name = h.name }
-        h.metrics.calls = h.metrics.calls + 1
-        local t0 = response.now_us()
-        local ok, err = xpcall(h.fn, _err_handler, ctx)
-        local elapsed = response.now_us() - t0
-        h.metrics.avg_latency_us = math.floor((h.metrics.avg_latency_us * (h.metrics.calls - 1) + elapsed) / h.metrics.calls)
-        if not ok then
-            h.metrics.errors = h.metrics.errors + 1
-            M._last_error = err
-        end
+        h.fn(ctx)
         return
     end
 
@@ -116,36 +82,16 @@ function M.dispatch(ctx, next)
             idx = idx + 1
             if mw.enabled and ctx.path and ctx.path:match(mw.pattern) then
                 M._last_matched[#M._last_matched + 1] = { id = mw.id, name = mw.name }
-                mw.metrics.calls = mw.metrics.calls + 1
-                local t0 = response.now_us()
                 local called_next = false
-                local ok, err = xpcall(mw.fn, _err_handler, ctx, function()
+                mw.fn(ctx, function()
                     called_next = true
                 end)
-                local elapsed = response.now_us() - t0
-                mw.metrics.avg_latency_us = math.floor((mw.metrics.avg_latency_us * (mw.metrics.calls - 1) + elapsed) / mw.metrics.calls)
-                if not ok then
-                    mw.metrics.errors = mw.metrics.errors + 1
-                    M._last_error = err
-                end
                 if not called_next then return end
             end
         end
         next()
     end
     run_next()
-end
-
--- Evaluate event conditions (called periodically or on metric update)
-function M.evaluate_conditions(current_metrics)
-    for _, cond in ipairs(_conditions) do
-        local ok, should_activate = pcall(cond.check_fn, current_metrics)
-        if ok then
-            if should_activate then
-                M.enable_script(cond.activate_script_id)
-            end
-        end
-    end
 end
 
 -- Enable/disable a specific script by ID
@@ -160,17 +106,6 @@ function M.disable_script(id)
         scripts_store.toggle(id)
         M.reload()
     end
-end
-
--- Get runtime metrics for a script
-function M.get_metrics(id)
-    for _, h in pairs(_handlers) do
-        if h.id == id then return h.metrics end
-    end
-    for _, mw in ipairs(_middleware) do
-        if mw.id == id then return mw.metrics end
-    end
-    return nil
 end
 
 -- List all registered routes (compiled handlers + middleware)
@@ -189,9 +124,9 @@ function M.list_routes()
                 pattern = path,
                 handler = h.name or "anonymous",
                 middleware = {},
-                hits = h.metrics and h.metrics.calls or 0,
-                errors = h.metrics and h.metrics.errors or 0,
-                avg_latency_us = h.metrics and h.metrics.avg_latency_us or 0,
+                hits = 0,
+                errors = 0,
+                avg_latency_us = 0,
             }
         end
     end
@@ -202,9 +137,9 @@ function M.list_routes()
             pattern = mw.pattern,
             handler = mw.name or "anonymous",
             middleware = {},
-            hits = mw.metrics and mw.metrics.calls or 0,
-            errors = mw.metrics and mw.metrics.errors or 0,
-            avg_latency_us = mw.metrics and mw.metrics.avg_latency_us or 0,
+            hits = 0,
+            errors = 0,
+            avg_latency_us = 0,
         }
     end
     return routes

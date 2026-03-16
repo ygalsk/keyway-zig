@@ -169,7 +169,7 @@ pub const LuaState = struct {
     }
 
     /// Load Lua code from string
-    pub fn loadString(self: *LuaState, code: []const u8) !void {
+    pub fn loadString(self: *LuaState, code: [:0]const u8) !void {
         try self.lua.doString(code);
     }
 
@@ -187,7 +187,7 @@ pub const LuaState = struct {
 
     /// Call a Lua function by name
     /// The function should be at the global scope
-    pub fn callGlobalFunction(self: *LuaState, name: []const u8) !void {
+    pub fn callGlobalFunction(self: *LuaState, name: [:0]const u8) !void {
         _ = self.lua.getGlobal(name);
         if (!self.lua.isFunction(-1)) {
             self.lua.pop(1);
@@ -493,7 +493,7 @@ test "lua function call" {
     // Verify it ran
     _ = state.lua.getGlobal("message");
     const msg = state.lua.toString(-1) catch unreachable;
-    try std.testing.expectEqualStrings("Hello from Lua", msg);
+    try std.testing.expectEqualStrings("Hello from Lua", std.mem.span(msg));
     state.lua.pop(1);
 }
 
@@ -523,7 +523,7 @@ test "coroutine dispatch - non-yielding handler" {
     // Look up the route to get the lua_ref
     var url_params = params_mod.ParamArray{};
     var query = params_mod.QueryArray{};
-    const lua_ref = router.match("GET", "/test", &url_params);
+    const lua_ref = try router.match("GET", "/test", &url_params);
     try std.testing.expect(lua_ref != null);
 
     // Build a minimal HttpExchange
@@ -632,7 +632,7 @@ test "middleware execution order" {
 
     var url_params = params_mod.ParamArray{};
     var query = params_mod.QueryArray{};
-    const lua_ref = router.match("GET", "/test", &url_params);
+    const lua_ref = try router.match("GET", "/test", &url_params);
     try std.testing.expect(lua_ref != null);
 
     var response_headers = try std.ArrayList(http.Header).initCapacity(allocator, 4);
@@ -690,7 +690,7 @@ test "middleware short-circuit" {
 
     var url_params = params_mod.ParamArray{};
     var query = params_mod.QueryArray{};
-    const lua_ref = router.match("GET", "/secret", &url_params);
+    const lua_ref = try router.match("GET", "/secret", &url_params);
     try std.testing.expect(lua_ref != null);
 
     var response_headers = try std.ArrayList(http.Header).initCapacity(allocator, 4);
@@ -742,7 +742,7 @@ test "security: request body with lua code is not executed" {
 
     var url_params = params_mod.ParamArray{};
     var query = params_mod.QueryArray{};
-    const lua_ref = router.match("POST", "/echo", &url_params);
+    const lua_ref = try router.match("POST", "/echo", &url_params);
     try std.testing.expect(lua_ref != null);
 
     var response_headers = try std.ArrayList(http.Header).initCapacity(allocator, 4);
@@ -795,7 +795,7 @@ test "security: param with lua code is literal string" {
 
     var url_params = params_mod.ParamArray{};
     var query = params_mod.QueryArray{};
-    const lua_ref = router.match("GET", "/h/os.execute('id')", &url_params);
+    const lua_ref = try router.match("GET", "/h/os.execute('id')", &url_params);
     try std.testing.expect(lua_ref != null);
 
     var response_headers = try std.ArrayList(http.Header).initCapacity(allocator, 4);
@@ -849,7 +849,7 @@ test "security: ctx.method and ctx.path are read-only" {
 
     var url_params = params_mod.ParamArray{};
     var query = params_mod.QueryArray{};
-    const lua_ref = router.match("GET", "/test", &url_params);
+    const lua_ref = try router.match("GET", "/test", &url_params);
     try std.testing.expect(lua_ref != null);
 
     var response_headers = try std.ArrayList(http.Header).initCapacity(allocator, 4);

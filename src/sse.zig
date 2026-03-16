@@ -39,6 +39,12 @@ pub const SseRegistry = struct {
         try gop.value_ptr.append(self.allocator, conn);
     }
 
+    /// Return the number of subscribers in a room (0 if room does not exist).
+    pub fn subscriberCount(self: *SseRegistry, room: []const u8) usize {
+        const list = self.rooms.getPtr(room) orelse return 0;
+        return list.items.len;
+    }
+
     /// Remove a connection from a room's subscriber list.
     pub fn unsubscribe(self: *SseRegistry, room: []const u8, conn: *Connection) void {
         const list = self.rooms.getPtr(room) orelse return;
@@ -241,9 +247,9 @@ test "SseRegistry subscribe and unsubscribe" {
     var reg = SseRegistry.init(allocator);
     defer reg.deinit();
 
-    // Use opaque pointers as fake Connection handles (never dereferenced)
-    const fake_conn_a: *Connection = @ptrFromInt(0xDEAD_0001);
-    const fake_conn_b: *Connection = @ptrFromInt(0xDEAD_0002);
+    // Use properly-aligned fake Connection handles (never dereferenced)
+    const fake_conn_a: *Connection = @ptrFromInt(0xDEAD_0000);
+    const fake_conn_b: *Connection = @ptrFromInt(0xBEEF_0000);
 
     try reg.subscribe("chat", fake_conn_a);
     try reg.subscribe("chat", fake_conn_b);
@@ -261,7 +267,7 @@ test "SseRegistry unsubscribe nonexistent is no-op" {
     var reg = SseRegistry.init(allocator);
     defer reg.deinit();
 
-    const fake_conn: *Connection = @ptrFromInt(0xDEAD_0003);
+    const fake_conn: *Connection = @ptrFromInt(0xCAFE_0000);
     // Unsubscribe from room that doesn't exist — should not crash
     reg.unsubscribe("nonexistent", fake_conn);
 }
@@ -271,7 +277,7 @@ test "SseRegistry multiple rooms" {
     var reg = SseRegistry.init(allocator);
     defer reg.deinit();
 
-    const fake_conn: *Connection = @ptrFromInt(0xDEAD_0004);
+    const fake_conn: *Connection = @ptrFromInt(0xFACE_0000);
 
     try reg.subscribe("room_a", fake_conn);
     try reg.subscribe("room_b", fake_conn);

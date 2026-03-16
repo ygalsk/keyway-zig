@@ -24,6 +24,7 @@ const result = await Bun.build({
   entrypoints: ["src/main.tsx"],
   outdir: "../public",
   minify: true,
+  sourcemap: "external",
   naming: "[name].js",
   plugins: [solidPlugin],
 });

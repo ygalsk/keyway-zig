@@ -77,40 +77,6 @@ return function(ctx, next)
   next()
 end`,
   },
-  upstream_proxy: {
-    name: "Upstream Proxy", type: "handler", pattern: "/api/proxy",
-    code: `-- Proxy requests to upstream (socket, dns are sandbox globals)
-return function(ctx)
-  local ip = dns.resolve_host("httpbin.org")
-  if not ip then
-    ctx.status = 502
-    ctx.body = '{"error":"dns failed"}'
-    return
-  end
-
-  local tcp = socket.tcp()
-  tcp:settimeout(5000)
-  local ok = tcp:connect(ip, 80)
-  if not ok then
-    ctx.status = 502
-    ctx.body = '{"error":"connect failed"}'
-    return
-  end
-
-  tcp:send("GET /get HTTP/1.1\\r\\nHost: httpbin.org\\r\\nConnection: close\\r\\n\\r\\n")
-  tcp:receive("*l") -- status
-  while true do
-    local line = tcp:receive("*l")
-    if not line or line == "" then break end
-  end
-  local body = tcp:receive("*a") or ""
-  tcp:close()
-
-  ctx.status = 200
-  ctx.headers["Content-Type"] = "application/json"
-  ctx.body = body
-end`,
-  },
   canary_router: {
     name: "Canary Router", type: "middleware", pattern: "^/api/",
     code: `-- Canary: route 10% of traffic to canary upstream

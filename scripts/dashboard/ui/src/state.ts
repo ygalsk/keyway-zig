@@ -1,7 +1,6 @@
 // Reactive state — Solid signals + stores
 
 import { createSignal, createRoot } from "solid-js";
-import { createStore, produce } from "solid-js/store";
 
 // Connection status
 export type ConnStatus = "connected" | "connecting" | "disconnected";
@@ -30,7 +29,6 @@ export interface ScriptMeta {
   enabled: boolean;
   code: string;
   metrics: { calls: number; errors: number; avg_latency_us: number };
-  trigger_condition?: string;
   created_at: string;
   updated_at: string;
 }
@@ -120,12 +118,6 @@ export interface Hook {
   capture_count: number;
   created_at: string;
   name?: string;
-  enabled?: boolean;
-  config?: {
-    response_status?: number;
-    response_body?: string;
-    response_content_type?: string;
-  };
 }
 
 export interface HookCapture {

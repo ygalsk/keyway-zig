@@ -79,6 +79,9 @@
   .method-DELETE { color: var(--kw-red); }
   .method-WS { color: var(--kw-purple); }
   .method-PROBE { color: var(--kw-blue); }
+  .method-MW { color: var(--kw-text); opacity: 0.5; }
+  .method-HEAD { color: var(--kw-accent); }
+  .method-OPTIONS { color: var(--kw-yellow); }
 
   .status-2xx { color: var(--kw-accent); }
   .status-3xx { color: var(--kw-blue); }

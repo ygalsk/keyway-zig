@@ -285,20 +285,22 @@ export function Overview(props: { onNavigate: (path: string, ctx?: Record<string
         <div class="bg-base-200 rounded p-3">
           <div class="text-detail text-base-content/50 font-medium mb-2">Quick Actions</div>
           <div class="flex flex-wrap gap-2">
-            {[
+            <For each={[
               { cmd: "probe", label: "Probe", desc: "HTTP test request" },
               { cmd: "dns", label: "DNS", desc: "DNS resolution" },
               { cmd: "scripts", label: "Scripts", desc: "List Lua scripts" },
               { cmd: "config", label: "Config", desc: "Effective config" },
-            ].map(action => (
-              <button
-                class="btn btn-xs btn-outline btn-primary"
-                title={action.desc}
-                onClick={() => props.onOpenConsole?.(action.cmd)}
-              >
-                {action.label}
-              </button>
-            ))}
+            ]}>
+              {(action) => (
+                <button
+                  class="btn btn-xs btn-outline btn-primary"
+                  title={action.desc}
+                  onClick={() => props.onOpenConsole?.(action.cmd)}
+                >
+                  {action.label}
+                </button>
+              )}
+            </For>
           </div>
           <div class="text-tiny text-base-content/30 mt-1">Opens console with command pre-filled</div>
         </div>
