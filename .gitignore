@@ -24,6 +24,9 @@ Thumbs.db
 # TLS certificates
 certs/
 
+# Node modules
+node_modules/
+
 # Profiling
 perf.data*
 *.svg

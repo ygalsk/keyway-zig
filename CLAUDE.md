@@ -197,6 +197,6 @@ Backend and infrastructure engineers building routing/gateway systems. They open
 6. **Authoring is lightweight** — Script editing, deploy, and toggle workflows should feel fast and low-friction. No modal wizards or multi-step forms. Inline editing, immediate feedback, keyboard-driven where possible.
 
 ### Frontend Stack
-- **Vite + vanilla TypeScript** — No framework (React/Vue/etc). Vanilla DOM manipulation.
+- **Bun + vanilla TypeScript** — No framework (React/Vue/etc). Vanilla DOM manipulation.
 - **Tailwind CSS + daisyUI** — Use daisyUI defaults for component styling. Only override the color theme to match Keyway's palette. Don't fight default spacing/sizing.
 - **JetBrains Mono everywhere** — Override daisyUI's font stack globally. All text is monospace.
