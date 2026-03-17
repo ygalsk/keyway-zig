@@ -28,27 +28,8 @@ export interface ScriptMeta {
   priority: number;
   enabled: boolean;
   code: string;
-  metrics: { calls: number; errors: number; avg_latency_us: number };
   created_at: string;
   updated_at: string;
-}
-
-export interface Metrics {
-  status: string;
-  worker_count: number;
-  total_requests: number;
-  active_connections: number;
-  total_errors: number;
-  rejected_connections: number;
-  latency: { min_us: number; avg_us: number; max_us: number };
-}
-
-export interface MetricSnapshot {
-  ts: number;
-  requests: number;
-  errors: number;
-  connections: number;
-  avg_latency_us: number;
 }
 
 export interface Route {
@@ -56,18 +37,11 @@ export interface Route {
   pattern: string;
   handler: string;
   middleware: string[];
-  hits: number;
-  errors: number;
-  avg_latency_us: number;
   type?: string;
 }
 
 export interface WorkerInfo {
   id: number;
-  requests: number;
-  errors: number;
-  active_connections: number;
-  avg_latency_us: number;
   counters: Record<string, number>;
 }
 
@@ -104,7 +78,7 @@ export const INVOCATION_LABELS: Record<InvocationState, string> = {
 export const INVOCATION_COLORS: Record<InvocationState, string> = {
   success: "text-success",
   client_error: "text-warning",
-  client_disconnect: "text-base-content/40",
+  client_disconnect: "text-base-content/50",
   script_error: "text-error",
   timeout: "text-warning",
   resource_exceeded: "text-secondary",
@@ -128,14 +102,6 @@ export interface HookCapture {
   ts: number;
 }
 
-// Active stats
-export interface ActiveStat {
-  key: string;
-  value: number;
-  delta: number;
-  rate: number;
-}
-
 // Traffic filters
 export interface TrafficFilters {
   method: string | null;
@@ -146,45 +112,35 @@ export interface TrafficFilters {
   paused: boolean;
 }
 
+// Toast errors
+export interface ToastError {
+  message: string;
+  ts: number;
+}
+
 // ─── Global Signals ──────────────────────────────────────
 // Created in a root so they live for the app lifetime.
 
 const TRAFFIC_MAX = 500;
-const METRIC_HISTORY_MAX = 60;
 
 function createAppState() {
   const [sseStatus, setSseStatus] = createSignal<ConnStatus>("disconnected");
   const [wsStatus, setWsStatus] = createSignal<ConnStatus>("disconnected");
-  const [metrics, setMetrics] = createSignal<Metrics | null>(null);
   const [traffic, setTraffic] = createSignal<TrafficEntry[]>([]);
-  const [metricHistory, setMetricHistory] = createSignal<MetricSnapshot[]>([]);
   const [wsMessages, setWsMessages] = createSignal<Record<string, unknown>[]>([]);
   const [scripts, setScripts] = createSignal<ScriptMeta[]>([]);
   const [drawerOpen, setDrawerOpen] = createSignal(false);
   const [pendingConsoleCmd, setPendingConsoleCmd] = createSignal<string | null>(null);
-
-  // Navigation context — ephemeral values consumed once
-  const [navContext, setNavContext] = createSignal<Record<string, unknown>>({});
+  const [dataStartTime, setDataStartTime] = createSignal<number | null>(null);
+  const [errors, setErrors] = createSignal<ToastError[]>([]);
 
   function pushTraffic(entry: TrafficEntry) {
+    // Track when first data arrives
+    if (dataStartTime() === null) setDataStartTime(Date.now());
     setTraffic(prev => {
       const next = [entry, ...prev];
       if (next.length > TRAFFIC_MAX) next.length = TRAFFIC_MAX;
       return next;
-    });
-  }
-
-  function pushMetricSnapshot(m: Metrics) {
-    setMetricHistory(prev => {
-      const entry: MetricSnapshot = {
-        ts: Date.now(),
-        requests: m.total_requests || 0,
-        errors: m.total_errors || 0,
-        connections: m.active_connections || 0,
-        avg_latency_us: m.latency?.avg_us || 0,
-      };
-      const base = prev.length >= METRIC_HISTORY_MAX ? prev.slice(1) : prev;
-      return [...base, entry];
     });
   }
 
@@ -195,39 +151,28 @@ function createAppState() {
     });
   }
 
-  function consumeNavContext(key: string): unknown {
-    const ctx = navContext();
-    const val = ctx[key];
-    if (val !== undefined) {
-      setNavContext(prev => {
-        const next = { ...prev };
-        delete next[key];
-        return next;
-      });
-    }
-    return val;
+  function pushError(message: string) {
+    setErrors(prev => [...prev.slice(-9), { message, ts: Date.now() }]);
   }
 
-  function setNavContextValues(values: Record<string, unknown>) {
-    setNavContext(prev => ({ ...prev, ...values }));
+  function dismissError(ts: number) {
+    setErrors(prev => prev.filter(e => e.ts !== ts));
   }
 
   return {
     sseStatus, setSseStatus,
     wsStatus, setWsStatus,
-    metrics, setMetrics,
     traffic, setTraffic,
-    metricHistory, setMetricHistory,
     wsMessages, setWsMessages,
     scripts, setScripts,
     drawerOpen, setDrawerOpen,
     pendingConsoleCmd, setPendingConsoleCmd,
-    navContext, setNavContext,
+    dataStartTime, setDataStartTime,
+    errors, setErrors,
     pushTraffic,
-    pushMetricSnapshot,
     pushWsMessage,
-    consumeNavContext,
-    setNavContextValues,
+    pushError,
+    dismissError,
   };
 }
 

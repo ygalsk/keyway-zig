@@ -4,6 +4,8 @@ import { createSignal, createMemo, For, Show, onMount, onCleanup } from "solid-j
 import { state, type Hook, type HookCapture } from "../state";
 import { fetchHooks, createHook, deleteHook, fetchHookCaptures } from "../api";
 import { MethodBadge } from "../components/badge";
+import { Card } from "../components/card";
+import { EmptyState, LoadingState, ErrorState } from "../components/feedback";
 import { formatTime } from "./format";
 
 function relativeTime(ts: number): string {
@@ -15,16 +17,20 @@ function relativeTime(ts: number): string {
 }
 
 export function Hooks() {
-  const [hooks, setHooks] = createSignal<Hook[]>([]);
+  const [hooks, setHooks] = createSignal<Hook[] | null>(null);
+  const [loadError, setLoadError] = createSignal<string | null>(null);
   const [selectedHook, setSelectedHook] = createSignal<string | null>(null);
   const [captures, setCaptures] = createSignal<HookCapture[]>([]);
   let sseSource: EventSource | null = null;
 
   async function loadHooks() {
+    setLoadError(null);
     try {
       const data = await fetchHooks();
       setHooks((data.hooks || []) as Hook[]);
-    } catch { /* ignore */ }
+    } catch (e) {
+      setLoadError((e as Error).message);
+    }
   }
 
   async function onCreateHook() {
@@ -101,62 +107,79 @@ export function Hooks() {
           <button class="btn btn-xs btn-primary" onClick={onCreateHook}>+ New</button>
         </div>
         <div class="flex-1 overflow-auto space-y-1">
-          <For each={hooks()}>
-            {(h) => {
-              const isSelected = () => h.id === selectedHook();
-              return (
-                <div
-                  class={`p-2 rounded cursor-pointer text-xs border ${isSelected() ? "border-primary bg-base-200" : "border-base-300 hover:bg-base-200"}`}
-                  onClick={() => selectHookById(h.id)}
-                >
-                  <div class="flex items-center justify-between">
-                    <span class={`font-mono text-detail ${isSelected() ? "text-primary" : "text-base-content/70"}`}>
-                      /h/{h.id}
-                    </span>
-                    <button
-                      class="btn btn-xs btn-ghost text-error"
-                      onClick={(e) => { e.stopPropagation(); onDeleteHook(h.id); }}
+          {/* Loading */}
+          <Show when={hooks() === null && !loadError()}>
+            <LoadingState rows={3} />
+          </Show>
+
+          {/* Error */}
+          <Show when={loadError()}>
+            {(errMsg) => <ErrorState message={errMsg()} onRetry={loadHooks} />}
+          </Show>
+
+          {/* Data */}
+          <Show when={hooks() !== null && !loadError()}>
+            <For each={hooks()!}>
+              {(h) => {
+                const isSelected = () => h.id === selectedHook();
+                return (
+                  <Card interactive border={isSelected()} borderColor={isSelected() ? "border-primary" : undefined}>
+                    <div
+                      class="cursor-pointer"
+                      onClick={() => selectHookById(h.id)}
                     >
-                      ×
-                    </button>
-                  </div>
-                  <div class="text-tiny text-base-content/40 mt-0.5">
-                    {h.capture_count} captures
-                  </div>
-                </div>
-              );
-            }}
-          </For>
+                      <div class="flex items-center justify-between">
+                        <span class={`font-mono text-detail ${isSelected() ? "text-primary" : "text-base-content/70"}`}>
+                          /h/{h.id}
+                        </span>
+                        <button
+                          class="btn btn-xs btn-ghost text-error"
+                          onClick={(e) => { e.stopPropagation(); onDeleteHook(h.id); }}
+                        >
+                          ×
+                        </button>
+                      </div>
+                      <div class="text-tiny text-base-content/50 mt-0.5">
+                        {h.capture_count} captures
+                      </div>
+                    </div>
+                  </Card>
+                );
+              }}
+            </For>
+          </Show>
         </div>
       </div>
 
       {/* Right: Metrics + Captures */}
       <div class="flex-1 flex flex-col gap-2 min-w-0">
-        <Show when={selectedHook()}>
+        <Show when={selectedHook()} fallback={
+          <EmptyState message="Select a hook to view captures" hint="Or create a new hook with the + New button" />
+        }>
           {(hookId) => (
             <>
               {/* Header */}
-              <div class="flex items-center gap-2 text-detail text-base-content/40">
+              <div class="flex items-center gap-2 text-detail text-base-content/50">
                 <span>Endpoint:</span>
                 <code class="text-primary select-all">{`${location.origin}/h/${hookId()}`}</code>
-                <button class="btn btn-xs btn-ghost text-base-content/40" title="Copy endpoint URL" onClick={onCopyEndpoint}>⎘</button>
+                <button class="btn btn-xs btn-ghost text-base-content/50" title="Copy endpoint URL" onClick={onCopyEndpoint}>⎘</button>
                 <span class="ml-auto">Live</span>
               </div>
 
               {/* Metrics panel */}
-              <div class="border border-base-300 rounded p-3">
+              <Card>
                 <div class="text-detail text-base-content/50 font-medium mb-2">Metrics</div>
                 <div class="grid grid-cols-3 gap-3 text-center text-detail">
                   <div>
-                    <div class="text-base-content/40">Total captures</div>
+                    <div class="text-base-content/50">Total captures</div>
                     <div class="text-base-content/80 font-semibold text-sm">{captureMetrics().total}</div>
                   </div>
                   <div>
-                    <div class="text-base-content/40">Rate (last 60s)</div>
+                    <div class="text-base-content/50">Rate (last 60s)</div>
                     <div class="text-base-content/80 font-semibold text-sm">{captureMetrics().rate}/min</div>
                   </div>
                   <div>
-                    <div class="text-base-content/40">Last capture</div>
+                    <div class="text-base-content/50">Last capture</div>
                     <div class="text-base-content/80 font-semibold text-sm">
                       {captureMetrics().lastTs ? relativeTime(captureMetrics().lastTs) : "never"}
                     </div>
@@ -180,23 +203,23 @@ export function Hooks() {
                     </For>
                   </div>
                 </Show>
-              </div>
+              </Card>
 
               {/* Captures */}
               <div class="flex-1 overflow-auto">
                 <Show when={captures().length > 0} fallback={
-                  <div class="text-center text-base-content/30 text-xs py-8">No captures yet. Send a request to the endpoint.</div>
+                  <EmptyState message="No captures yet" hint="Send a request to the endpoint above" />
                 }>
                   <For each={captures()}>
                     {(c) => (
-                      <div class="border border-base-300 rounded p-2 mb-2 text-detail">
+                      <Card>
                         <div class="flex items-center gap-2 mb-1">
                           <MethodBadge method={c.method} />
                           <span class="text-base-content/70 truncate">{c.path}</span>
-                          <span class="ml-auto text-base-content/30">{c.ts ? formatTime(c.ts) : ""}</span>
+                          <span class="ml-auto text-base-content/45">{c.ts ? formatTime(c.ts) : ""}</span>
                         </div>
                         <Show when={c.headers}>
-                          <div class="text-base-content/40 mb-1">
+                          <div class="text-base-content/50 mb-1">
                             <For each={Object.entries(c.headers)}>
                               {([k, v]) => <div>{k}: {v}</div>}
                             </For>
@@ -205,7 +228,7 @@ export function Hooks() {
                         <Show when={c.body}>
                           <pre class="bg-base-300 rounded p-1 mt-1 text-base-content/70 overflow-x-auto">{c.body}</pre>
                         </Show>
-                      </div>
+                      </Card>
                     )}
                   </For>
                 </Show>

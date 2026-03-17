@@ -8,9 +8,7 @@ local M = {}
 
 local REDIS_KEY = "kw:hooks"
 local MAX_CAPTURES = 50
-
--- In-memory capture storage (ephemeral, real-time)
-local _captures = {}    -- id -> { request_data[] }
+local CAPTURE_PREFIX = "kw:hook_captures:"
 
 -- Generate 8-char hex ID
 pcall(ffi.cdef, [[int open(const char *path, int flags); long read(int fd, void *buf, long count); int close(int fd);]])
@@ -52,7 +50,6 @@ function M.create()
     }
     hooks[#hooks + 1] = hook
     save_hooks(hooks)
-    _captures[id] = {}
     return hook
 end
 
@@ -65,22 +62,31 @@ function M.exists(id)
 end
 
 function M.capture(id, request_data)
-    if not _captures[id] then _captures[id] = {} end
     request_data.ts = os.date("!%Y-%m-%dT%H:%M:%SZ")
-    table.insert(_captures[id], 1, request_data)
-    if #_captures[id] > MAX_CAPTURES then
-        _captures[id][MAX_CAPTURES + 1] = nil
-    end
+    local encoded = cjson.encode(request_data)
+    redis.lpush(CAPTURE_PREFIX .. id, encoded)
+    redis.ltrim(CAPTURE_PREFIX .. id, 0, MAX_CAPTURES - 1)
     -- Broadcast capture event via SSE
-    pcall(response.broadcast_html, "hook:" .. id, "capture", cjson.encode(request_data))
+    pcall(response.broadcast_html, "hook:" .. id, "capture", encoded)
     return true
+end
+
+local function load_captures(id)
+    local raw = redis.lrange(CAPTURE_PREFIX .. id, 0, MAX_CAPTURES - 1)
+    if not raw or type(raw) ~= "table" then return {} end
+    local result = {}
+    for _, item in ipairs(raw) do
+        local ok, decoded = pcall(cjson.decode, item)
+        if ok then result[#result + 1] = decoded end
+    end
+    return result
 end
 
 function M.get(id)
     local hooks = load_hooks()
     for _, h in ipairs(hooks) do
         if h.id == id then
-            h.requests = _captures[id] or {}
+            h.requests = load_captures(id)
             return h
         end
     end
@@ -91,7 +97,7 @@ function M.list()
     local hooks = load_hooks()
     local result = {}
     for _, h in ipairs(hooks) do
-        local caps = _captures[h.id] or {}
+        local caps = load_captures(h.id)
         result[#result + 1] = {
             id = h.id,
             name = h.name or "",
@@ -103,7 +109,7 @@ function M.list()
 end
 
 function M.get_requests(id)
-    return _captures[id]
+    return load_captures(id)
 end
 
 function M.delete(id)
@@ -112,7 +118,7 @@ function M.delete(id)
         if h.id == id then
             table.remove(hooks, i)
             save_hooks(hooks)
-            _captures[id] = nil
+            redis.del(CAPTURE_PREFIX .. id)
             return true
         end
     end

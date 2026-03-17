@@ -5,8 +5,8 @@ import { For } from "solid-js";
 export function EmptyState(props: { message: string; hint?: string }) {
   return (
     <div class="flex flex-col items-center justify-center py-8 text-center">
-      <div class="text-detail text-base-content/30">{props.message}</div>
-      {props.hint && <div class="text-tiny text-base-content/20 mt-1">{props.hint}</div>}
+      <div class="text-detail text-base-content/45">{props.message}</div>
+      {props.hint && <div class="text-tiny text-base-content/35 mt-1">{props.hint}</div>}
     </div>
   );
 }

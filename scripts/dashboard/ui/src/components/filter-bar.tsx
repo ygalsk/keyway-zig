@@ -8,6 +8,8 @@ export interface FilterConfig {
   placeholder: string;
   options?: { value: string; label: string }[];
   width?: string;
+  value?: string;
+  onChange?: (value: string) => void;
 }
 
 export function FilterBar(props: { filters: FilterConfig[]; children?: JSX.Element }) {
@@ -17,7 +19,12 @@ export function FilterBar(props: { filters: FilterConfig[]; children?: JSX.Eleme
         {(f) => {
           if (f.type === "select") {
             return (
-              <select id={f.id} class="select select-xs select-bordered">
+              <select
+                id={f.id}
+                class="select select-xs select-bordered"
+                value={f.value ?? ""}
+                onChange={(e) => f.onChange?.(e.currentTarget.value)}
+              >
                 <option value="">{f.placeholder}</option>
                 <For each={f.options || []}>
                   {(o) => <option value={o.value}>{o.label}</option>}
@@ -31,6 +38,8 @@ export function FilterBar(props: { filters: FilterConfig[]; children?: JSX.Eleme
               type="text"
               placeholder={f.placeholder}
               class={`input input-xs input-bordered ${f.width || "w-32"}`}
+              value={f.value ?? ""}
+              onInput={(e) => f.onChange?.(e.currentTarget.value)}
             />
           );
         }}

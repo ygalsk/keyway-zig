@@ -1,6 +1,7 @@
 // API client — fetch, SSE, WebSocket wrappers
 
-import { state, type ConnStatus, type TrafficEntry, type Metrics } from "./state";
+import { state, type TrafficEntry } from "./state";
+import { ingestScrape } from "./prom";
 
 const BASE = "";
 const FETCH_TIMEOUT = 10_000;
@@ -26,6 +27,9 @@ export async function api<T>(
     } catch {
       throw new Error(`Invalid JSON from ${path}: ${text.slice(0, 200)}`);
     }
+  } catch (err) {
+    state().pushError(`API ${path}: ${(err as Error).message}`);
+    throw err;
   } finally {
     clearTimeout(timer);
   }
@@ -59,13 +63,21 @@ let metricTimer: ReturnType<typeof setInterval> | null = null;
 
 export function startMetricPolling(): void {
   if (metricTimer) return;
-  const s = state();
+
   async function poll() {
     try {
-      const m = await apiWithRetry<Metrics>("/__keyway/api/metrics");
-      s.setMetrics(m);
-      s.pushMetricSnapshot(m);
-    } catch { /* ignore after retries exhausted */ }
+      const controller = new AbortController();
+      const timer = setTimeout(() => controller.abort(), FETCH_TIMEOUT);
+      try {
+        const res = await fetch("/metrics", { signal: controller.signal });
+        if (res.ok) {
+          const text = await res.text();
+          ingestScrape(text);
+        }
+      } finally {
+        clearTimeout(timer);
+      }
+    } catch { /* ignore */ }
   }
 
   function startTimer() {
@@ -223,4 +235,39 @@ export async function fetchHookCaptures(id: string): Promise<{ hook: object; req
 
 export async function fetchEffectiveConfig(): Promise<object> {
   return api("/__keyway/api/config/effective");
+}
+
+// ─── Counters ───────────────────────────────────────────
+
+export async function fetchCounters(): Promise<Record<string, Record<string, number>>> {
+  return api("/__keyway/api/counters");
+}
+
+// ─── Self Request ───────────────────────────────────────
+
+export async function fetchSelf(path: string): Promise<{ status: number; body: string; timing_ms: number }> {
+  return api("/__keyway/api/self", {
+    method: "POST",
+    body: JSON.stringify({ path }),
+  });
+}
+
+// ─── Stream ─────────────────────────────────────────────
+
+export function startStream(onChunk: (chunk: string) => void, onDone: () => void): () => void {
+  const controller = new AbortController();
+  fetch("/__keyway/api/stream", { signal: controller.signal })
+    .then(async (res) => {
+      const reader = res.body?.getReader();
+      if (!reader) { onDone(); return; }
+      const decoder = new TextDecoder();
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) break;
+        onChunk(decoder.decode(value, { stream: true }));
+      }
+      onDone();
+    })
+    .catch(() => onDone());
+  return () => controller.abort();
 }

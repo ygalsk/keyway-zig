@@ -12,6 +12,7 @@ local probe = require("scripts.dashboard.lib.probe")
 local scripts_store = require("scripts.dashboard.lib.scripts_store")
 local dispatch = require("scripts.dashboard.lib.dispatch")
 local hooks_store = require("scripts.dashboard.lib.hooks_store")
+local redis = require("scripts.dashboard.lib.redis_ring")
 
 -- Local HTTP request helper (uses keyway.socket which is ring-based, yields properly)
 local function self_request(host_hdr, port, method, path)
@@ -60,9 +61,23 @@ local counters = {
     stream_tests   = 0,
 }
 
--- ─── Per-Route Metrics (static routes from keyway.routes) ────────────
--- Key: "METHOD /pattern" → { hits, errors, total_latency_us }
-local _route_metrics = {}
+-- ─── Periodic Flush to Redis ────────────────────────────────────────
+local _last_flush = 0
+local FLUSH_INTERVAL_US = 5000000 -- 5 seconds
+
+local function flush_counters()
+    for key, val in pairs(counters) do
+        if val > 0 then
+            redis.incrby("kw:counters:" .. key, val)
+        end
+    end
+    -- Reset local counters after flush (except ws_connections which tracks live state)
+    for key, _ in pairs(counters) do
+        if key ~= "ws_connections" then
+            counters[key] = 0
+        end
+    end
+end
 
 -- ─── Helpers ──────────────────────────────────────────────────────────
 
@@ -149,28 +164,12 @@ local function access_log_middleware(ctx, next)
         hook_id = hook_id,
     })
 
-    -- Track per-route metrics for static routes
-    local path = ctx.path or ""
-    -- Match against registered static route patterns
-    for pattern, methods in pairs(keyway.routes) do
-        if type(methods) == "table" and pattern ~= "middleware" and methods[method] then
-            -- Check if path matches pattern (exact or param substitution)
-            local pat_regex = "^" .. pattern:gsub("([%.%-%+%%%^%$%(%)%[%]%*%?])", "%%%1"):gsub("{[^}]+}", "[^/]+") .. "$"
-            if path:match(pat_regex) then
-                local key = method .. " " .. pattern
-                local rm = _route_metrics[key]
-                if not rm then
-                    rm = { hits = 0, errors = 0, total_latency_us = 0 }
-                    _route_metrics[key] = rm
-                end
-                rm.hits = rm.hits + 1
-                if status >= 400 then rm.errors = rm.errors + 1 end
-                rm.total_latency_us = rm.total_latency_us + latency_us
-                break
-            end
-        end
+    -- Periodic flush of counters to Redis
+    local now = response.now_us()
+    if (now - _last_flush) > FLUSH_INTERVAL_US then
+        _last_flush = now
+        pcall(flush_counters)
     end
-
 end
 
 -- ─── Test Middleware ──────────────────────────────────────────────────
@@ -237,11 +236,16 @@ ws_commands.ping = function(ws, _)
 end
 
 ws_commands.info = function(ws, _)
+    local agg = {}
+    for key, val in pairs(counters) do
+        local redis_val = tonumber(redis.get("kw:counters:" .. key)) or 0
+        agg[key] = redis_val + val
+    end
     ws_reply(ws, {
         cmd = "info",
         worker_id = keyway.worker_id,
         ts = math.floor(response.now_us()),
-        counters = counters,
+        counters = agg,
     })
 end
 
@@ -476,10 +480,19 @@ keyway.routes = {
         end,
     },
 
-    -- Counters
+    -- Counters (read aggregated values from Redis)
     ["/__keyway/api/counters"] = {
         GET = function(ctx)
-            response.json_response(ctx, 200, counters)
+            local result = {}
+            for key, _ in pairs(counters) do
+                local val = redis.get("kw:counters:" .. key)
+                result[key] = tonumber(val) or 0
+            end
+            -- Add unflushed local counters
+            for key, val in pairs(counters) do
+                result[key] = (result[key] or 0) + val
+            end
+            response.json_response(ctx, 200, result)
         end,
     },
 
@@ -489,19 +502,11 @@ keyway.routes = {
             local routes = dispatch.list_routes()
             each_static_route(function(pattern, _, mw_names, http_methods)
                 for _, method in ipairs(http_methods) do
-                    local key = method .. " " .. pattern
-                    local rm = _route_metrics[key]
-                    local hits = rm and rm.hits or 0
-                    local errors = rm and rm.errors or 0
-                    local avg = (rm and hits > 0) and math.floor(rm.total_latency_us / hits) or 0
                     routes[#routes + 1] = {
                         method = method,
                         pattern = pattern,
                         handler = "keyway.lua",
                         middleware = mw_names,
-                        hits = hits,
-                        errors = errors,
-                        avg_latency_us = avg,
                     }
                 end
             end)

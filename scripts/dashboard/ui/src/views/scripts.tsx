@@ -6,7 +6,9 @@ import { api } from "../api";
 import { Editor, type EditorHandle } from "../components/editor";
 import { SectionHeader } from "../components/section-header";
 import { MethodBadge, StatusBadge } from "../components/badge";
+import { LoadingState, ErrorState } from "../components/feedback";
 import { formatLatency, formatTime } from "./format";
+import { getHashParams } from "../router";
 
 const TEMPLATES: Record<string, { name: string; type: string; pattern: string; code: string }> = {
   rate_limiter: {
@@ -101,7 +103,8 @@ end`,
 
 export function Scripts() {
   const s = state();
-  const [scripts, setScripts] = createSignal<ScriptMeta[]>([]);
+  const [scripts, setScripts] = createSignal<ScriptMeta[] | null>(null);
+  const [loadError, setLoadError] = createSignal<string | null>(null);
   const [currentScript, setCurrentScript] = createSignal<ScriptMeta | null>(null);
   const [feedback, setFeedback] = createSignal<{ msg: string; error: boolean } | null>(null);
   const [testResult, setTestResult] = createSignal<string | null>(null);
@@ -115,12 +118,14 @@ export function Scripts() {
   const [metaPriority, setMetaPriority] = createSignal(0);
 
   async function loadScripts(): Promise<ScriptMeta[]> {
+    setLoadError(null);
     try {
       const data = await api<{ scripts: ScriptMeta[] }>("/__keyway/api/scripts");
       setScripts(data.scripts);
       s.setScripts(data.scripts);
       return data.scripts;
-    } catch {
+    } catch (e) {
+      setLoadError((e as Error).message);
       return [];
     }
   }
@@ -148,6 +153,16 @@ export function Scripts() {
     const loaded = await loadScripts();
     const updated = loaded.find(s => s.id === sc.id);
     if (updated && currentScript()?.id === sc.id) selectScript(updated);
+  }
+
+  async function onTrigger(sc: ScriptMeta) {
+    try {
+      await api(`/__keyway/api/scripts/${sc.id}/trigger`, { method: "POST" });
+      showFeedback("Triggered", false);
+      await loadScripts();
+    } catch (e) {
+      showFeedback("Trigger failed: " + e, true);
+    }
   }
 
   async function onSave() {
@@ -187,6 +202,12 @@ export function Scripts() {
     } catch (e) {
       showFeedback("Toggle failed: " + e, true);
     }
+  }
+
+  async function onTriggerCurrent() {
+    const cs = currentScript();
+    if (!cs) return;
+    await onTrigger(cs);
   }
 
   async function onTest() {
@@ -240,7 +261,8 @@ export function Scripts() {
 
   onMount(() => {
     loadScripts().then((loaded) => {
-      const navName = s.consumeNavContext("navigate_to_script_name") as string | undefined;
+      const params = getHashParams();
+      const navName = params.get("navigate_to_script_name");
       if (navName) {
         const target = loaded.find(s => s.name === navName);
         if (target) selectScript(target);
@@ -281,39 +303,49 @@ export function Scripts() {
       <div class="flex flex-1 overflow-hidden">
         {/* Script list */}
         <div class="w-64 border-r border-base-300 overflow-y-auto shrink-0">
-          <Show when={scripts().length > 0} fallback={<div class="p-4 text-base-content/50 text-center">No scripts</div>}>
-            <For each={scripts()}>
-              {(sc) => (
-                <div
-                  class={`px-3 py-2 cursor-pointer hover:bg-base-300 border-b border-base-300/50 ${currentScript()?.id === sc.id ? "bg-base-300/50 border-l-2 border-l-primary" : ""}`}
-                  onClick={() => selectScript(sc)}
-                >
-                  <div class="flex items-center gap-2">
-                    <span class="font-medium text-base-content/80 flex-1 truncate">{sc.name}</span>
-                    <input
-                      type="checkbox"
-                      class="toggle toggle-xs toggle-primary"
-                      checked={sc.enabled}
-                      onClick={(e) => { e.stopPropagation(); onToggle(sc); }}
-                    />
+          {/* Loading */}
+          <Show when={scripts() === null && !loadError()}>
+            <LoadingState rows={4} />
+          </Show>
+
+          {/* Error */}
+          <Show when={loadError()}>
+            {(errMsg) => <ErrorState message={errMsg()} onRetry={loadScripts} />}
+          </Show>
+
+          {/* Data */}
+          <Show when={scripts() !== null && !loadError()}>
+            <Show when={(scripts() || []).length > 0} fallback={<div class="p-4 text-base-content/50 text-center">No scripts</div>}>
+              <For each={scripts()!}>
+                {(sc) => (
+                  <div
+                    class={`px-3 py-2 cursor-pointer hover:bg-base-300 border-b border-base-300/50 ${currentScript()?.id === sc.id ? "bg-base-300/50 border-l-2 border-l-primary" : ""}`}
+                    onClick={() => selectScript(sc)}
+                  >
+                    <div class="flex items-center gap-2">
+                      <span class="font-medium text-base-content/80 flex-1 truncate">{sc.name}</span>
+                      <input
+                        type="checkbox"
+                        class="toggle toggle-xs toggle-primary"
+                        checked={sc.enabled}
+                        onClick={(e) => { e.stopPropagation(); onToggle(sc); }}
+                      />
+                    </div>
+                    <div class="text-detail text-base-content/50 mt-0.5 flex items-center gap-2">
+                      <span class={`badge badge-xs ${sc.type === "handler" ? "badge-info" : "badge-ghost"}`}>{sc.type}</span>
+                      <span class="truncate">{sc.pattern}</span>
+                    </div>
                   </div>
-                  <div class="text-detail text-base-content/50 mt-0.5 flex items-center gap-2">
-                    <span class={`badge badge-xs ${sc.type === "handler" ? "badge-info" : "badge-ghost"}`}>{sc.type}</span>
-                    <span class="truncate">{sc.pattern}</span>
-                    <span class="ml-auto">{sc.metrics.calls}c</span>
-                    <span class={sc.metrics.errors > 0 ? "text-error" : ""}>{sc.metrics.errors}e</span>
-                    <span>{formatLatency(sc.metrics.avg_latency_us)}</span>
-                  </div>
-                </div>
-              )}
-            </For>
+                )}
+              </For>
+            </Show>
           </Show>
         </div>
 
         {/* Editor panel */}
         <div class="flex-1 flex flex-col overflow-hidden">
           <Show when={currentScript()} fallback={
-            <div class="flex items-center justify-center h-full text-base-content/30">Select or create a script</div>
+            <div class="flex items-center justify-center h-full text-base-content/45">Select or create a script</div>
           }>
             {(cs) => (
               <>
@@ -327,10 +359,6 @@ export function Scripts() {
                     </select>
                     <input class="input input-xs input-bordered bg-base-100 w-40 text-body" placeholder="Pattern/Path" value={metaPattern()} onInput={(e) => setMetaPattern(e.currentTarget.value)} />
                     <input class="input input-xs input-bordered bg-base-100 w-16 text-body" type="number" placeholder="Pri" value={metaPriority()} onInput={(e) => setMetaPriority(parseInt(e.currentTarget.value) || 0)} />
-                    <div class="ml-auto flex items-center gap-2 text-detail text-base-content/50">
-                      <span>{cs().metrics.calls} calls</span>
-                      <span>{cs().metrics.errors} errors</span>
-                    </div>
                   </div>
                 </div>
 
@@ -364,7 +392,7 @@ export function Scripts() {
                         <div class="border-t border-base-300 bg-base-200/50 p-3 max-h-48 overflow-y-auto text-detail space-y-1">
                           <div class="flex items-center gap-2">
                             <span class={`${success ? "text-success" : "text-error"} font-semibold`}>{success ? "PASS" : "FAIL"}</span>
-                            {result.timing_us && <span class="text-base-content/40">{String(result.timing_us)}us</span>}
+                            {result.timing_us && <span class="text-base-content/50">{String(result.timing_us)}us</span>}
                           </div>
                           {errorStr && (
                             <pre class="text-error whitespace-pre-wrap bg-base-300 rounded p-2 font-mono overflow-auto max-h-32">{errorStr}</pre>
@@ -379,7 +407,7 @@ export function Scripts() {
                 {/* Recent Activity */}
                 <Show when={recentActivity().length > 0}>
                   <div class="border-t border-base-300 bg-base-200/30 max-h-36 overflow-y-auto">
-                    <div class="px-3 py-1 text-tiny text-base-content/40 font-medium sticky top-0 bg-base-200/30">RECENT ACTIVITY</div>
+                    <div class="px-3 py-1 text-tiny text-base-content/50 font-medium sticky top-0 bg-base-200/30">RECENT ACTIVITY</div>
                     <For each={recentActivity()}>
                       {(e) => (
                         <div class="flex items-center gap-2 text-detail px-3 py-0.5 hover:bg-base-300/30">
@@ -404,6 +432,7 @@ export function Scripts() {
                     {cs().enabled ? "Disable" : "Enable"}
                   </button>
                   <button class="btn btn-xs btn-ghost" onClick={onTest}>Test</button>
+                  <button class="btn btn-xs btn-outline btn-primary" onClick={onTriggerCurrent}>Trigger</button>
                   <div class="flex-1" />
                   <button class="btn btn-xs btn-error btn-ghost" onClick={onDelete}>Delete</button>
                   <Show when={feedback()}>

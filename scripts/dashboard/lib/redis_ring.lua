@@ -42,8 +42,40 @@ local function parse_redis_reply(buf)
         local data_start = line_end + 2
         return buf:sub(data_start, data_start + len - 1)
     elseif prefix == "*" then
-        -- Array (simplified: return raw for now)
-        return buf
+        -- Array: parse into Lua table of elements
+        local count = tonumber(buf:sub(2, line_end - 1))
+        if count == -1 then return nil end
+        local result = {}
+        local pos = line_end + 2
+        for _ = 1, count do
+            if pos > #buf then break end
+            local elem_prefix = buf:sub(pos, pos)
+            local elem_line_end = buf:find("\r\n", pos)
+            if not elem_line_end then break end
+            if elem_prefix == "$" then
+                local len = tonumber(buf:sub(pos + 1, elem_line_end - 1))
+                if len == -1 then
+                    result[#result + 1] = nil
+                    pos = elem_line_end + 2
+                else
+                    local data_start = elem_line_end + 2
+                    result[#result + 1] = buf:sub(data_start, data_start + len - 1)
+                    pos = data_start + len + 2
+                end
+            elseif elem_prefix == ":" then
+                result[#result + 1] = tonumber(buf:sub(pos + 1, elem_line_end - 1))
+                pos = elem_line_end + 2
+            elseif elem_prefix == "+" then
+                result[#result + 1] = buf:sub(pos + 1, elem_line_end - 1)
+                pos = elem_line_end + 2
+            elseif elem_prefix == "-" then
+                result[#result + 1] = nil
+                pos = elem_line_end + 2
+            else
+                break
+            end
+        end
+        return result
     end
 
     return nil, "unknown reply type: " .. prefix
@@ -111,6 +143,26 @@ end
 --- INCR key
 function M.incr(key)
     return M.command("INCR", key)
+end
+
+--- INCRBY key amount
+function M.incrby(key, amount)
+    return M.command("INCRBY", key, amount)
+end
+
+--- LPUSH key value
+function M.lpush(key, value)
+    return M.command("LPUSH", key, value)
+end
+
+--- LTRIM key start stop
+function M.ltrim(key, start, stop)
+    return M.command("LTRIM", key, start, stop)
+end
+
+--- LRANGE key start stop
+function M.lrange(key, start, stop)
+    return M.command("LRANGE", key, start, stop)
 end
 
 --- PING

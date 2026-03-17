@@ -5,6 +5,7 @@ import { createSignal, lazy, Match, Switch } from "solid-js";
 import { initState, state } from "./state";
 import { connectSSE, connectWS, startMetricPolling } from "./api";
 import { Layout, type RouteEntry } from "./components/layout";
+import { parseHash } from "./router";
 
 // Views
 import { Overview } from "./views/overview";
@@ -27,11 +28,19 @@ const routes: RouteEntry[] = [
 
 function App() {
   const s = state();
-  const [currentPath, setCurrentPath] = createSignal(location.hash.slice(1) || "/");
+  const [currentPath, setCurrentPath] = createSignal(parseHash(location.hash).path);
 
   function navigate(path: string, ctx?: Record<string, unknown>) {
-    if (ctx) s.setNavContextValues(ctx);
-    location.hash = path;
+    let hash = path;
+    if (ctx) {
+      const params = new URLSearchParams();
+      for (const [k, v] of Object.entries(ctx)) {
+        if (v != null) params.set(k, String(v));
+      }
+      const qs = params.toString();
+      if (qs) hash = `${path}?${qs}`;
+    }
+    location.hash = hash;
     setCurrentPath(path);
   }
 
@@ -41,9 +50,9 @@ function App() {
   }
 
   // Listen for hash changes (back/forward)
-  // Use onhashchange to avoid Solid's babel transform intercepting addEventListener
   window.onhashchange = () => {
-    setCurrentPath(location.hash.slice(1) || "/");
+    const { path } = parseHash(location.hash);
+    setCurrentPath(path);
   };
 
   return (

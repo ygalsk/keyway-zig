@@ -1,7 +1,7 @@
 // Console — REPL with command history, JSON highlighting, WS integration
 
 import { createSignal, createEffect, For, Show, onMount, onCleanup } from "solid-js";
-import { api, sendWS, fetchEffectiveConfig } from "../api";
+import { api, sendWS, fetchEffectiveConfig, fetchSelf, startStream } from "../api";
 import { state, type TrafficEntry, classifyInvocation, INVOCATION_LABELS } from "../state";
 import { CommandInput, type CommandInputHandle } from "../components/command-input";
 import { SectionHeader } from "../components/section-header";
@@ -27,6 +27,8 @@ const COMMAND_GROUPS: { label: string; cmds: { name: string; desc: string }[] }[
     { name: "probe <url>", desc: "HTTP test request" },
     { name: "dns <domain>", desc: "DNS resolution" },
     { name: "lua <code>", desc: "Execute Lua snippet" },
+    { name: "self <path>", desc: "Self-request to server" },
+    { name: "stream", desc: "Stream test chunks" },
   ]},
   { label: "control", cmds: [
     { name: "scripts:toggle <id>", desc: "Enable/disable script" },
@@ -60,6 +62,7 @@ export function ConsoleCore() {
   const [showHelp, setShowHelp] = createSignal(true);
   let logEl!: HTMLDivElement;
   let cmdHandle: CommandInputHandle | null = null;
+  let activeStreamCancel: (() => void) | null = null;
 
   function addEntry(entry: LogEntry) {
     setEntries(prev => {
@@ -119,6 +122,29 @@ export function ConsoleCore() {
     "scripts:test":   (arg) => { if (requireArg(arg, "scripts:test <id>")) apiCmd(`/__keyway/api/scripts/${arg}/test`, { method: "POST", body: JSON.stringify({ method: "GET", path: "/test", headers: {}, body: "" }) }); },
     probe:            (arg) => { if (requireArg(arg, "probe <url>")) apiCmd("/__keyway/api/probe", { method: "POST", body: JSON.stringify({ url: arg }) }); },
     dns:              (arg) => { if (requireArg(arg, "dns <domain>")) apiCmd("/__keyway/api/dns", { method: "POST", body: JSON.stringify({ domain: arg }) }); },
+    self:             async (arg) => {
+      const path = arg || "/";
+      reply(`Self-request: ${path}`);
+      try {
+        const r = await fetchSelf(path);
+        reply(JSON.stringify(r));
+      } catch (e) {
+        err(String(e));
+      }
+    },
+    stream:           () => {
+      if (activeStreamCancel) {
+        activeStreamCancel();
+        activeStreamCancel = null;
+        reply("Stream cancelled.");
+        return;
+      }
+      reply("Streaming...");
+      activeStreamCancel = startStream(
+        (chunk) => addEntry({ type: "response", text: chunk, ts: Date.now() }),
+        () => { activeStreamCancel = null; reply("Stream ended."); },
+      );
+    },
     config:           async () => {
       try { const config = await fetchEffectiveConfig(); reply(JSON.stringify(config)); }
       catch (e) { err(String(e)); }
@@ -175,6 +201,7 @@ export function ConsoleCore() {
   });
 
   onMount(() => { setTimeout(() => cmdHandle?.focus(), 100); });
+  onCleanup(() => { if (activeStreamCancel) activeStreamCancel(); });
 
   return (
     <div class="flex flex-col h-full">
@@ -212,7 +239,7 @@ export function ConsoleCore() {
             const ts = formatTime(entry.ts, false);
             return (
               <div class="text-detail flex gap-2">
-                <span class="text-base-content/30 shrink-0">{ts}</span>
+                <span class="text-base-content/45 shrink-0">{ts}</span>
                 {entry.type === "cmd" ? (
                   <span class="text-primary">{">"} {entry.text}</span>
                 ) : entry.type === "error" ? (

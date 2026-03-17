@@ -3,6 +3,7 @@
 import { createSignal, createEffect, onCleanup, For, Show, type JSX } from "solid-js";
 import { state, type ConnStatus } from "../state";
 import { Drawer } from "./drawer";
+import { ToastBar } from "./toast";
 
 const isMac = typeof navigator !== "undefined" && /Mac/.test(navigator.userAgent);
 const shortcutLabel = isMac ? "Cmd+K" : "Ctrl+K";
@@ -110,7 +111,7 @@ export function Layout(props: {
           <For each={[...routesByGroup().entries()]}>
             {([group, groupRoutes]) => (
               <>
-                <div class="px-4 pt-3 pb-1 text-tiny font-semibold tracking-widest text-base-content/30 uppercase max-md:hidden">
+                <div class="px-4 pt-3 pb-1 text-tiny font-semibold tracking-widest text-base-content/45 uppercase max-md:hidden">
                   {group}
                 </div>
                 <For each={groupRoutes}>
@@ -178,6 +179,9 @@ export function Layout(props: {
             Live stream disconnected. Reconnecting...
           </div>
         </Show>
+
+        {/* Error toasts */}
+        <ToastBar />
 
         {/* Content */}
         <div id="main-content" tabindex="-1" class="flex-1 overflow-auto">

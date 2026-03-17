@@ -5,7 +5,11 @@ import { api, fetchEffectiveConfig } from "../api";
 import { state, type Route, type TrafficEntry } from "../state";
 import { MethodBadge, StatusBadge } from "../components/badge";
 import { SectionHeader } from "../components/section-header";
+import { Card } from "../components/card";
+import { FilterBar, type FilterConfig } from "../components/filter-bar";
+import { LoadingState, ErrorState } from "../components/feedback";
 import { formatLatency, formatTime } from "./format";
+import { getHashParams } from "../router";
 
 function MiddlewarePipeline(props: { middleware: string[]; handler: string }) {
   const nodes = () => {
@@ -23,11 +27,11 @@ function MiddlewarePipeline(props: { middleware: string[]; handler: string }) {
           const isHandler = node.type === "handler";
           const borderCls = isHandler ? "border-primary/50 bg-primary/5" : "border-base-content/20 bg-base-300/30";
           const labelCls = isHandler ? "text-primary" : "text-base-content/60";
-          const typeCls = isHandler ? "text-primary/40" : "text-base-content/30";
+          const typeCls = isHandler ? "text-primary/40" : "text-base-content/35";
           return (
             <>
               <Show when={i() > 0}>
-                <span class="text-base-content/20 text-xs shrink-0">→</span>
+                <span class="text-base-content/35 text-xs shrink-0">→</span>
               </Show>
               <div class={`border rounded px-2 py-1 shrink-0 ${borderCls}`}>
                 <div class={`text-detail font-mono ${labelCls}`}>{node.name}</div>
@@ -49,7 +53,6 @@ interface ProbeResult {
   error?: string;
 }
 
-type SortKey = "pattern" | "hits" | "errors" | "latency";
 type RouteType = "all" | "user" | "internal" | "script" | "hook";
 
 function classifyRouteType(r: Route): RouteType {
@@ -61,61 +64,45 @@ function classifyRouteType(r: Route): RouteType {
 
 export function Routes(props: { onNavigate: (path: string, ctx?: Record<string, unknown>) => void }) {
   const s = state();
-  const [routes, setRoutes] = createSignal<Route[]>([]);
+  const [routes, setRoutes] = createSignal<Route[] | null>(null);
+  const [error, setError] = createSignal<string | null>(null);
   const [filter, setFilter] = createSignal("");
   const [methodFilter, setMethodFilter] = createSignal("");
   const [typeFilter, setTypeFilter] = createSignal<RouteType>("all");
-  const [errorFilter, setErrorFilter] = createSignal(false);
-  const [sortKey, setSortKey] = createSignal<SortKey>("pattern");
   const [expandedIdx, setExpandedIdx] = createSignal<number | null>(null);
   const [effectiveOpen, setEffectiveOpen] = createSignal(false);
   const [effectiveConfig, setEffectiveConfig] = createSignal<string | null>(null);
   const [probeResults, setProbeResults] = createSignal<Record<number, string>>({});
 
-  const maxHits = createMemo(() => {
-    let max = 0;
-    for (const r of routes()) if (r.hits > max) max = r.hits;
-    return max;
-  });
-
   const filtered = createMemo(() => {
-    let list = routes();
+    let list = routes() || [];
     const f = filter();
     if (f) list = list.filter(r => r.pattern.includes(f));
     const mf = methodFilter();
     if (mf) list = list.filter(r => r.method === mf);
     const tf = typeFilter();
     if (tf !== "all") list = list.filter(r => classifyRouteType(r) === tf);
-    if (errorFilter()) list = list.filter(r => r.errors > 0);
 
-    const sk = sortKey();
-    if (sk === "hits") list = [...list].sort((a, b) => b.hits - a.hits);
-    else if (sk === "errors") list = [...list].sort((a, b) => b.errors - a.errors);
-    else if (sk === "latency") list = [...list].sort((a, b) => (b.avg_latency_us || 0) - (a.avg_latency_us || 0));
-    else list = [...list].sort((a, b) => a.pattern.localeCompare(b.pattern));
-
+    list = [...list].sort((a, b) => a.pattern.localeCompare(b.pattern));
     return list;
   });
 
-  const hasActiveFilter = () => !!(filter() || methodFilter() || typeFilter() !== "all" || errorFilter());
-
-  const allZero = createMemo(() => {
-    const r = routes();
-    return r.length > 0 && r.every(r => r.hits === 0);
-  });
+  const hasActiveFilter = () => !!(filter() || methodFilter() || typeFilter() !== "all");
 
   async function loadRoutes() {
+    setError(null);
     try {
       const data = await api<{ routes: Route[] }>("/__keyway/api/routes");
       setRoutes(data.routes || []);
-    } catch {
-      // handle error
+    } catch (e) {
+      setError((e as Error).message);
     }
   }
 
   onMount(() => {
     loadRoutes();
-    const ctxFilter = s.consumeNavContext("filter_pattern") as string | undefined;
+    const params = getHashParams();
+    const ctxFilter = params.get("filter_pattern");
     if (ctxFilter) setFilter(ctxFilter);
   });
 
@@ -157,8 +144,6 @@ export function Routes(props: { onNavigate: (path: string, ctx?: Record<string, 
     setFilter("");
     setMethodFilter("");
     setTypeFilter("all");
-    setErrorFilter(false);
-    setSortKey("pattern");
     setExpandedIdx(null);
   }
 
@@ -169,6 +154,34 @@ export function Routes(props: { onNavigate: (path: string, ctx?: Record<string, 
     if (t === "hook") return <span class="badge badge-xs badge-secondary text-tiny">hook</span>;
     return null;
   };
+
+  const filterConfigs = (): FilterConfig[] => [
+    {
+      id: "pattern", type: "text", placeholder: "Filter pattern...", width: "w-40",
+      value: filter(),
+      onChange: (v) => { setFilter(v); setExpandedIdx(null); },
+    },
+    {
+      id: "method", type: "select", placeholder: "Method",
+      options: [
+        { value: "GET", label: "GET" }, { value: "POST", label: "POST" },
+        { value: "PUT", label: "PUT" }, { value: "DELETE", label: "DELETE" },
+        { value: "MW", label: "MW" },
+      ],
+      value: methodFilter(),
+      onChange: (v) => setMethodFilter(v),
+    },
+    {
+      id: "type", type: "select", placeholder: "Type",
+      options: [
+        { value: "all", label: "All" }, { value: "user", label: "User" },
+        { value: "internal", label: "Internal" }, { value: "script", label: "Script" },
+        { value: "hook", label: "Hook" },
+      ],
+      value: typeFilter(),
+      onChange: (v) => setTypeFilter(v as RouteType),
+    },
+  ];
 
   return (
     <div class="flex flex-col h-full">
@@ -185,169 +198,110 @@ export function Routes(props: { onNavigate: (path: string, ctx?: Record<string, 
       </SectionHeader>
 
       {/* Filter bar */}
-      <div class="px-4 py-2 flex items-center gap-2 flex-wrap border-b border-base-300/50 bg-base-200/30">
-        <input
-          type="text"
-          placeholder="Filter pattern..."
-          class="input input-xs input-bordered bg-base-100 w-40 text-body"
-          value={filter()}
-          onInput={(e) => { setFilter(e.currentTarget.value); setExpandedIdx(null); }}
-        />
-        <select
-          class="select select-xs select-bordered bg-base-100 text-body"
-          value={methodFilter()}
-          onChange={(e) => setMethodFilter(e.currentTarget.value)}
-        >
-          <option value="">Method</option>
-          <option>GET</option><option>POST</option><option>PUT</option><option>DELETE</option><option>MW</option>
-        </select>
-        <select
-          class="select select-xs select-bordered bg-base-100 text-body"
-          value={typeFilter()}
-          onChange={(e) => setTypeFilter(e.currentTarget.value as RouteType)}
-        >
-          <option value="all">Type</option>
-          <option value="user">User</option>
-          <option value="internal">Internal</option>
-          <option value="script">Script</option>
-          <option value="hook">Hook</option>
-        </select>
-        <label class="flex items-center gap-1 text-detail text-base-content/50 cursor-pointer">
-          <input
-            type="checkbox"
-            class="checkbox checkbox-xs checkbox-error"
-            checked={errorFilter()}
-            onChange={(e) => setErrorFilter(e.currentTarget.checked)}
-          />
-          Has errors
-        </label>
-        <select
-          class="select select-xs select-bordered bg-base-100 text-body"
-          value={sortKey()}
-          onChange={(e) => setSortKey(e.currentTarget.value as SortKey)}
-        >
-          <option value="pattern">Sort: pattern</option>
-          <option value="hits">Sort: hits</option>
-          <option value="errors">Sort: errors</option>
-          <option value="latency">Sort: latency</option>
-        </select>
-        <Show when={hasActiveFilter()}>
-          <button class="btn btn-xs btn-ghost text-base-content/40" onClick={clearFilters}>Clear</button>
-        </Show>
-        <span class="ml-auto text-detail text-base-content/40">{filtered().length} / {routes().length}</span>
+      <div class="px-4 py-2 border-b border-base-300/50 bg-base-200/30">
+        <FilterBar filters={filterConfigs()}>
+          <Show when={hasActiveFilter()}>
+            <button class="btn btn-xs btn-ghost text-base-content/50" onClick={clearFilters}>Clear</button>
+          </Show>
+          <span class="ml-auto text-detail text-base-content/50">{filtered().length} / {(routes() || []).length}</span>
+        </FilterBar>
       </div>
-
-      <Show when={allZero() && !hasActiveFilter()}>
-        <div class="px-4 py-1 text-detail text-base-content/50 bg-base-200/30 border-b border-base-300/50">
-          Click any route to see middleware pipeline or send a test request
-        </div>
-      </Show>
 
       <Show when={effectiveOpen()}>
         <div class="border-b border-base-300 p-3">
-          <div class="flex items-center justify-between mb-2">
-            <span class="text-detail text-base-content/50 font-medium">EFFECTIVE ROUTE TABLE</span>
-            <button class="btn btn-xs btn-ghost text-base-content/40" onClick={() => { setEffectiveOpen(false); setEffectiveConfig(null); }}>Close</button>
-          </div>
-          <Show when={effectiveConfig() === "loading"}>
-            <div class="text-detail text-base-content/50">Loading...</div>
-          </Show>
-          <Show when={effectiveConfig() === "error"}>
-            <div class="text-detail text-error">Failed to load effective config</div>
-          </Show>
-          <Show when={effectiveConfig() && effectiveConfig() !== "loading" && effectiveConfig() !== "error"}>
-            <pre class="bg-base-300 rounded p-2 text-detail text-base-content/70 overflow-auto max-h-64 font-mono">{effectiveConfig()}</pre>
-          </Show>
+          <Card>
+            <div class="flex items-center justify-between mb-2">
+              <span class="text-detail text-base-content/50 font-medium">EFFECTIVE ROUTE TABLE</span>
+              <button class="btn btn-xs btn-ghost text-base-content/50" onClick={() => { setEffectiveOpen(false); setEffectiveConfig(null); }}>Close</button>
+            </div>
+            <Show when={effectiveConfig() === "loading"}>
+              <LoadingState rows={4} />
+            </Show>
+            <Show when={effectiveConfig() === "error"}>
+              <div class="text-detail text-error">Failed to load effective config</div>
+            </Show>
+            <Show when={effectiveConfig() && effectiveConfig() !== "loading" && effectiveConfig() !== "error"}>
+              <pre class="bg-base-300 rounded p-2 text-detail text-base-content/70 overflow-auto max-h-64 font-mono">{effectiveConfig()}</pre>
+            </Show>
+          </Card>
         </div>
       </Show>
 
       <div class="flex-1 overflow-y-auto">
-        <Show when={filtered().length > 0} fallback={<div class="p-4 text-base-content/30 text-center">No routes</div>}>
-          <table class="table table-xs table-pin-rows w-full">
-            <thead>
-              <tr>
-                <th class="bg-base-200 w-4" />
-                <th class="bg-base-200 text-base-content/50 w-[70px]">Method</th>
-                <th class="bg-base-200 text-base-content/50">Pattern</th>
-                <th class="bg-base-200 text-base-content/50 w-[120px]">Handler</th>
-                <th class="bg-base-200 text-base-content/50 w-[90px] text-right">Hits</th>
-                <th class="bg-base-200 text-base-content/50 w-[80px] text-right">Errors</th>
-                <th class="bg-base-200 text-base-content/50 w-[80px] text-right">Latency</th>
-                <th class="bg-base-200 text-base-content/50 w-[80px] text-right">Actions</th>
-              </tr>
-            </thead>
-            <tbody>
-              <For each={filtered()}>
-                {(r, i) => {
-                  const expanded = () => expandedIdx() === i();
-                  const mwBadges = () => {
-                    const mw = Array.isArray(r.middleware) ? r.middleware : [];
-                    return mw.length > 0
-                      ? mw.map(m => <span class="badge badge-xs badge-ghost text-tiny">{m}</span>)
-                      : null;
-                  };
-                  const hitsPct = () => maxHits() > 0 ? (r.hits / maxHits()) * 100 : 0;
+        {/* Loading state */}
+        <Show when={routes() === null && !error()}>
+          <LoadingState rows={6} />
+        </Show>
 
-                  return (
-                    <>
-                      <tr
-                        class={`cursor-pointer hover:bg-base-300/30 ${expanded() ? "bg-base-300/20" : ""}`}
-                        onClick={() => setExpandedIdx(expanded() ? null : i())}
-                      >
-                        <td class="text-base-content/30 text-detail">{expanded() ? "▾" : "▸"}</td>
-                        <td>
-                          <MethodBadge method={r.method} />
-                          {typeBadge(r)}
-                        </td>
-                        <td>
-                          <span class="text-base-content/80">{r.pattern}</span>
-                          <Show when={mwBadges()}><div class="mt-0.5">{mwBadges()}</div></Show>
-                        </td>
-                        <td
-                          class="text-primary/70 cursor-pointer hover:text-primary"
-                          onClick={(e) => { e.stopPropagation(); props.onNavigate("/scripts", { navigate_to_script_name: r.handler }); }}
+        {/* Error state */}
+        <Show when={error()}>
+          {(errMsg) => <ErrorState message={errMsg()} onRetry={loadRoutes} />}
+        </Show>
+
+        {/* Data */}
+        <Show when={routes() !== null && !error()}>
+          <Show when={filtered().length > 0} fallback={<div class="p-4 text-base-content/45 text-center">No routes</div>}>
+            <table class="table table-xs table-pin-rows w-full">
+              <thead>
+                <tr>
+                  <th class="bg-base-200 w-4" />
+                  <th class="bg-base-200 text-base-content/50 w-[70px]">Method</th>
+                  <th class="bg-base-200 text-base-content/50">Pattern</th>
+                  <th class="bg-base-200 text-base-content/50 w-[120px]">Handler</th>
+                  <th class="bg-base-200 text-base-content/50 w-[80px] text-right">Actions</th>
+                </tr>
+              </thead>
+              <tbody>
+                <For each={filtered()}>
+                  {(r, i) => {
+                    const expanded = () => expandedIdx() === i();
+                    const mwBadges = () => {
+                      const mw = Array.isArray(r.middleware) ? r.middleware : [];
+                      return mw.length > 0
+                        ? mw.map(m => <span class="badge badge-xs badge-ghost text-tiny">{m}</span>)
+                        : null;
+                    };
+
+                    return (
+                      <>
+                        <tr
+                          class={`cursor-pointer hover:bg-base-300/30 ${expanded() ? "bg-base-300/20" : ""}`}
+                          onClick={() => setExpandedIdx(expanded() ? null : i())}
                         >
-                          {r.handler}
-                        </td>
-                        <td class="text-right">
-                          <Show when={r.hits > 0} fallback={<span class="text-base-content/30">0</span>}>
-                            <div class="flex items-center gap-1 justify-end">
-                              <div class="w-12 bg-base-300 rounded-full h-1">
-                                <div class="bg-primary/50 h-1 rounded-full" style={{ width: `${hitsPct()}%` }} />
-                              </div>
-                              <span class="text-base-content/80">{r.hits}</span>
-                            </div>
-                          </Show>
-                        </td>
-                        <td class="text-right">
-                          <Show when={r.errors > 0} fallback={<span class="text-base-content/30">0</span>}>
-                            <span
-                              class="text-error bg-error/10 px-1.5 py-0.5 rounded cursor-pointer hover:underline font-semibold"
-                              onClick={(e) => { e.stopPropagation(); props.onNavigate("/traffic", { path_pattern: r.pattern, status_family: "5xx" }); }}
-                            >
-                              {r.errors}
-                            </span>
-                          </Show>
-                        </td>
-                        <td class={`text-right ${!r.avg_latency_us ? "text-base-content/30" : "text-base-content/50"}`}>{formatLatency(r.avg_latency_us)}</td>
-                        <td class="text-right">
-                          <button
-                            class="btn btn-xs btn-ghost text-primary"
-                            onClick={(e) => { e.stopPropagation(); setExpandedIdx(expanded() ? null : i()); }}
+                          <td class="text-base-content/35 text-detail">{expanded() ? "▾" : "▸"}</td>
+                          <td>
+                            <MethodBadge method={r.method} />
+                            {typeBadge(r)}
+                          </td>
+                          <td>
+                            <span class="text-base-content/80">{r.pattern}</span>
+                            <Show when={mwBadges()}><div class="mt-0.5">{mwBadges()}</div></Show>
+                          </td>
+                          <td
+                            class="text-primary/70 cursor-pointer hover:text-primary"
+                            onClick={(e) => { e.stopPropagation(); props.onNavigate("/scripts", { navigate_to_script_name: r.handler }); }}
                           >
-                            Test
-                          </button>
-                        </td>
-                      </tr>
-                      <Show when={expanded()}>
-                        <ProbePanel route={r} idx={i()} onProbe={doProbe} result={probeResults()[i()]} traffic={s.traffic()} />
-                      </Show>
-                    </>
-                  );
-                }}
-              </For>
-            </tbody>
-          </table>
+                            {r.handler}
+                          </td>
+                          <td class="text-right">
+                            <button
+                              class="btn btn-xs btn-ghost text-primary"
+                              onClick={(e) => { e.stopPropagation(); setExpandedIdx(expanded() ? null : i()); }}
+                            >
+                              Test
+                            </button>
+                          </td>
+                        </tr>
+                        <Show when={expanded()}>
+                          <ProbePanel route={r} idx={i()} onProbe={doProbe} result={probeResults()[i()]} traffic={s.traffic()} />
+                        </Show>
+                      </>
+                    );
+                  }}
+                </For>
+              </tbody>
+            </table>
+          </Show>
         </Show>
       </div>
     </div>
@@ -358,7 +312,6 @@ function ProbePanel(props: { route: Route; idx: number; onProbe: (idx: number, u
   const defaultUrl = () => `${location.origin}${props.route.pattern.replace(/\{[^}]+\}/g, "test")}`;
   let urlInput!: HTMLInputElement;
 
-  // Use the route's own method for probing — no separate dropdown
   const probeMethod = () => props.route.method === "MW" ? "GET" : props.route.method;
 
   const resultDisplay = createMemo(() => {
@@ -373,7 +326,6 @@ function ProbePanel(props: { route: Route; idx: number; onProbe: (idx: number, u
     }
   });
 
-  // Recent errors for this route
   const recentErrors = createMemo(() => {
     const pattern = props.route.pattern;
     return props.traffic
@@ -383,14 +335,14 @@ function ProbePanel(props: { route: Route; idx: number; onProbe: (idx: number, u
 
   return (
     <tr>
-      <td colspan="8" class="bg-base-200/50 p-3">
+      <td colspan="5" class="bg-base-200/50 p-3">
         <div class="space-y-3">
-          <div>
-            <div class="text-tiny text-base-content/40 font-medium mb-1">MIDDLEWARE PIPELINE</div>
+          <Card>
+            <div class="text-tiny text-base-content/50 font-medium mb-1">MIDDLEWARE PIPELINE</div>
             <MiddlewarePipeline middleware={Array.isArray(props.route.middleware) ? props.route.middleware : []} handler={props.route.handler} />
-          </div>
-          <div class="border-t border-base-300/50 pt-2">
-            <div class="text-tiny text-base-content/40 font-medium mb-1">PROBE ({probeMethod()})</div>
+          </Card>
+          <Card>
+            <div class="text-tiny text-base-content/50 font-medium mb-1">PROBE ({probeMethod()})</div>
             <div class="flex gap-2">
               <input ref={urlInput} type="text" class="input input-xs input-bordered bg-base-100 flex-1 text-body" value={defaultUrl()} />
               <button class="btn btn-xs btn-primary" onClick={() => props.onProbe(props.idx, urlInput.value, probeMethod())}>Send</button>
@@ -427,12 +379,12 @@ function ProbePanel(props: { route: Route; idx: number; onProbe: (idx: number, u
                 }}
               </Show>
             </div>
-          </div>
+          </Card>
 
           {/* Recent Errors for this route */}
           <Show when={recentErrors().length > 0}>
-            <div class="border-t border-base-300/50 pt-2">
-              <div class="text-tiny text-base-content/40 font-medium mb-1">RECENT ERRORS</div>
+            <Card>
+              <div class="text-tiny text-base-content/50 font-medium mb-1">RECENT ERRORS</div>
               <For each={recentErrors()}>
                 {(e) => (
                   <div class="flex items-center gap-2 text-detail py-0.5">
@@ -447,7 +399,7 @@ function ProbePanel(props: { route: Route; idx: number; onProbe: (idx: number, u
                   </div>
                 )}
               </For>
-            </div>
+            </Card>
           </Show>
         </div>
       </td>

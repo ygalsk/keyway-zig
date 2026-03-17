@@ -3,7 +3,9 @@
 import { createSignal, createMemo, For, Show, onMount } from "solid-js";
 import { state, type TrafficEntry, type TrafficFilters, type InvocationState, classifyInvocation, INVOCATION_LABELS, INVOCATION_COLORS } from "../state";
 import { MethodBadge, StatusBadge } from "../components/badge";
+import { FilterBar, type FilterConfig } from "../components/filter-bar";
 import { formatLatency, formatTime } from "./format";
+import { getHashParams } from "../router";
 
 const METHODS = ["GET", "POST", "PUT", "PATCH", "DELETE"];
 const STATUS_FAMILIES = ["2xx", "3xx", "4xx", "5xx"];
@@ -44,25 +46,26 @@ function TrafficRow(props: { entry: TrafficEntry; idx: number; expanded: boolean
       >
         <td>
           <div class="flex items-center gap-1">
+            <span class="text-base-content/35 text-detail">{props.expanded ? "▾" : "▸"}</span>
             <MethodBadge method={e().method} />
             <Show when={e().error_message}>
               <span class="inline-block w-1.5 h-1.5 rounded-full bg-error shrink-0" title={e().error_message} />
             </Show>
           </div>
         </td>
-        <td class="truncate max-w-xs">{e().path}</td>
-        <td class={`${stateColor()} text-detail max-sm:hidden`}>{INVOCATION_LABELS[invState()]}</td>
-        <td class="text-right tabular-nums">{formatLatency(e().latency_us)}</td>
+        <td class="truncate max-w-xs max-sm:max-w-[120px]">{e().path}</td>
+        <td class={`${stateColor()} text-detail`}>{INVOCATION_LABELS[invState()]}</td>
+        <td class="text-right tabular-nums max-sm:hidden">{formatLatency(e().latency_us)}</td>
         <td class="text-right tabular-nums"><StatusBadge status={e().status} /></td>
         <td class="text-right text-base-content/50 max-md:hidden">{e().worker_id}</td>
-        <td class="text-right text-base-content/40 text-detail max-md:hidden">{formatTime(e().ts)}</td>
+        <td class="text-right text-base-content/50 text-detail max-md:hidden">{formatTime(e().ts)}</td>
       </tr>
       <Show when={props.expanded}>
         <tr>
           <td colspan="7" class="bg-base-200 p-3">
             <div class="grid grid-cols-2 gap-4 text-detail">
               <div>
-                <div class="text-base-content/40 mb-1">Request Details</div>
+                <div class="text-base-content/50 mb-1">Request Details</div>
                 <div>
                   Path:{" "}
                   <span
@@ -96,7 +99,7 @@ function TrafficRow(props: { entry: TrafficEntry; idx: number; expanded: boolean
                 </Show>
               </div>
               <div>
-                <div class="text-base-content/40 mb-1">Timing</div>
+                <div class="text-base-content/50 mb-1">Timing</div>
                 <div>Latency: <span class="text-base-content">{formatLatency(e().latency_us)}</span></div>
                 <div>Worker: <span class="text-base-content">{e().worker_id}</span></div>
                 <Show when={e().error_message}>
@@ -120,16 +123,19 @@ export function Traffic(props: { onNavigate?: (path: string, ctx?: Record<string
   const [expanded, setExpanded] = createSignal<number | null>(null);
   const [pausedSnapshot, setPausedSnapshot] = createSignal<TrafficEntry[]>([]);
 
-  // Check for navigation context
+  // Read filters from URL query params
   onMount(() => {
-    const ctxState = s.consumeNavContext("traffic_filter_state") as string | undefined;
-    if (ctxState) setFilters(f => ({ ...f, invocation_state: ctxState as InvocationState }));
-    const ctxWorker = s.consumeNavContext("worker_id") as string | undefined;
-    if (ctxWorker) setFilters(f => ({ ...f, worker_id: ctxWorker }));
-    const ctxStatusFam = s.consumeNavContext("status_family") as string | undefined;
-    if (ctxStatusFam) setFilters(f => ({ ...f, status_family: ctxStatusFam }));
-    const ctxPath = s.consumeNavContext("path_pattern") as string | undefined;
-    if (ctxPath) setFilters(f => ({ ...f, path_pattern: ctxPath }));
+    const params = getHashParams();
+    const f = defaultFilters();
+    const st = params.get("traffic_filter_state");
+    if (st) f.invocation_state = st as InvocationState;
+    const wk = params.get("worker_id");
+    if (wk) f.worker_id = wk;
+    const sf = params.get("status_family");
+    if (sf) f.status_family = sf;
+    const pp = params.get("path_pattern");
+    if (pp) f.path_pattern = pp;
+    if (st || wk || sf || pp) setFilters(f);
   });
 
   const traffic = () => filters().paused ? pausedSnapshot() : s.traffic();
@@ -156,67 +162,62 @@ export function Traffic(props: { onNavigate?: (path: string, ctx?: Record<string
     setFilters(f => ({ ...f, paused: !f.paused }));
   }
 
+  const filterConfigs = (): FilterConfig[] => [
+    {
+      id: "method", type: "select", placeholder: "Method",
+      options: METHODS.map(m => ({ value: m, label: m })),
+      value: filters().method || "",
+      onChange: (v) => setFilters(f => ({ ...f, method: v || null })),
+    },
+    {
+      id: "status", type: "select", placeholder: "Status",
+      options: STATUS_FAMILIES.map(s => ({ value: s, label: s })),
+      value: filters().status_family || "",
+      onChange: (v) => setFilters(f => ({ ...f, status_family: v || null })),
+    },
+    {
+      id: "state", type: "select", placeholder: "State",
+      options: STATES.map(s => ({ value: s, label: INVOCATION_LABELS[s] })),
+      value: filters().invocation_state || "",
+      onChange: (v) => setFilters(f => ({ ...f, invocation_state: (v as InvocationState) || null })),
+    },
+    {
+      id: "path", type: "text", placeholder: "path filter", width: "w-32",
+      value: filters().path_pattern || "",
+      onChange: (v) => setFilters(f => ({ ...f, path_pattern: v || null })),
+    },
+    {
+      id: "worker", type: "text", placeholder: "worker", width: "w-16",
+      value: filters().worker_id || "",
+      onChange: (v) => setFilters(f => ({ ...f, worker_id: v || null })),
+    },
+  ];
+
   return (
     <div class="p-4 h-full flex flex-col gap-3">
       <div class="flex items-center gap-2 flex-wrap">
         <h2 class="text-sm font-semibold text-base-content mr-2">Traffic</h2>
-        <select
-          class="select select-xs select-bordered"
-          value={filters().method || ""}
-          onChange={(e) => setFilters(f => ({ ...f, method: e.currentTarget.value || null }))}
-        >
-          <option value="">Method</option>
-          <For each={METHODS}>{(m) => <option>{m}</option>}</For>
-        </select>
-        <select
-          class="select select-xs select-bordered"
-          value={filters().status_family || ""}
-          onChange={(e) => setFilters(f => ({ ...f, status_family: e.currentTarget.value || null }))}
-        >
-          <option value="">Status</option>
-          <For each={STATUS_FAMILIES}>{(s) => <option>{s}</option>}</For>
-        </select>
-        <select
-          class="select select-xs select-bordered"
-          value={filters().invocation_state || ""}
-          onChange={(e) => setFilters(f => ({ ...f, invocation_state: (e.currentTarget.value as InvocationState) || null }))}
-        >
-          <option value="">State</option>
-          <For each={STATES}>{(s) => <option value={s}>{INVOCATION_LABELS[s]}</option>}</For>
-        </select>
-        <input
-          type="text"
-          placeholder="path filter"
-          class="input input-xs input-bordered w-32"
-          value={filters().path_pattern || ""}
-          onInput={(e) => setFilters(f => ({ ...f, path_pattern: e.currentTarget.value || null }))}
-        />
-        <input
-          type="text"
-          placeholder="worker"
-          class="input input-xs input-bordered w-16"
-          value={filters().worker_id || ""}
-          onInput={(e) => setFilters(f => ({ ...f, worker_id: e.currentTarget.value || null }))}
-        />
-        <Show when={hasActiveFilter(filters())}>
-          <button class="btn btn-xs btn-ghost text-base-content/40" onClick={clearFilters}>Clear</button>
-        </Show>
-        <button
-          class={`btn btn-xs btn-outline ${filters().paused ? "btn-active" : ""}`}
-          onClick={togglePause}
-        >
-          {filters().paused ? "Resume" : "Pause"}
-        </button>
-        <span class="ml-auto text-detail text-base-content/40">{filteredCount()} / {totalCount()}</span>
+        <FilterBar filters={filterConfigs()}>
+          <Show when={hasActiveFilter(filters())}>
+            <button class="btn btn-xs btn-ghost text-base-content/50" onClick={clearFilters}>Clear</button>
+          </Show>
+          <button
+            class={`btn btn-xs btn-outline ${filters().paused ? "btn-active" : ""}`}
+            onClick={togglePause}
+          >
+            {filters().paused ? "Resume" : "Pause"}
+          </button>
+          <span class="ml-auto text-detail text-base-content/50">{filteredCount()} / {totalCount()}</span>
+        </FilterBar>
       </div>
       <div class="flex-1 overflow-auto" tabindex="0" role="grid" aria-label="Traffic entries">
         <table class="table table-xs table-pin-rows w-full">
           <thead>
-            <tr class="text-base-content/40">
-              <th class="w-16">Method</th>
+            <tr class="text-base-content/50">
+              <th class="w-20">Method</th>
               <th>Path</th>
-              <th class="w-32 max-sm:hidden">State</th>
-              <th class="w-20 text-right">Latency</th>
+              <th class="w-32">State</th>
+              <th class="w-20 text-right max-sm:hidden">Latency</th>
               <th class="w-16 text-right">Status</th>
               <th class="w-16 text-right max-md:hidden">Worker</th>
               <th class="w-20 text-right max-md:hidden">Time</th>
