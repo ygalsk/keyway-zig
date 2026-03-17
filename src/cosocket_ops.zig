@@ -18,6 +18,7 @@ const SuspendedState = handler_mod.SuspendedState;
 
 const ring = @import("ring.zig");
 const IoEntry = ring.IoEntry;
+const prom = @import("prom.zig");
 
 const tls_mod = @import("tls.zig");
 const TlsConn = tls_mod.TlsConn;
@@ -311,6 +312,7 @@ pub fn submitOutboundIO(self: *Connection) void {
         return;
     };
     self.lua_state.pending_io = null;
+    prom.ringSubmissions(1);
 
     switch (pending) {
         .connect => |conn| submitConnect(self, conn, .connect),

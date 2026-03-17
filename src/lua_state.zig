@@ -23,6 +23,7 @@ const tls = @import("tls.zig");
 const castUserdata = @import("helpers.zig").castUserdata;
 const TlsManager = tls.TlsManager;
 const SseRegistry = @import("sse.zig").SseRegistry;
+const prom = @import("prom.zig");
 
 // zig-luajit marks resumeCoroutine as private — call C API directly.
 // Lua is an opaque type that maps 1:1 to lua_State*, so @ptrCast is safe.
@@ -238,11 +239,13 @@ pub const LuaState = struct {
         }
 
         // Resume the coroutine: thread stack has [handler_fn, userdata]
+        prom.luaCoroutineStarted();
         const status = lua_resume(@ptrCast(thread), 1);
 
         switch (status) {
             0 => {
                 // LUA_OK — handler completed normally
+                prom.luaCoroutineFinished();
                 if (self.cached_thread_ref == 0) self.lua.pop(1);
                 return .completed;
             },
@@ -258,6 +261,7 @@ pub const LuaState = struct {
                 return .yielded;
             },
             else => {
+                prom.luaCoroutineFinished();
                 if (thread.isString(-1)) {
                     const err_msg = thread.toString(-1) catch "unknown error";
                     // Attempt debug.traceback(msg, 2) for a full stack trace
@@ -317,6 +321,7 @@ pub const LuaState = struct {
         switch (status) {
             0 => {
                 // LUA_OK — handler completed
+                prom.luaCoroutineFinished();
                 return .completed;
             },
             1 => {
@@ -324,6 +329,7 @@ pub const LuaState = struct {
                 return .yielded;
             },
             else => {
+                prom.luaCoroutineFinished();
                 const lua_thread: *Lua = @ptrCast(@alignCast(thread));
                 if (lua_thread.isString(-1)) {
                     const err_msg = lua_thread.toString(-1) catch "unknown error";

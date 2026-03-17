@@ -36,6 +36,7 @@ const error_response = @import("error_response.zig");
 const Server = @import("server.zig").Server;
 const WorkerMetrics = @import("metrics.zig").WorkerMetrics;
 const metrics_mod = @import("metrics.zig");
+const prom = @import("prom.zig");
 const static_mod = @import("static.zig");
 
 const ParamArray = params.ParamArray;
@@ -518,6 +519,7 @@ pub const Connection = struct {
         // Record metrics (latency + error tracking)
         const latency_us: u64 = @intCast(@max(0, dur_us));
         self.server.metrics.recordRequest(latency_us, status >= 400);
+        prom.recordRequest(self.http_state.request_method, status, latency_us);
     }
 
     /// Parse stage: HTTP parse, query/param setup, Content-Length validation.
@@ -562,6 +564,8 @@ pub const Connection = struct {
     }
 
     fn dispatchToHandler(self: *Connection, ref: i32, exchange: *HttpExchange, request: *const http.Request, clean_path: []const u8) !void {
+        // Record request body size
+        prom.recordRequestBodySize(exchange.body.len);
         // Start the per-request deadline clock before Lua dispatch
         self.startRequestTimer();
         self.lua_state.current_connection = self;
@@ -657,6 +661,12 @@ pub const Connection = struct {
             return null;
         }
 
+        // Prometheus metrics endpoint: handled before Lua routing
+        if (std.mem.eql(u8, clean_path, "/metrics")) {
+            self.servePrometheusMetrics(self.arena.allocator());
+            return null;
+        }
+
         // Static file routes: handled before Lua routing (zero Lua overhead)
         if (self.router.matchStatic(clean_path)) |match| {
             if (!std.mem.eql(u8, request.method, "GET") and !std.mem.eql(u8, request.method, "HEAD")) {
@@ -701,6 +711,8 @@ pub const Connection = struct {
     pub fn writeResponseDirect(self: *Connection, response: *http.Response) !void {
         self.state = .writing;
         const alloc = self.arena.allocator();
+        // Record response body size
+        prom.recordResponseBodySize(response.body.len);
         // Pre-size to avoid repeated ArrayList growth in arena (old buffers can't be freed)
         const estimated = response.body.len + 512;
         var response_buf = try std.ArrayList(u8).initCapacity(alloc, estimated);
@@ -786,6 +798,27 @@ pub const Connection = struct {
 
         self.logAccess(http_status);
         self.sendRawResponse(response_text);
+    }
+
+    /// Prometheus metrics endpoint. Returns text exposition format.
+    fn servePrometheusMetrics(self: *Connection, alloc: std.mem.Allocator) void {
+        // Use std.Io.Writer.Allocating to write metrics, then extract the buffer
+        var allocating_writer: std.Io.Writer.Allocating = .init(alloc);
+        prom.write(&allocating_writer.writer) catch {
+            error_response.sendError(self, .server_error, "metrics write failed");
+            return;
+        };
+        const body = allocating_writer.writer.buffered();
+        const header = std.fmt.allocPrint(alloc, "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {d}\r\n\r\n", .{body.len}) catch {
+            error_response.sendError(self, .server_error, "metrics header failed");
+            return;
+        };
+        const full = std.mem.concat(alloc, u8, &.{ header, body }) catch {
+            error_response.sendError(self, .server_error, "metrics concat failed");
+            return;
+        };
+        self.logAccess(200);
+        self.sendRawResponse(full);
     }
 
     fn onWrite(
@@ -898,6 +931,7 @@ pub const Connection = struct {
         self.state = .closing;
         // Decrement active connection counter
         self.server.metrics.decrementActiveConnections();
+        prom.connectionClosed();
         // Deferred deinit: only free when all armed cosocket completions have fired.
         // Normal HTTP connections have pending_completions == 0 (no cosocket I/O),
         // so maybeFinishClose is equivalent to deinit() in the common case.

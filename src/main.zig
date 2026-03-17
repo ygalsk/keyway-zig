@@ -4,6 +4,7 @@ const cli = @import("cli.zig");
 const Server = @import("server.zig").Server;
 const ThreadPool = @import("worker.zig").ThreadPool;
 const shutdown = @import("shutdown.zig");
+const prom = @import("prom.zig");
 
 pub const version = "0.1.0";
 
@@ -37,6 +38,10 @@ pub fn main() !void {
         stderr.print("keyway {s}\n", .{version}) catch {};
         return;
     }
+
+    // Initialize Prometheus metrics (before spawning workers)
+    try prom.init(allocator);
+    defer prom.deinit();
 
     // Convert CLI config to Server.Config
     // TLS paths: cli.Config has ?[]const u8, Server.Config needs ?[*:0]const u8
@@ -106,6 +111,7 @@ comptime {
     _ = @import("lua_state.zig");
     _ = @import("metrics.zig");
     _ = @import("params.zig");
+    _ = @import("prom.zig");
     _ = @import("ring.zig");
     _ = @import("router.zig");
     _ = @import("server.zig");

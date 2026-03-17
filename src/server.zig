@@ -13,6 +13,7 @@ const SseBroadcastBus = sse.SseBroadcastBus;
 const ShutdownCoordinator = @import("shutdown.zig").ShutdownCoordinator;
 const tuning = @import("config.zig");
 const WorkerMetrics = @import("metrics.zig").WorkerMetrics;
+const prom = @import("prom.zig");
 
 // TCP socket configuration
 const DEFAULT_BACKLOG = tuning.DEFAULT_BACKLOG;
@@ -191,6 +192,7 @@ pub const Server = struct {
         if (self.metrics.active_connections.load(.monotonic) >= tuning.MAX_CONNECTIONS_PER_WORKER) {
             std.posix.close(client_socket);
             self.metrics.incrementRejectedConnections();
+            prom.connectionRejected();
             self.acceptNext();
             return .disarm;
         }
@@ -207,6 +209,7 @@ pub const Server = struct {
 
         // Track active connections (for health endpoint and drain logging)
         self.metrics.incrementActiveConnections();
+        prom.connectionAccepted();
 
         // Create connection handler
         const conn = Connection.init(

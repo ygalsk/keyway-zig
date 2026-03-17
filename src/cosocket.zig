@@ -35,6 +35,7 @@ const castUserdata = @import("helpers.zig").castUserdata;
 const cosocket_ops = @import("cosocket_ops.zig");
 const cosocket_tls = @import("cosocket_tls.zig");
 const conn_ws = @import("conn_ws.zig");
+const prom = @import("prom.zig");
 
 // ============================================================================
 // Shared error infrastructure
@@ -79,6 +80,7 @@ pub fn onOutboundComplete(
 ) xev.CallbackAction {
     _ = loop;
     const self = castUserdata(Connection, userdata);
+    prom.ringCompletions(1);
 
     // Decrement single-shot pending completion counter
     self.cs.pending_completions -= 1;
@@ -318,6 +320,7 @@ fn drainSubmissionRing(self: *Connection) void {
         }
     }
     self.cs.sq.reset();
+    if (io_index > 0) prom.ringSubmissions(io_index);
 
     if (self.cs.pending_completions == 0) {
         // All ops were synchronous (pool hits, setkeepalive) — resume immediately
@@ -340,6 +343,7 @@ pub fn onBatchComplete(
     _ = loop;
 
     const self = castUserdata(Connection, userdata);
+    prom.ringCompletions(1);
 
     // Determine which SQE index this completion corresponds to
     const base = @intFromPtr(&self.cs.batch_completions[0]);
