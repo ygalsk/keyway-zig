@@ -8,6 +8,7 @@
 //! After handshake, kTLS is set up and TlsConn is freed.
 
 const std = @import("std");
+const log = @import("log.zig");
 const xev = @import("xev");
 const Lua = @import("luajit").Lua;
 
@@ -129,7 +130,7 @@ fn finish(self: *Connection, tls_conn: *TlsConn) void {
         s.cleanupTls(self.base_allocator);
     } else |_| {
         // kTLS unavailable — keep TlsConn alive for userspace encrypt/decrypt
-        std.log.info("ktls: unavailable for fd={d}, using userspace TLS", .{s.outbound_fd});
+        log.info().string("msg", "ktls unavailable, using userspace TLS").int("fd", s.outbound_fd).log();
     }
     s.outbound_fd = -1;
     s.pending_op = .none;

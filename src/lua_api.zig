@@ -8,6 +8,7 @@
 //! Write path: ctx.field = val → __newindex → sets on HttpExchange (status, body, headers)
 
 const std = @import("std");
+const log = @import("log.zig");
 const Lua = @import("luajit").Lua;
 const http = @import("http.zig");
 const HttpExchange = @import("http_exchange.zig").HttpExchange;
@@ -304,7 +305,7 @@ pub fn registerHttpExchangeMetatable(lua: *Lua) void {
     registerMetatable(lua, "HttpExchange", luaExchangeIndex, luaExchangeNewIndex);
     registerMetatable(lua, "HttpExchange.Headers", luaHeadersIndex, luaHeadersNewIndex);
     registerMetatable(lua, "WsContext", luaWsContextIndex, null);
-    std.log.debug("HttpExchange metatables registered", .{});
+    log.debug().string("msg", "HttpExchange metatables registered").log();
 }
 
 // === Keyway Module ===
@@ -338,10 +339,10 @@ pub fn registerKeywayModule(lua: *Lua) void {
         \\    return chain
         \\end
     ) catch |err| {
-        std.log.err("failed to register middleware wrapper: {}", .{err});
+        log.err().string("msg", "failed to register middleware wrapper").err(err).log();
         return;
     };
 
-    std.log.debug("keyway lua module registered", .{});
+    log.debug().string("msg", "keyway lua module registered").log();
 }
 

@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const Lua = @import("luajit").Lua;
+const log = @import("log.zig");
 const http = @import("http.zig");
 const HttpExchange = @import("http_exchange.zig").HttpExchange;
 const Router = @import("router.zig").Router;
@@ -135,7 +136,7 @@ pub const LuaState = struct {
             \\        .. package.cpath
             \\end
         ) catch |err| {
-            std.log.warn("failed to configure Lua package paths: {}", .{err});
+            log.warn().string("msg", "failed to configure Lua package paths").err(err).log();
         };
 
         const tls_manager = TlsManager.init(allocator) catch return error.TlsInitFailed;
@@ -161,7 +162,7 @@ pub const LuaState = struct {
             // Get error message from Lua stack
             if (self.lua.isString(-1)) {
                 const err_msg = self.lua.toString(-1) catch "unknown error";
-                std.log.err("Lua error loading {s}: {s}", .{path, err_msg});
+                log.err().string("msg", "Lua error loading script").string("path", path).string("error", std.mem.span(err_msg)).log();
                 self.lua.pop(1); // Pop error message
             }
             return err;
@@ -246,7 +247,7 @@ pub const LuaState = struct {
                 return .completed;
             },
             1 => {
-                // LUA_YIELD — handler wants outbound I/O
+                // LUA_YIELD — handler wants outbound I/O (coroutine still active)
                 if (self.cached_thread_ref != 0) {
                     self.coroutine_ref = self.cached_thread_ref;
                     self.cached_thread_ref = 0;
@@ -267,13 +268,13 @@ pub const LuaState = struct {
                             thread.pushValue(-3); // push original error msg
                             thread.pushInteger(2); // skip 2 frames
                             thread.callProtected(2, 1, 0) catch {
-                                std.log.err("coroutine error ref={d} err=\"{s}\"", .{ lua_ref, err_msg });
+                                log.err().string("msg", "coroutine error").int("ref", lua_ref).string("error", std.mem.span(err_msg)).log();
                                 thread.setTop(0);
                                 if (self.cached_thread_ref == 0) self.lua.pop(1);
                                 return error.Runtime;
                             };
                             const tb_msg = thread.toString(-1) catch err_msg;
-                            std.log.err("coroutine error ref={d}\n{s}", .{ lua_ref, tb_msg });
+                            log.err().string("msg", "coroutine error").int("ref", lua_ref).string("traceback", std.mem.span(tb_msg)).log();
                             thread.setTop(0);
                             if (self.cached_thread_ref == 0) self.lua.pop(1);
                             return error.Runtime;
@@ -282,7 +283,7 @@ pub const LuaState = struct {
                     } else {
                         thread.pop(1); // pop non-table
                     }
-                    std.log.err("coroutine error ref={d} err=\"{s}\"", .{ lua_ref, err_msg });
+                    log.err().string("msg", "coroutine error").int("ref", lua_ref).string("error", std.mem.span(err_msg)).log();
                 }
                 if (self.cached_thread_ref == 0) self.lua.pop(1);
                 return error.Runtime;
@@ -316,7 +317,6 @@ pub const LuaState = struct {
         switch (status) {
             0 => {
                 // LUA_OK — handler completed
-                // Response body already arena-duped on ctx.body assignment (lua_api.zig newindex)
                 return .completed;
             },
             1 => {
@@ -327,7 +327,7 @@ pub const LuaState = struct {
                 const lua_thread: *Lua = @ptrCast(@alignCast(thread));
                 if (lua_thread.isString(-1)) {
                     const err_msg = lua_thread.toString(-1) catch "unknown error";
-                    std.log.err("lua resume error err=\"{s}\"", .{err_msg});
+                    log.err().string("msg", "lua resume error").string("error", std.mem.span(err_msg)).log();
                 }
                 return error.Runtime;
             },

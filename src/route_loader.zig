@@ -1,5 +1,6 @@
 const std = @import("std");
 const Lua = @import("luajit").Lua;
+const log = @import("log.zig");
 const router_mod = @import("router.zig");
 const Router = router_mod.Router;
 
@@ -21,14 +22,14 @@ pub fn processRouteTable(lua: *Lua, router: *Router, allocator: std.mem.Allocato
     const keyway_type = lua.getGlobal("keyway");
     if (keyway_type != .table) {
         lua.pop(1);
-        std.log.err("keyway global is not a table", .{});
+        log.err().string("msg", "keyway global is not a table").log();
         return error.Runtime;
     }
 
     const routes_type = lua.getField(-1, "routes");
     if (routes_type != .table) {
         lua.pop(2);
-        std.log.err("keyway.routes is not a table", .{});
+        log.err().string("msg", "keyway.routes is not a table").log();
         return error.Runtime;
     }
 
@@ -93,7 +94,7 @@ fn walkTable(
             defer allocator.free(full_path);
             try walkTable(lua, router, -1, full_path, middleware, allocator);
         } else {
-            std.log.warn("Ignoring unknown route table key: {s}", .{key});
+            log.warn().string("msg", "ignoring unknown route table key").string("key", key).log();
         }
 
         lua.pop(1); // pop value, keep key for next iteration
@@ -135,7 +136,7 @@ fn collectMiddleware(
             }
             lua.pop(1);
             allocator.free(combined);
-            std.log.err("middleware[{d}] is not a function", .{i + 1});
+            log.err().string("msg", "middleware is not a function").int("index", i + 1).log();
             return error.Runtime;
         }
         combined[parent_refs.len + i] = lua.ref(Lua.PseudoIndex.Registry);
@@ -163,7 +164,7 @@ fn registerRoute(
             lua.unref(Lua.PseudoIndex.Registry, lua_ref);
             return error.Runtime;
         };
-        std.log.debug("route registered method={s} path={s} lua_ref={d}", .{ method, path, lua_ref });
+        log.debug().string("msg", "route registered").stringSafe("method", method).string("path", path).int("lua_ref", lua_ref).log();
     } else {
         // Build middleware chain via __keyway_wrap_chain(handler, middleware_table)
         _ = lua.getGlobal("__keyway_wrap_chain");
@@ -178,7 +179,7 @@ fn registerRoute(
 
         // Call __keyway_wrap_chain(handler, mw_table) -> wrapped_fn
         lua.callProtected(2, 1, 0) catch {
-            std.log.err("Failed to build middleware chain for {s} {s}", .{ method, path });
+            log.err().string("msg", "failed to build middleware chain").stringSafe("method", method).string("path", path).log();
             return error.Runtime;
         };
 
@@ -188,7 +189,7 @@ fn registerRoute(
             lua.unref(Lua.PseudoIndex.Registry, lua_ref);
             return error.Runtime;
         };
-        std.log.debug("route registered method={s} path={s} lua_ref={d} middleware={d}", .{ method, path, lua_ref, middleware.len });
+        log.debug().string("msg", "route registered").stringSafe("method", method).string("path", path).int("lua_ref", lua_ref).int("middleware", middleware.len).log();
     }
 }
 
@@ -217,7 +218,7 @@ pub fn processStaticTable(lua: *Lua, router: *Router) !void {
         const prefix = std.mem.span(key_cstr);
 
         if (!lua.isTable(-1) or prefix.len == 0 or prefix[0] != '/') {
-            std.log.warn("keyway.static: ignoring invalid entry key={s}", .{prefix});
+            log.warn().string("msg", "keyway.static ignoring invalid entry").string("key", prefix).log();
             lua.pop(1);
             continue;
         }
@@ -228,7 +229,7 @@ pub fn processStaticTable(lua: *Lua, router: *Router) !void {
         lua.pop(1);
 
         if (root_str.len == 0) {
-            std.log.warn("keyway.static[{s}]: missing 'root' field", .{prefix});
+            log.warn().string("msg", "keyway.static missing 'root' field").string("prefix", prefix).log();
             lua.pop(1);
             continue;
         }
@@ -239,12 +240,12 @@ pub fn processStaticTable(lua: *Lua, router: *Router) !void {
         lua.pop(1);
 
         router.addStaticRoute(prefix, root_str, index_str) catch |err| {
-            std.log.err("keyway.static[{s}]: failed to register: {}", .{ prefix, err });
+            log.err().string("msg", "keyway.static failed to register").string("prefix", prefix).err(err).log();
             lua.pop(1);
             continue;
         };
 
-        std.log.info("static route registered prefix={s} root={s} index={s}", .{ prefix, root_str, index_str });
+        log.info().string("msg", "static route registered").string("prefix", prefix).string("root", root_str).string("index", index_str).log();
         lua.pop(1); // pop value, keep key
     }
 

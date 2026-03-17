@@ -7,6 +7,7 @@
 //! Fixed-size (RING_DEPTH=16), per-connection, inline, reset per request.
 
 const std = @import("std");
+const log = @import("log.zig");
 const config = @import("config.zig");
 const TlsMode = @import("io_request.zig").TlsMode;
 const ErrorCategory = @import("error_response.zig").ErrorCategory;
@@ -93,7 +94,7 @@ pub const CompletionRing = struct {
 
     pub inline fn push(self: *CompletionRing, entry: CQEntry) void {
         if (self.tail >= MAX_DEPTH) {
-            std.log.err("CompletionRing overflow: tail={d} max={d}", .{ self.tail, MAX_DEPTH });
+            log.err().string("msg", "CompletionRing overflow").int("tail", self.tail).int("max", MAX_DEPTH).log();
             return;
         }
         self.entries[self.tail] = entry;

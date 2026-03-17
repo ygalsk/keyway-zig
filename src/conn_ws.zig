@@ -1,5 +1,6 @@
 const std = @import("std");
 const xev = @import("xev");
+const log = @import("log.zig");
 const http = @import("http.zig");
 const ws = @import("ws.zig");
 const handler_mod = @import("handler.zig");
@@ -35,9 +36,9 @@ pub fn handleWsUpgrade(conn: *Connection, exchange: *HttpExchange, request: *con
     // If the key has trailing whitespace, the accept hash will be wrong and
     // the browser silently rejects the 101 -> 1006 abnormal closure.
     const sec_key_trimmed = std.mem.trim(u8, sec_key, " \t");
-    std.log.debug("ws: sec_key len={d} val=[{s}]", .{ sec_key_trimmed.len, sec_key_trimmed });
+    log.debug().string("msg", "ws sec_key").int("len", sec_key_trimmed.len).string("val", sec_key_trimmed).log();
     ws.computeAcceptKey(sec_key_trimmed, &accept_key);
-    std.log.debug("ws: accept_key=[{s}]", .{&accept_key});
+    log.debug().string("msg", "ws accept_key").string("val", &accept_key).log();
 
     // Build 101 response
     var resp = http.Response.init(alloc);
@@ -114,17 +115,17 @@ fn onWsRead(
 
     const bytes_read = result.recv catch |err| {
         if (self.state == .closing) { self.maybeFinishClose(); return .disarm; }
-        std.log.err("ws recv failed err={} eof={}", .{ err, @intFromBool(err == error.EOF) });
+        log.err().string("msg", "ws recv failed").err(err).log();
         self.close();
         return .disarm;
     };
 
     if (self.state == .closing) { self.maybeFinishClose(); return .disarm; }
 
-    std.log.debug("ws: recv got {d} bytes", .{bytes_read});
+    log.debug().string("msg", "ws recv").int("bytes", bytes_read).log();
 
     if (bytes_read == 0) {
-        std.log.debug("ws: recv 0 bytes, closing", .{});
+        log.debug().string("msg", "ws recv 0 bytes, closing").log();
         self.close();
         return .disarm;
     }
@@ -136,7 +137,7 @@ fn onWsRead(
     if (self.tls_state.ciphertext_buffer) |*cb| {
         cb.commitWrite(bytes_read);
         // TODO: userspace TLS decrypt path for WS (pre-kTLS connections)
-        std.log.err("ws: ciphertext_buffer recv not supported (need decrypt path)", .{});
+        log.err().string("msg", "ws ciphertext_buffer recv not supported (need decrypt path)").log();
         self.close();
         return .disarm;
     } else {
@@ -151,13 +152,13 @@ fn onWsRead(
 pub fn processWsFrames(conn: *Connection) void {
     while (true) {
         const data = conn.read_buffer.readSlice();
-        std.log.debug("ws: processWsFrames data.len={d}", .{data.len});
+        log.debug().string("msg", "ws processWsFrames").int("data_len", data.len).log();
         if (data.len == 0) break;
 
         // parseFrame needs mutable slice for in-place unmasking
         const mutable = @as([*]u8, @constCast(data.ptr))[0..data.len];
         const parse_result = ws.parseFrame(mutable) catch {
-            std.log.err("ws: frame parse error, sending close 1002", .{});
+            log.err().string("msg", "ws frame parse error, sending close 1002").log();
             // Send close 1002 (protocol error) and disconnect
             sendWsClose(conn, 1002);
             return;
@@ -170,14 +171,12 @@ pub fn processWsFrames(conn: *Connection) void {
                 return;
             },
             .frame => |f| {
-                std.log.debug("ws: got frame opcode={d} fin={} payload_len={d} consumed={d}", .{
-                    @intFromEnum(f.frame.opcode), f.frame.fin, f.frame.payload.len, f.consumed,
-                });
+                log.debug().string("msg", "ws got frame").int("opcode", @intFromEnum(f.frame.opcode)).int("payload_len", f.frame.payload.len).int("consumed", f.consumed).log();
                 conn.read_buffer.consume(f.consumed);
 
                 // v1: single-frame messages only
                 if (!f.frame.fin) {
-                    std.log.err("ws: continuation frame, closing 1003", .{});
+                    log.err().string("msg", "ws continuation frame, closing 1003").log();
                     // Continuation frames not supported — close 1003
                     sendWsClose(conn, 1003);
                     return;
@@ -185,7 +184,7 @@ pub fn processWsFrames(conn: *Connection) void {
 
                 switch (f.frame.opcode) {
                     .text, .binary => {
-                        std.log.debug("ws: dispatching text/binary message", .{});
+                        log.debug().string("msg", "ws dispatching text/binary message").log();
                         dispatchWsMessage(conn, f.frame.payload);
                         return; // dispatchWsMessage will call startWsRead when done
                     },
@@ -216,9 +215,9 @@ pub fn processWsFrames(conn: *Connection) void {
 
 /// Dispatch a WebSocket message to the Lua on_message callback as a fresh coroutine.
 fn dispatchWsMessage(conn: *Connection, payload: []const u8) void {
-    std.log.debug("ws: dispatchWsMessage payload_len={d}", .{payload.len});
+    log.debug().string("msg", "ws dispatchWsMessage").int("payload_len", payload.len).log();
     const wss = conn.ws_state orelse {
-        std.log.err("ws: no ws_state, closing", .{});
+        log.err().string("msg", "ws no ws_state, closing").log();
         conn.close();
         return;
     };

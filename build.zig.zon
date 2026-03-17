@@ -13,6 +13,14 @@
             .url = "https://github.com/sackosoft/zig-luajit/archive/refs/heads/main.tar.gz",
             .hash = "luajit-2.1.0-nMGF0kPDAwCHuZVz5A5rFIuxewhLyhCBaar1YJbtICyi",
         },
+        .metrics = .{
+            .url = "https://github.com/karlseguin/metrics.zig/archive/28cf547974144d827b5f85c07af7f9ec72c302dc.tar.gz",
+            .hash = "metrics-0.0.0-W7G4ePy_AQBozb1s8-avLxHOd4thMO92zKXDW84tmAhf",
+        },
+        .logz = .{
+            .url = "https://github.com/karlseguin/log.zig/archive/b4a0b6b38d8fad1b94649046a967a700df5ce576.tar.gz",
+            .hash = "logz-0.0.0-O9YWXraFAgBQxWV4eh_4wp9axpoLhrzTIpYws4oxMLYh",
+        },
     },
 
     .paths = .{

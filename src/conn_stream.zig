@@ -8,6 +8,7 @@
 
 const std = @import("std");
 const xev = @import("xev");
+const log = @import("log.zig");
 const handler_mod = @import("handler.zig");
 const Connection = handler_mod.Connection;
 const HttpExchange = @import("http_exchange.zig").HttpExchange;
@@ -117,7 +118,7 @@ pub fn handleStreamPostWrite(self: *Connection) void {
                 } else {
                     ss.empty_yield_count += 1;
                     if (ss.empty_yield_count >= 64) {
-                        std.log.err("[fd={d}] stream: 64 consecutive empty yields, closing", .{self.socket});
+                        log.err().string("msg", "stream 64 consecutive empty yields, closing").int("fd", self.socket).log();
                         self.close();
                         return;
                     }
@@ -128,7 +129,7 @@ pub fn handleStreamPostWrite(self: *Connection) void {
                 // Lua error
                 if (thread.isString(-1)) {
                     const err_msg = thread.toString(-1) catch "unknown error";
-                    std.log.err("[fd={d}] stream handler error: {s}", .{ self.socket, err_msg });
+                    log.err().string("msg", "stream handler error").int("fd", self.socket).string("error", std.mem.span(err_msg)).log();
                 }
                 self.close();
                 return;

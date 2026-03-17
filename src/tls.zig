@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = @import("log.zig");
 const config = @import("config.zig");
 const c = @cImport({
     @cInclude("openssl/ssl.h");
@@ -476,14 +477,14 @@ pub const TlsConn = struct {
         if (self.mode == .client) {
             const verify_result = c.SSL_get_verify_result(self.ssl);
             if (verify_result != 0) {
-                std.log.err("outbound tls: certificate verify failed code={d}", .{verify_result});
+                log.err().string("msg", "outbound tls certificate verify failed").int("code", verify_result).log();
             }
             var errbuf: [256]u8 = undefined;
             while (true) {
                 const e = c.ERR_get_error();
                 if (e == 0) break;
                 c.ERR_error_string_n(e, &errbuf, errbuf.len);
-                std.log.err("outbound tls: {s}", .{std.mem.sliceTo(&errbuf, 0)});
+                log.err().string("msg", "outbound tls error").string("detail", std.mem.sliceTo(&errbuf, 0)).log();
             }
         }
         return .failed;
@@ -543,7 +544,7 @@ pub const TlsConn = struct {
         const cipher = c.SSL_get_current_cipher(self.ssl) orelse return error.KtlsNoCipher;
         const cipher_id = c.SSL_CIPHER_get_id(cipher);
         const params = getCipherParams(cipher_id) orelse {
-            std.log.warn("ktls: unsupported cipher 0x{x}, cannot enable kTLS", .{cipher_id & 0xFFFF});
+            log.warn().string("msg", "ktls unsupported cipher").fmt("cipher", "0x{x}", .{cipher_id & 0xFFFF}).log();
             return error.KtlsUnsupportedCipher;
         };
 
@@ -586,11 +587,9 @@ pub const TlsConn = struct {
         if (rc != 0) {
             const e = syscallErrno(rc);
             if (e == .NOENT) {
-                std.log.warn("ktls: tls kernel module not loaded (ENOENT from TCP_ULP) — run 'modprobe tls'", .{});
+                log.warn().string("msg", "ktls tls kernel module not loaded (ENOENT from TCP_ULP) — run 'modprobe tls'").log();
             } else {
-                std.log.err("ktls: TCP_ULP setsockopt failed: errno={d} ({s}) fd={d}", .{
-                    @intFromEnum(e), @tagName(e), fd,
-                });
+                log.err().string("msg", "ktls TCP_ULP setsockopt failed").int("errno", @intFromEnum(e)).stringSafe("errname", @tagName(e)).int("fd", fd).log();
             }
             return error.KtlsSetupFailed;
         }
@@ -668,7 +667,7 @@ pub const TlsConn = struct {
         @memset(&self.ktls_secrets.client_secret, 0);
         @memset(&self.ktls_secrets.server_secret, 0);
 
-        std.log.info("ktls: enabled for fd={d} cipher=0x{x} version=0x{x}", .{ fd, cipher_id & 0xFFFF, tls_version });
+        log.info().string("msg", "ktls enabled").int("fd", fd).fmt("cipher", "0x{x}", .{cipher_id & 0xFFFF}).fmt("version", "0x{x}", .{tls_version}).log();
     }
 
     fn setsockoptTls(fd: std.posix.socket_t, direction: u32, info_bytes: []const u8) !void {
@@ -683,9 +682,7 @@ pub const TlsConn = struct {
         );
         if (rc != 0) {
             const e = syscallErrno(rc);
-            std.log.err("ktls: setsockopt SOL_TLS dir={d} failed: errno={d} ({s}) fd={d}", .{
-                direction, @intFromEnum(e), @tagName(e), fd,
-            });
+            log.err().string("msg", "ktls setsockopt SOL_TLS failed").int("dir", direction).int("errno", @intFromEnum(e)).stringSafe("errname", @tagName(e)).int("fd", fd).log();
             return error.KtlsSetupFailed;
         }
     }
@@ -823,10 +820,10 @@ pub const TlsManager = struct {
                 .cert_path = @ptrCast(cert.ptr),
                 .key_path = @ptrCast(key.ptr),
             }) catch |err| {
-                std.log.err("custom TLS context init failed (CASS_TLS_*): {}", .{err});
+                log.err().string("msg", "custom TLS context init failed (CASS_TLS_*)").err(err).log();
                 break :blk null;
             };
-            std.log.info("custom mTLS context loaded from CASS_TLS_CA/CERT/KEY", .{});
+            log.info().string("msg", "custom mTLS context loaded from CASS_TLS_CA/CERT/KEY").log();
             break :blk ctx;
         };
 

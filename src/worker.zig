@@ -112,8 +112,8 @@ pub const Worker = struct {
 
         defer ctx.allocator.destroy(ctx);
 
-        std.log.debug("Worker {d} pinned to core {d}", .{ ctx.worker_id, ctx.worker_id });
-        std.log.info("Worker {d} starting...", .{ctx.worker_id});
+        log.debug().string("msg", "worker pinned to core").int("core", ctx.worker_id).log();
+        log.info().string("msg", "worker starting").log();
 
         // === Worker Initialization Sequence ===
         // 1. Pin thread to CPU core (NUMA locality, cache affinity)
@@ -173,7 +173,7 @@ pub const Worker = struct {
         try lua_state.processStaticTable(&router);
 
         if (router.isEmpty()) {
-            std.log.warn("Worker {d}: no routes registered — all requests will 404", .{ctx.worker_id});
+            log.warn().string("msg", "no routes registered — all requests will 404").log();
         }
 
         // Create server (shares socket via SO_REUSEPORT)
@@ -214,7 +214,7 @@ pub const Worker = struct {
         // Start accepting connections
         try server.start();
 
-        std.log.info("Worker {d} ready on port {d}", .{ ctx.worker_id, ctx.config.port });
+        log.info().string("msg", "worker ready").int("port", ctx.config.port).log();
 
         // Signal readiness to main thread
         _ = ctx.ready_count.fetchAdd(1, .release);
@@ -249,20 +249,20 @@ fn onShutdownSignal(
     }
 
     if (ctx.coordinator.isForceShutdown()) {
-        std.log.info("Force shutdown — closing all connections immediately", .{});
+        log.info().string("msg", "force shutdown — closing all connections immediately").log();
         ctx.server.forceCloseAll();
         ctx.allocator.destroy(ctx);
         return .disarm;
     }
 
-    std.log.info("Shutting down...", .{});
+    log.info().string("msg", "shutting down").log();
     ctx.server.stopAccepting();
 
     const active = ctx.server.metrics.active_connections.load(.monotonic);
-    std.log.info("Draining {d} active connections (deadline {d}ms)", .{ active, config.DRAIN_DEADLINE_MS });
+    log.info().string("msg", "draining active connections").int("active", active).int("deadline_ms", config.DRAIN_DEADLINE_MS).log();
 
     if (active == 0) {
-        std.log.info("Shutdown complete — no active connections", .{});
+        log.info().string("msg", "shutdown complete — no active connections").log();
         ctx.server.forceCloseAll();
         ctx.allocator.destroy(ctx);
         return .disarm;
@@ -286,13 +286,13 @@ fn onDrainDeadline(
         const server: *Server = @ptrCast(@alignCast(ud));
         const remaining = server.metrics.active_connections.load(.monotonic);
         if (remaining > 0) {
-            std.log.info("Drain deadline expired — force-closing {d} connections", .{remaining});
+            log.info().string("msg", "drain deadline expired — force-closing connections").int("remaining", remaining).log();
         }
         // Always call forceCloseAll — closes listen socket + any remaining connections.
         // Idempotent: safe if force shutdown already ran.
         server.forceCloseAll();
     }
-    std.log.info("Shutdown complete", .{});
+    log.info().string("msg", "shutdown complete").log();
     return .disarm;
 }
 
@@ -318,7 +318,7 @@ pub const ThreadPool = struct {
     ) !ThreadPool {
         const num_cpus = try std.Thread.getCpuCount();
         const num_workers: usize = if (worker_count > 0) @intCast(worker_count) else num_cpus;
-        std.log.info("Detected {d} CPU cores, spawning {d} workers", .{ num_cpus, num_workers });
+        log.info().string("msg", "spawning workers").int("cpu_cores", num_cpus).int("workers", num_workers).log();
 
         const workers = try allocator.alloc(Worker, num_workers);
         errdefer allocator.free(workers);

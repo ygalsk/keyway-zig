@@ -38,11 +38,6 @@ pub fn main() !void {
         return;
     }
 
-    // Apply runtime log level before any log output
-    log.runtime_log_level = cli_config.log_level;
-
-    std.log.info("Keyway - Starting...", .{});
-
     // Convert CLI config to Server.Config
     // TLS paths: cli.Config has ?[]const u8, Server.Config needs ?[*:0]const u8
     const tls_cert: ?[*:0]const u8 = if (cli_config.tls_cert_path) |p|
@@ -67,6 +62,12 @@ pub fn main() !void {
     const num_cpus = try std.Thread.getCpuCount();
     const num_workers: usize = if (cli_config.workers > 0) @intCast(cli_config.workers) else num_cpus;
 
+    // Initialize structured logging (needs worker count for pool sizing)
+    try log.init(allocator, cli_config.log_level, num_workers);
+    defer log.deinit();
+
+    log.info().string("msg", "Keyway - Starting...").log();
+
     // Create shutdown coordinator before spawning workers (one Async per worker)
     var coordinator = try shutdown.ShutdownCoordinator.init(allocator, num_workers);
     defer coordinator.deinit();
@@ -80,7 +81,7 @@ pub fn main() !void {
 
     // Block until all workers have bound sockets and are accepting connections
     pool.waitUntilReady();
-    std.log.info("Keyway - Ready on {s}:{d} (press Ctrl+C to stop)", .{ server_config.host, server_config.port });
+    log.info().string("msg", "Keyway - Ready").stringSafe("host", server_config.host).int("port", server_config.port).log();
 
     // Wait for all workers (runs until Ctrl+C)
     pool.joinAll();

@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = @import("log.zig");
 const params = @import("params.zig");
 
 /// Radix tree node for efficient route matching
@@ -146,7 +147,7 @@ pub const Router = struct {
             }
         }
         if (param_count > params.MAX_ROUTE_PARAMS) {
-            std.log.err("route has too many params pattern={s} count={d} max={d}", .{ pattern, param_count, params.MAX_ROUTE_PARAMS });
+            log.err().string("msg", "route has too many params").string("pattern", pattern).int("count", param_count).int("max", params.MAX_ROUTE_PARAMS).log();
             return error.TooManyParams;
         }
 

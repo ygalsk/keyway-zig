@@ -1,5 +1,6 @@
 const std = @import("std");
 const xev = @import("xev");
+const log = @import("log.zig");
 const Connection = @import("handler.zig").Connection;
 const Router = @import("router.zig").Router;
 const LuaState = @import("lua_state.zig").LuaState;
@@ -94,9 +95,9 @@ pub const Server = struct {
             if (worker_id == 0) {
                 // Worker 0: attach BPF, then bind, then listen, then signal others
                 bpf_reuseport.attachAffinity(socket, num_workers) catch |err| {
-                    std.log.warn("BPF affinity unavailable: {} (connections may hit different Lua states)", .{err});
+                    log.warn().string("msg", "BPF affinity unavailable").err(err).log();
                 };
-                std.log.info("BPF connection affinity enabled for {} workers", .{num_workers});
+                log.info().string("msg", "BPF connection affinity enabled").int("workers", num_workers).log();
 
                 try std.posix.bind(socket, &addr.any, addr.getOsSockLen());
                 try std.posix.listen(socket, DEFAULT_BACKLOG);
@@ -127,7 +128,7 @@ pub const Server = struct {
             null;
 
         if (tls_ctx == null and (config.tls_cert_path != null or config.tls_key_path != null)) {
-            std.log.warn("TLS disabled: both --tls-cert and --tls-key are required", .{});
+            log.warn().string("msg", "TLS disabled: both --tls-cert and --tls-key are required").log();
         }
 
         return Server{
@@ -175,7 +176,7 @@ pub const Server = struct {
         const client_socket = result.accept catch |err| {
             // During shutdown, accept errors are expected (listen socket closed)
             if (self.draining) return .disarm;
-            std.log.err("accept failed err={}", .{err});
+            log.err().string("msg", "accept failed").err(err).log();
             self.acceptNext();
             return .disarm;
         };
@@ -201,7 +202,7 @@ pub const Server = struct {
             std.posix.TCP.NODELAY,
             &std.mem.toBytes(@as(c_int, 1)),
         ) catch |err| {
-            std.log.err("setsockopt TCP_NODELAY failed err={}", .{err});
+            log.err().string("msg", "setsockopt TCP_NODELAY failed").err(err).log();
         };
 
         // Track active connections (for health endpoint and drain logging)
@@ -217,7 +218,7 @@ pub const Server = struct {
             self.sse_registry,
             self,
         ) catch |err| {
-            std.log.err("connection init failed err={}", .{err});
+            log.err().string("msg", "connection init failed").err(err).log();
             std.posix.close(client_socket);
             self.acceptNext();
             return .disarm;
@@ -226,7 +227,7 @@ pub const Server = struct {
         // Initialize TLS if configured
         if (self.tls_ctx) |*tc| {
             conn.initTls(tc) catch |err| {
-                std.log.err("TLS init failed err={}", .{err});
+                log.err().string("msg", "TLS init failed").err(err).log();
                 conn.deinit(self.allocator);
                 self.acceptNext();
                 return .disarm;

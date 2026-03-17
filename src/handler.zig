@@ -478,7 +478,7 @@ pub const Connection = struct {
         const bytes_read = result.recv catch |err| {
             if (self.state == .closing) { self.maybeFinishClose(); return .disarm; }
             if (err != error.EOF) {
-                std.log.err("[fd={d}] recv failed err={}", .{ self.socket, err });
+                log.err().string("msg", "recv failed").int("fd", self.socket).err(err).log();
             }
             self.close();
             return .disarm;
@@ -516,7 +516,8 @@ pub const Connection = struct {
         const dur_us: i64 = @intCast(@divTrunc(std.time.nanoTimestamp() - self.http_state.request_start_ns, 1000));
         log.accessLog(self.http_state.request_method, self.http_state.request_path, status, dur_us);
         // Record metrics (latency + error tracking)
-        self.server.metrics.recordRequest(@intCast(@max(0, dur_us)), status >= 400);
+        const latency_us: u64 = @intCast(@max(0, dur_us));
+        self.server.metrics.recordRequest(latency_us, status >= 400);
     }
 
     /// Parse stage: HTTP parse, query/param setup, Content-Length validation.
@@ -567,7 +568,7 @@ pub const Connection = struct {
         const handler_result = self.lua_state.callLuaHandler(ref, exchange) catch |err| {
             self.lua_state.current_connection = null;
             // Log the detailed Lua error separately (not exposed to client)
-            std.log.err("[fd={d}] lua handler error {s} {s} err={}", .{ self.socket, request.method, clean_path, err });
+            log.err().string("msg", "lua handler error").int("fd", self.socket).stringSafe("method", request.method).string("path", clean_path).err(err).log();
             self.logAccess(500);
             error_response.sendError(self, .server_error, "lua handler error");
             return;
@@ -640,7 +641,7 @@ pub const Connection = struct {
         self.cancelHeaderTimer();
         const ref = (self.routeRequest(&request) catch return) orelse return;
         self.dispatchRequest(&request, ref) catch |err| {
-            std.log.err("[fd={d}] dispatch failed err={}", .{ self.socket, err });
+            log.err().string("msg", "dispatch failed").int("fd", self.socket).err(err).log();
             self.close();
         };
     }
@@ -706,7 +707,7 @@ pub const Connection = struct {
         try response.serialize(response_buf.writer(alloc));
 
         if (self.ws_state != null) {
-            std.log.debug("ws: response buf len={d} content=[{s}]", .{ response_buf.items.len, response_buf.items });
+            log.debug().string("msg", "ws response buf").int("len", response_buf.items.len).string("content", response_buf.items).log();
         }
 
         self.submitSend(response_buf.items, onWrite, false);
@@ -817,12 +818,7 @@ pub const Connection = struct {
     /// enter WS frame read loop.
     fn handleWsPostWrite(self: *Connection, bytes_written: usize) void {
         std.debug.assert(self.ws_state != null);
-        std.log.debug("ws: 101 sent ({d} bytes written), entering WS mode. raw_len={d} buf_avail_read={d} buf_avail_write={d}", .{
-            bytes_written,
-            self.http_state.request_raw_len,
-            self.read_buffer.availableRead(),
-            self.read_buffer.availableWrite(),
-        });
+        log.debug().string("msg", "ws 101 sent, entering WS mode").int("bytes_written", bytes_written).int("raw_len", self.http_state.request_raw_len).int("buf_avail_read", self.read_buffer.availableRead()).int("buf_avail_write", self.read_buffer.availableWrite()).log();
         _ = self.arena.reset(.retain_capacity);
         if (self.http_state.request_raw_len > 0) {
             self.read_buffer.consume(self.http_state.request_raw_len);
@@ -830,10 +826,7 @@ pub const Connection = struct {
         } else {
             self.read_buffer.reset();
         }
-        std.log.debug("ws: starting WS read loop. buf_avail_read={d} buf_avail_write={d}", .{
-            self.read_buffer.availableRead(),
-            self.read_buffer.availableWrite(),
-        });
+        log.debug().string("msg", "ws starting read loop").int("buf_avail_read", self.read_buffer.availableRead()).int("buf_avail_write", self.read_buffer.availableWrite()).log();
         // If the client sent WS data in the same TCP segment as the HTTP
         // upgrade request, process it now instead of waiting for another recv.
         if (self.read_buffer.availableRead() > 0) {

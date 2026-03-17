@@ -1,4 +1,5 @@
 const std = @import("std");
+const log = @import("log.zig");
 const config = @import("config.zig");
 
 pub const MAX_ROUTE_PARAMS = config.MAX_ROUTE_PARAMS;
@@ -49,12 +50,12 @@ pub fn parseQueryString(raw: []const u8, out: *QueryArray) void {
         if (pair.len == 0) continue;
         if (std.mem.indexOfScalar(u8, pair, '=')) |eq| {
             out.put(pair[0..eq], pair[eq + 1 ..]) catch {
-                std.log.warn("query string exceeds {d} params, truncating", .{MAX_QUERY_PARAMS});
+                log.warn().string("msg", "query string exceeds max params, truncating").int("max", MAX_QUERY_PARAMS).log();
                 return;
             };
         } else {
             out.put(pair, "") catch {
-                std.log.warn("query string exceeds {d} params, truncating", .{MAX_QUERY_PARAMS});
+                log.warn().string("msg", "query string exceeds max params, truncating").int("max", MAX_QUERY_PARAMS).log();
                 return;
             };
         }

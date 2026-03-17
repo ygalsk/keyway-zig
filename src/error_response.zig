@@ -7,9 +7,8 @@
 //! No internal details (Zig error names, file paths, stack traces) leak to clients.
 
 const std = @import("std");
+const log = @import("log.zig");
 const Connection = @import("handler.zig").Connection;
-
-const log = std.log.scoped(.error_response);
 
 /// Error classification. Each category maps to a default HTTP status, body, and log severity.
 pub const ErrorCategory = enum {
@@ -102,17 +101,19 @@ pub fn logError(
     path: []const u8,
     internal_msg: []const u8,
 ) void {
-    switch (category.logLevel()) {
-        .warn => log.warn("method={s} path={s} status={d} category={s} msg={s}", .{
-            method, path, status, @tagName(category), internal_msg,
-        }),
-        .err => log.err("method={s} path={s} status={d} category={s} msg={s}", .{
-            method, path, status, @tagName(category), internal_msg,
-        }),
-        else => log.info("method={s} path={s} status={d} category={s} msg={s}", .{
-            method, path, status, @tagName(category), internal_msg,
-        }),
-    }
+    const logger = switch (category.logLevel()) {
+        .warn => log.warn(),
+        .err => log.err(),
+        else => log.info(),
+    };
+    logger
+        .stringSafe("scope", "error_response")
+        .stringSafe("method", method)
+        .string("path", path)
+        .int("status", status)
+        .stringSafe("category", @tagName(category))
+        .string("msg", internal_msg)
+        .log();
 }
 
 /// Send an error response for a category. Logs the error and sends the pre-serialized response.
