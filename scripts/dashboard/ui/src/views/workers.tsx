@@ -1,11 +1,47 @@
-// Workers — aggregate Prometheus stats + worker list
+// Workers — per-worker Prometheus metrics with cards, comparison, anomaly detection
 
 import { createMemo, For, Show, onMount } from "solid-js";
 import { state } from "../state";
 import { sendWS } from "../api";
 import { SectionHeader } from "../components/section-header";
 import { formatLatency } from "./format";
-import { rate, gauge, histogramQuantile, scrapeCount } from "../prom";
+import { rate, gauge, histogramQuantile, scrapeCount, uniqueLabels, rateHistory } from "../prom";
+
+function HealthBadge(props: { errorRate: number }) {
+  const cls = () => {
+    if (props.errorRate > 0.05) return "badge-error";
+    if (props.errorRate > 0.01) return "badge-warning";
+    return "badge-success";
+  };
+  const label = () => {
+    if (props.errorRate > 0.05) return "unhealthy";
+    if (props.errorRate > 0.01) return "degraded";
+    return "healthy";
+  };
+  return <span class={`badge badge-xs ${cls()}`}>{label()}</span>;
+}
+
+function Sparkline(props: { data: number[]; color?: string; height?: number }) {
+  const h = () => props.height ?? 24;
+  const w = 80;
+  const path = createMemo(() => {
+    const d = props.data;
+    if (d.length < 2) return "";
+    const max = Math.max(...d, 1);
+    const points = d.map((v, i) => {
+      const x = (i / (d.length - 1)) * w;
+      const y = h() - (v / max) * h();
+      return `${x},${y}`;
+    });
+    return `M${points.join("L")}`;
+  });
+
+  return (
+    <svg width={w} height={h()} class="inline-block align-middle">
+      <path d={path()} fill="none" stroke={props.color ?? "currentColor"} stroke-width="1.5" />
+    </svg>
+  );
+}
 
 export function Workers(props: { onNavigate?: (path: string, ctx?: Record<string, unknown>) => void }) {
   const s = state();
@@ -19,6 +55,13 @@ export function Workers(props: { onNavigate?: (path: string, ctx?: Record<string
 
   const hasScrapes = createMemo(() => { _(); return scrapeCount() >= 2; });
 
+  // Derive worker list from Prometheus labels
+  const workerIds = createMemo(() => {
+    _();
+    return uniqueLabels("keyway_connections_active", "worker_id");
+  });
+
+  // Aggregate stats
   const totalRps = createMemo(() => { _(); return Math.round(rate("keyway_http_requests_total")); });
   const activeConns = createMemo(() => { _(); return gauge("keyway_connections_active"); });
   const activeCoroutines = createMemo(() => { _(); return gauge("keyway_lua_coroutines_active"); });
@@ -31,14 +74,48 @@ export function Workers(props: { onNavigate?: (path: string, ctx?: Record<string
 
   const latencyUs = (seconds: number) => Math.round(seconds * 1_000_000);
 
-  // Derive worker count from traffic entries
-  const workerIds = createMemo(() => {
-    const ids = new Set<string>();
-    for (const e of s.traffic()) {
-      if (e.worker_id && e.worker_id !== "-") ids.add(e.worker_id);
-    }
-    return Array.from(ids).sort((a, b) => Number(a) - Number(b));
+  // Per-worker metric accessors
+  function workerSelector(wid: string) {
+    return (l: Record<string, string>) => l.worker_id === wid;
+  }
+
+  function workerRps(wid: string) {
+    return Math.round(rate("keyway_http_requests_total", workerSelector(wid)));
+  }
+
+  function workerConns(wid: string) {
+    return gauge("keyway_connections_active", { worker_id: wid });
+  }
+
+  function workerCoroutines(wid: string) {
+    return gauge("keyway_lua_coroutines_active", { worker_id: wid });
+  }
+
+  function workerErrorRate(wid: string) {
+    const total = rate("keyway_http_requests_total", workerSelector(wid));
+    const errors = rate("keyway_http_requests_total", (l) => l.worker_id === wid && Number(l.status) >= 400);
+    return total > 0 ? errors / total : 0;
+  }
+
+  function workerRpsHistory(wid: string) {
+    return rateHistory("keyway_http_requests_total", workerSelector(wid));
+  }
+
+  // Anomaly detection: flag workers with error rate > 2x average
+  const avgErrorRate = createMemo(() => {
+    _();
+    const ids = workerIds();
+    if (ids.length === 0) return 0;
+    let sum = 0;
+    for (const wid of ids) sum += workerErrorRate(wid);
+    return sum / ids.length;
   });
+
+  function isAnomaly(wid: string) {
+    const avg = avgErrorRate();
+    if (avg <= 0) return false;
+    return workerErrorRate(wid) > avg * 2;
+  }
 
   function refresh() {
     sendWS({ cmd: "info" });
@@ -52,7 +129,7 @@ export function Workers(props: { onNavigate?: (path: string, ctx?: Record<string
       <div class="flex-1 overflow-y-auto p-4 space-y-4">
         {/* Aggregate stats from Prometheus */}
         <div class="bg-base-200 rounded p-3 space-y-3">
-          <div class="text-detail text-base-content/50 font-medium">Aggregate (Prometheus)</div>
+          <div class="text-detail text-base-content/50 font-medium">Aggregate</div>
           <Show when={hasScrapes()} fallback={<div class="text-detail text-base-content/45">Waiting for scrapes...</div>}>
             <div class="grid grid-cols-3 gap-3 text-center text-detail">
               <div><div class="text-base-content/50">Requests/sec</div><div class="text-base-content/80 font-semibold text-sm">{totalRps()}</div></div>
@@ -71,26 +148,96 @@ export function Workers(props: { onNavigate?: (path: string, ctx?: Record<string
           </Show>
         </div>
 
-        {/* Worker list */}
-        <div class="bg-base-200 rounded p-3">
-          <div class="text-detail text-base-content/50 font-medium mb-2">Workers (from traffic)</div>
-          <Show when={workerIds().length > 0} fallback={<div class="text-detail text-base-content/45">No traffic yet — worker IDs appear when requests arrive</div>}>
+        {/* Per-worker cards */}
+        <Show when={hasScrapes() && workerIds().length > 0}>
+          <div class="bg-base-200 rounded p-3">
+            <div class="text-detail text-base-content/50 font-medium mb-2">Per-Worker</div>
             <div class="grid grid-cols-2 lg:grid-cols-3 xl:grid-cols-4 gap-3">
               <For each={workerIds()}>
                 {(wid) => {
-                  const count = createMemo(() => s.traffic().filter(e => e.worker_id === wid).length);
+                  const rps = createMemo(() => { _(); return workerRps(wid); });
+                  const conns = createMemo(() => { _(); return workerConns(wid); });
+                  const coros = createMemo(() => { _(); return workerCoroutines(wid); });
+                  const errRate = createMemo(() => { _(); return workerErrorRate(wid); });
+                  const anomaly = createMemo(() => { _(); return isAnomaly(wid); });
+                  const history = createMemo(() => { _(); return workerRpsHistory(wid); });
+
                   return (
-                    <div class="bg-base-300/30 rounded p-3 border-l-2 border-base-content/20">
-                      <div class="text-sm font-semibold text-base-content/80 mb-1">Worker {wid}</div>
-                      <div class="text-detail text-base-content/50">{count()} requests in buffer</div>
+                    <div class={`bg-base-300/30 rounded p-3 border-l-2 ${anomaly() ? "border-error" : "border-base-content/20"}`}>
+                      <div class="flex items-center gap-2 mb-2">
+                        <span class="text-sm font-semibold text-base-content/80">Worker {wid}</span>
+                        <HealthBadge errorRate={errRate()} />
+                        <Show when={anomaly()}>
+                          <span class="badge badge-xs badge-error badge-outline">anomaly</span>
+                        </Show>
+                      </div>
+                      <div class="grid grid-cols-2 gap-1 text-detail">
+                        <div><span class="text-base-content/50">RPS</span> <span class="text-base-content/80 font-semibold">{rps()}</span></div>
+                        <div><span class="text-base-content/50">Conns</span> <span class="text-info font-semibold">{conns()}</span></div>
+                        <div><span class="text-base-content/50">Coros</span> <span class="text-base-content/80 font-semibold">{coros()}</span></div>
+                        <div><span class="text-base-content/50">Err%</span> <span class={`font-semibold ${errRate() > 0.05 ? "text-error" : errRate() > 0.01 ? "text-warning" : "text-success"}`}>{(errRate() * 100).toFixed(1)}%</span></div>
+                      </div>
+                      <Show when={history().length > 1}>
+                        <div class="mt-1">
+                          <Sparkline data={history()} color="var(--color-primary)" />
+                        </div>
+                      </Show>
                     </div>
                   );
                 }}
               </For>
             </div>
-          </Show>
-          <div class="text-tiny text-base-content/35 mt-2">Per-worker Prometheus metrics require worker labels in prom.zig</div>
-        </div>
+          </div>
+        </Show>
+
+        {/* Worker comparison table */}
+        <Show when={hasScrapes() && workerIds().length > 1}>
+          <div class="bg-base-200 rounded p-3">
+            <div class="text-detail text-base-content/50 font-medium mb-2">Worker Comparison</div>
+            <div class="overflow-x-auto">
+              <table class="table table-xs w-full">
+                <thead>
+                  <tr>
+                    <th class="text-base-content/50">Worker</th>
+                    <th class="text-base-content/50 text-right">RPS</th>
+                    <th class="text-base-content/50 text-right">Connections</th>
+                    <th class="text-base-content/50 text-right">Coroutines</th>
+                    <th class="text-base-content/50 text-right">Error Rate</th>
+                    <th class="text-base-content/50 text-center">Health</th>
+                  </tr>
+                </thead>
+                <tbody>
+                  <For each={workerIds()}>
+                    {(wid) => {
+                      const rps = createMemo(() => { _(); return workerRps(wid); });
+                      const conns = createMemo(() => { _(); return workerConns(wid); });
+                      const coros = createMemo(() => { _(); return workerCoroutines(wid); });
+                      const errRate = createMemo(() => { _(); return workerErrorRate(wid); });
+
+                      return (
+                        <tr>
+                          <td class="font-semibold text-base-content/80">{wid}</td>
+                          <td class="text-right text-base-content/80">{rps()}</td>
+                          <td class="text-right text-info">{conns()}</td>
+                          <td class="text-right text-base-content/80">{coros()}</td>
+                          <td class={`text-right font-semibold ${errRate() > 0.05 ? "text-error" : errRate() > 0.01 ? "text-warning" : "text-success"}`}>{(errRate() * 100).toFixed(1)}%</td>
+                          <td class="text-center"><HealthBadge errorRate={errRate()} /></td>
+                        </tr>
+                      );
+                    }}
+                  </For>
+                </tbody>
+              </table>
+            </div>
+          </div>
+        </Show>
+
+        {/* Empty state */}
+        <Show when={hasScrapes() && workerIds().length === 0}>
+          <div class="bg-base-200 rounded p-3">
+            <div class="text-detail text-base-content/45 text-center">No worker metrics yet — send requests to see per-worker data</div>
+          </div>
+        </Show>
       </div>
     </div>
   );

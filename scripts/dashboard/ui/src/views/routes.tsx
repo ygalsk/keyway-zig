@@ -10,6 +10,7 @@ import { FilterBar, type FilterConfig } from "../components/filter-bar";
 import { LoadingState, ErrorState } from "../components/feedback";
 import { formatLatency, formatTime } from "./format";
 import { getHashParams } from "../router";
+import { rate, scrapeCount } from "../prom";
 
 function MiddlewarePipeline(props: { middleware: string[]; handler: string }) {
   const nodes = () => {
@@ -248,6 +249,9 @@ export function Routes(props: { onNavigate: (path: string, ctx?: Record<string, 
                   <th class="bg-base-200 text-base-content/50 w-[70px]">Method</th>
                   <th class="bg-base-200 text-base-content/50">Pattern</th>
                   <th class="bg-base-200 text-base-content/50 w-[120px]">Handler</th>
+                  <th class="bg-base-200 text-base-content/50 w-[60px] text-right">Hits/s</th>
+                  <th class="bg-base-200 text-base-content/50 w-[60px] text-right">Err/s</th>
+                  <th class="bg-base-200 text-base-content/50 w-[50px] text-right">Err%</th>
                   <th class="bg-base-200 text-base-content/50 w-[80px] text-right">Actions</th>
                 </tr>
               </thead>
@@ -282,6 +286,15 @@ export function Routes(props: { onNavigate: (path: string, ctx?: Record<string, 
                             onClick={(e) => { e.stopPropagation(); props.onNavigate("/scripts", { navigate_to_script_name: r.handler }); }}
                           >
                             {r.handler}
+                          </td>
+                          <td class="text-right text-base-content/80 text-detail">
+                            {(() => { const v = rate("keyway_http_requests_total", (l) => l.route === r.pattern); return scrapeCount() >= 2 ? v.toFixed(1) : "-"; })()}
+                          </td>
+                          <td class="text-right text-detail">
+                            {(() => { const v = rate("keyway_http_requests_total", (l) => l.route === r.pattern && Number(l.status) >= 400); return scrapeCount() >= 2 ? <span class={v > 0 ? "text-error" : "text-base-content/50"}>{v.toFixed(1)}</span> : "-"; })()}
+                          </td>
+                          <td class="text-right text-detail">
+                            {(() => { if (scrapeCount() < 2) return "-"; const hits = rate("keyway_http_requests_total", (l) => l.route === r.pattern); const errs = rate("keyway_http_requests_total", (l) => l.route === r.pattern && Number(l.status) >= 400); const pct = hits > 0 ? (errs / hits * 100) : 0; return <span class={pct > 5 ? "text-error" : pct > 1 ? "text-warning" : "text-success"}>{pct.toFixed(1)}%</span>; })()}
                           </td>
                           <td class="text-right">
                             <button
@@ -335,7 +348,7 @@ function ProbePanel(props: { route: Route; idx: number; onProbe: (idx: number, u
 
   return (
     <tr>
-      <td colspan="5" class="bg-base-200/50 p-3">
+      <td colspan="8" class="bg-base-200/50 p-3">
         <div class="space-y-3">
           <Card>
             <div class="text-tiny text-base-content/50 font-medium mb-1">MIDDLEWARE PIPELINE</div>

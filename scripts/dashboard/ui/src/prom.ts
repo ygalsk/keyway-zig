@@ -211,3 +211,16 @@ export function gaugeHistory(metric: string, selector?: Labels): number[] {
 export function scrapeCount(): number {
   return scrapes.length;
 }
+
+/** Extract unique values for a given label key from the latest scrape. */
+export function uniqueLabels(metric: string, labelKey: string): string[] {
+  const s = latest();
+  if (!s) return [];
+  const vals = new Set<string>();
+  for (const sample of s.parsed) {
+    if (sample.name === metric && sample.labels[labelKey] !== undefined) {
+      vals.add(sample.labels[labelKey]);
+    }
+  }
+  return Array.from(vals).sort((a, b) => a.localeCompare(b, undefined, { numeric: true }));
+}

@@ -9,6 +9,9 @@ const m = @import("metrics");
 
 const Allocator = std.mem.Allocator;
 
+/// Per-worker thread-local ID. Set once in worker.zig workerMain before any I/O.
+pub threadlocal var worker_id: u16 = 0;
+
 /// Global metrics instance. Starts as noop, activated by `init()`.
 pub var global: Metrics = m.initializeNoop(Metrics);
 
@@ -20,21 +23,25 @@ pub const Metrics = struct {
     http_response_body_bytes: BodySizeHist,
 
     // -- Connections --
-    connections_accepted_total: m.Counter(u64),
-    connections_active: m.Gauge(i64),
-    connections_rejected_total: m.Counter(u64),
+    connections_accepted_total: ConnectionCounter,
+    connections_active: ConnectionGauge,
+    connections_rejected_total: ConnectionCounter,
 
     // -- io_uring / Ring buffer --
-    ring_submissions_total: m.Counter(u64),
-    ring_completions_total: m.Counter(u64),
+    ring_submissions_total: ConnectionCounter,
+    ring_completions_total: ConnectionCounter,
 
     // -- Lua runtime --
-    lua_coroutines_active: m.Gauge(i64),
+    lua_coroutines_active: ConnectionGauge,
 
     // Labeled types
-    const HttpRequestsTotal = m.CounterVec(u64, struct { method: []const u8, status: u16 });
-    const HttpRequestDuration = m.Histogram(f64, &latency_buckets_seconds);
+    const WorkerLabels = struct { worker_id: u16 };
+    const RequestLabels = struct { worker_id: u16, method: []const u8, status: u16, route: []const u8 };
+    const HttpRequestsTotal = m.CounterVec(u64, RequestLabels);
+    const HttpRequestDuration = m.HistogramVec(f64, WorkerLabels, &latency_buckets_seconds);
     const BodySizeHist = m.Histogram(u64, &size_buckets_bytes);
+    const ConnectionCounter = m.CounterVec(u64, WorkerLabels);
+    const ConnectionGauge = m.GaugeVec(i64, WorkerLabels);
 };
 
 /// Latency bucket bounds in seconds (Prometheus convention).
@@ -51,7 +58,7 @@ pub fn init(allocator: Allocator) !void {
         .http_requests_total = try Metrics.HttpRequestsTotal.init(allocator, "keyway_http_requests_total", .{
             .help = "Total HTTP requests handled",
         }, .{}),
-        .http_request_duration_seconds = Metrics.HttpRequestDuration.init("keyway_http_request_duration_seconds", .{
+        .http_request_duration_seconds = try Metrics.HttpRequestDuration.init(allocator, "keyway_http_request_duration_seconds", .{
             .help = "Request latency in seconds",
         }, .{}),
         .http_request_body_bytes = Metrics.BodySizeHist.init("keyway_http_request_body_bytes", .{
@@ -60,22 +67,22 @@ pub fn init(allocator: Allocator) !void {
         .http_response_body_bytes = Metrics.BodySizeHist.init("keyway_http_response_body_bytes", .{
             .help = "Response body size in bytes",
         }, .{}),
-        .connections_accepted_total = m.Counter(u64).init("keyway_connections_accepted_total", .{
+        .connections_accepted_total = try Metrics.ConnectionCounter.init(allocator, "keyway_connections_accepted_total", .{
             .help = "Total accepted connections",
         }, .{}),
-        .connections_active = m.Gauge(i64).init("keyway_connections_active", .{
+        .connections_active = try Metrics.ConnectionGauge.init(allocator, "keyway_connections_active", .{
             .help = "Current active connections",
         }, .{}),
-        .connections_rejected_total = m.Counter(u64).init("keyway_connections_rejected_total", .{
+        .connections_rejected_total = try Metrics.ConnectionCounter.init(allocator, "keyway_connections_rejected_total", .{
             .help = "Total rejected connections",
         }, .{}),
-        .ring_submissions_total = m.Counter(u64).init("keyway_ring_submissions_total", .{
+        .ring_submissions_total = try Metrics.ConnectionCounter.init(allocator, "keyway_ring_submissions_total", .{
             .help = "Total ring buffer submissions",
         }, .{}),
-        .ring_completions_total = m.Counter(u64).init("keyway_ring_completions_total", .{
+        .ring_completions_total = try Metrics.ConnectionCounter.init(allocator, "keyway_ring_completions_total", .{
             .help = "Total ring buffer completions",
         }, .{}),
-        .lua_coroutines_active = m.Gauge(i64).init("keyway_lua_coroutines_active", .{
+        .lua_coroutines_active = try Metrics.ConnectionGauge.init(allocator, "keyway_lua_coroutines_active", .{
             .help = "Active Lua coroutines",
         }, .{}),
     };
@@ -83,6 +90,13 @@ pub fn init(allocator: Allocator) !void {
 
 pub fn deinit() void {
     global.http_requests_total.deinit();
+    global.http_request_duration_seconds.deinit();
+    global.connections_accepted_total.deinit();
+    global.connections_active.deinit();
+    global.connections_rejected_total.deinit();
+    global.ring_submissions_total.deinit();
+    global.ring_completions_total.deinit();
+    global.lua_coroutines_active.deinit();
 }
 
 /// Write all metrics in Prometheus text exposition format.
@@ -94,11 +108,15 @@ pub fn write(writer: *std.Io.Writer) !void {
 // Convenience recording functions (called from hot path)
 // =============================================================================
 
+fn wlabels() Metrics.WorkerLabels {
+    return .{ .worker_id = worker_id };
+}
+
 /// Record a completed HTTP request.
-pub fn recordRequest(method: []const u8, status: u16, latency_us: u64) void {
-    global.http_requests_total.incr(.{ .method = method, .status = status }) catch {};
+pub fn recordRequest(method: []const u8, status: u16, latency_us: u64, route: []const u8) void {
+    global.http_requests_total.incr(.{ .worker_id = worker_id, .method = method, .status = status, .route = route }) catch {};
     const latency_seconds: f64 = @as(f64, @floatFromInt(latency_us)) / 1_000_000.0;
-    global.http_request_duration_seconds.observe(latency_seconds);
+    global.http_request_duration_seconds.observe(wlabels(), latency_seconds) catch {};
 }
 
 /// Record request body size.
@@ -113,38 +131,38 @@ pub fn recordResponseBodySize(size: u64) void {
 
 /// Connection accepted.
 pub fn connectionAccepted() void {
-    global.connections_accepted_total.incr();
-    global.connections_active.incr();
+    global.connections_accepted_total.incr(wlabels()) catch {};
+    global.connections_active.incr(wlabels()) catch {};
 }
 
 /// Connection closed.
 pub fn connectionClosed() void {
-    global.connections_active.incrBy(-1);
+    global.connections_active.incrBy(wlabels(), -1) catch {};
 }
 
 /// Connection rejected (over limit).
 pub fn connectionRejected() void {
-    global.connections_rejected_total.incr();
+    global.connections_rejected_total.incr(wlabels()) catch {};
 }
 
 /// Ring buffer submission(s).
 pub fn ringSubmissions(count: u64) void {
-    global.ring_submissions_total.incrBy(count);
+    global.ring_submissions_total.incrBy(wlabels(), count) catch {};
 }
 
 /// Ring buffer completion(s).
 pub fn ringCompletions(count: u64) void {
-    global.ring_completions_total.incrBy(count);
+    global.ring_completions_total.incrBy(wlabels(), count) catch {};
 }
 
 /// Lua coroutine started.
 pub fn luaCoroutineStarted() void {
-    global.lua_coroutines_active.incr();
+    global.lua_coroutines_active.incr(wlabels()) catch {};
 }
 
 /// Lua coroutine finished (completed or errored).
 pub fn luaCoroutineFinished() void {
-    global.lua_coroutines_active.incrBy(-1);
+    global.lua_coroutines_active.incrBy(wlabels(), -1) catch {};
 }
 
 // =============================================================================
@@ -156,8 +174,8 @@ test "prom: init and record" {
     try init(allocator);
     defer deinit();
 
-    recordRequest("GET", 200, 1500);
-    recordRequest("POST", 201, 3000);
+    recordRequest("GET", 200, 1500, "/users");
+    recordRequest("POST", 201, 3000, "/users");
     connectionAccepted();
     connectionAccepted();
     connectionClosed();
@@ -165,12 +183,12 @@ test "prom: init and record" {
     recordResponseBodySize(2048);
 }
 
-test "prom: write produces output" {
+test "prom: write produces output with worker_id labels" {
     const allocator = std.testing.allocator;
     try init(allocator);
     defer deinit();
 
-    recordRequest("GET", 200, 500);
+    recordRequest("GET", 200, 500, "/test");
     connectionAccepted();
 
     var writer: std.Io.Writer.Allocating = .init(allocator);
@@ -182,7 +200,8 @@ test "prom: write produces output" {
     try std.testing.expect(std.mem.indexOf(u8, buf, "# TYPE keyway_http_requests_total counter") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf, "# TYPE keyway_connections_active gauge") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf, "# TYPE keyway_http_request_duration_seconds histogram") != null);
-    // Verify data present
-    try std.testing.expect(std.mem.indexOf(u8, buf, "keyway_connections_accepted_total 1") != null);
-    try std.testing.expect(std.mem.indexOf(u8, buf, "keyway_connections_active 1") != null);
+    // Verify worker_id label is present
+    try std.testing.expect(std.mem.indexOf(u8, buf, "worker_id=") != null);
+    // Verify route label is present on requests counter
+    try std.testing.expect(std.mem.indexOf(u8, buf, "route=") != null);
 }

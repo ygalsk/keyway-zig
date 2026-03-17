@@ -73,6 +73,7 @@ pub const HttpState = struct {
     request_path: []const u8 = "",
     request_raw_len: usize = 0, // total bytes consumed by current request (headers + body)
     body_bytes_received: u64 = 0,
+    route_pattern: []const u8 = "", // matched route pattern for Prometheus labels (e.g. "/users/{id}")
 };
 
 /// Inbound TLS state — set once at connection init, persists across keep-alive.
@@ -519,7 +520,7 @@ pub const Connection = struct {
         // Record metrics (latency + error tracking)
         const latency_us: u64 = @intCast(@max(0, dur_us));
         self.server.metrics.recordRequest(latency_us, status >= 400);
-        prom.recordRequest(self.http_state.request_method, status, latency_us);
+        prom.recordRequest(self.http_state.request_method, status, latency_us, self.http_state.route_pattern);
     }
 
     /// Parse stage: HTTP parse, query/param setup, Content-Length validation.
@@ -643,16 +644,17 @@ pub const Connection = struct {
         const request = self.parseRequest() catch return;
         // Headers received successfully — cancel header timeout
         self.cancelHeaderTimer();
-        const ref = (self.routeRequest(&request) catch return) orelse return;
-        self.dispatchRequest(&request, ref) catch |err| {
+        const route_match = (self.routeRequest(&request) catch return) orelse return;
+        self.http_state.route_pattern = route_match.pattern;
+        self.dispatchRequest(&request, route_match.lua_ref) catch |err| {
             log.err().string("msg", "dispatch failed").int("fd", self.socket).err(err).log();
             self.close();
         };
     }
 
     /// Route stage: health check short-circuit, trie lookup, 404 on no match.
-    /// Returns the Lua handler ref, or null after sending a response (health/404).
-    fn routeRequest(self: *Connection, request: *const http.Request) !?i32 {
+    /// Returns the RouteMatch, or null after sending a response (health/404).
+    fn routeRequest(self: *Connection, request: *const http.Request) !?Router.RouteMatch {
         const clean_path = self.http_state.request_path;
 
         // Health endpoint: handled before Lua routing (zero Lua overhead)
@@ -677,16 +679,16 @@ pub const Connection = struct {
             return null;
         }
 
-        const lua_ref = self.router.match(request.method, clean_path, &self.param_cache) catch {
+        const route_match = self.router.match(request.method, clean_path, &self.param_cache) catch {
             error_response.sendError(self, .client_error, "route match error");
             return error.RouteMatchFailed;
         };
 
-        if (lua_ref == null) {
+        if (route_match == null) {
             self.logAccess(404);
             self.send404NotFound();
         }
-        return lua_ref;
+        return route_match;
     }
 
     /// Dispatch stage: create HttpExchange, hand off to Lua handler.

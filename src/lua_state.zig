@@ -529,8 +529,8 @@ test "coroutine dispatch - non-yielding handler" {
     // Look up the route to get the lua_ref
     var url_params = params_mod.ParamArray{};
     var query = params_mod.QueryArray{};
-    const lua_ref = try router.match("GET", "/test", &url_params);
-    try std.testing.expect(lua_ref != null);
+    const lua_ref = (try router.match("GET", "/test", &url_params)).?.lua_ref;
+    // lua_ref is valid (unwrapped from RouteMatch)
 
     // Build a minimal HttpExchange
     var response_headers = try std.ArrayList(http.Header).initCapacity(allocator, 4);
@@ -550,7 +550,7 @@ test "coroutine dispatch - non-yielding handler" {
     };
 
     // Call via coroutine dispatch
-    const result = try state.callLuaHandler(lua_ref.?, &exchange);
+    const result = try state.callLuaHandler(lua_ref, &exchange);
     try std.testing.expectEqual(HandlerResult.completed, result);
 
     // Verify response was set correctly
@@ -638,8 +638,8 @@ test "middleware execution order" {
 
     var url_params = params_mod.ParamArray{};
     var query = params_mod.QueryArray{};
-    const lua_ref = try router.match("GET", "/test", &url_params);
-    try std.testing.expect(lua_ref != null);
+    const lua_ref = (try router.match("GET", "/test", &url_params)).?.lua_ref;
+    // lua_ref is valid (unwrapped from RouteMatch)
 
     var response_headers = try std.ArrayList(http.Header).initCapacity(allocator, 4);
     defer response_headers.deinit(allocator);
@@ -657,7 +657,7 @@ test "middleware execution order" {
         .allocator = allocator,
     };
 
-    const result = try state.callLuaHandler(lua_ref.?, &exchange);
+    const result = try state.callLuaHandler(lua_ref, &exchange);
     try std.testing.expectEqual(HandlerResult.completed, result);
     try std.testing.expectEqual(@as(u16, 200), exchange.status);
     try std.testing.expectEqualStrings("mw1_before,mw2_before,handler,mw2_after,mw1_after", exchange.response_body);
@@ -696,8 +696,8 @@ test "middleware short-circuit" {
 
     var url_params = params_mod.ParamArray{};
     var query = params_mod.QueryArray{};
-    const lua_ref = try router.match("GET", "/secret", &url_params);
-    try std.testing.expect(lua_ref != null);
+    const lua_ref = (try router.match("GET", "/secret", &url_params)).?.lua_ref;
+    // lua_ref is valid (unwrapped from RouteMatch)
 
     var response_headers = try std.ArrayList(http.Header).initCapacity(allocator, 4);
     defer response_headers.deinit(allocator);
@@ -715,7 +715,7 @@ test "middleware short-circuit" {
         .allocator = allocator,
     };
 
-    const result = try state.callLuaHandler(lua_ref.?, &exchange);
+    const result = try state.callLuaHandler(lua_ref, &exchange);
     try std.testing.expectEqual(HandlerResult.completed, result);
     try std.testing.expectEqual(@as(u16, 401), exchange.status);
     try std.testing.expectEqualStrings("unauthorized", exchange.response_body);
@@ -748,8 +748,8 @@ test "security: request body with lua code is not executed" {
 
     var url_params = params_mod.ParamArray{};
     var query = params_mod.QueryArray{};
-    const lua_ref = try router.match("POST", "/echo", &url_params);
-    try std.testing.expect(lua_ref != null);
+    const lua_ref = (try router.match("POST", "/echo", &url_params)).?.lua_ref;
+    // lua_ref is valid (unwrapped from RouteMatch)
 
     var response_headers = try std.ArrayList(http.Header).initCapacity(allocator, 4);
     defer response_headers.deinit(allocator);
@@ -767,7 +767,7 @@ test "security: request body with lua code is not executed" {
         .allocator = allocator,
     };
 
-    const result = try state.callLuaHandler(lua_ref.?, &exchange);
+    const result = try state.callLuaHandler(lua_ref, &exchange);
     try std.testing.expectEqual(HandlerResult.completed, result);
     try std.testing.expectEqual(@as(u16, 200), exchange.status);
     // Body is the literal string, never evaluated as Lua code
@@ -801,8 +801,8 @@ test "security: param with lua code is literal string" {
 
     var url_params = params_mod.ParamArray{};
     var query = params_mod.QueryArray{};
-    const lua_ref = try router.match("GET", "/h/os.execute('id')", &url_params);
-    try std.testing.expect(lua_ref != null);
+    const lua_ref = (try router.match("GET", "/h/os.execute('id')", &url_params)).?.lua_ref;
+    // lua_ref is valid (unwrapped from RouteMatch)
 
     var response_headers = try std.ArrayList(http.Header).initCapacity(allocator, 4);
     defer response_headers.deinit(allocator);
@@ -820,7 +820,7 @@ test "security: param with lua code is literal string" {
         .allocator = allocator,
     };
 
-    const result = try state.callLuaHandler(lua_ref.?, &exchange);
+    const result = try state.callLuaHandler(lua_ref, &exchange);
     try std.testing.expectEqual(HandlerResult.completed, result);
     // Param value is literal string, never evaluated
     try std.testing.expectEqualStrings("os.execute('id')", exchange.response_body);
@@ -855,8 +855,8 @@ test "security: ctx.method and ctx.path are read-only" {
 
     var url_params = params_mod.ParamArray{};
     var query = params_mod.QueryArray{};
-    const lua_ref = try router.match("GET", "/test", &url_params);
-    try std.testing.expect(lua_ref != null);
+    const lua_ref = (try router.match("GET", "/test", &url_params)).?.lua_ref;
+    // lua_ref is valid (unwrapped from RouteMatch)
 
     var response_headers = try std.ArrayList(http.Header).initCapacity(allocator, 4);
     defer response_headers.deinit(allocator);
@@ -874,7 +874,7 @@ test "security: ctx.method and ctx.path are read-only" {
         .allocator = allocator,
     };
 
-    const result = try state.callLuaHandler(lua_ref.?, &exchange);
+    const result = try state.callLuaHandler(lua_ref, &exchange);
     try std.testing.expectEqual(HandlerResult.completed, result);
     // Writes to method/path are silently ignored — original values preserved
     try std.testing.expectEqualStrings("GET /test", exchange.response_body);

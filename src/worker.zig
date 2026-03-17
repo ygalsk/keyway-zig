@@ -12,6 +12,7 @@ const ShutdownCoordinator = @import("shutdown.zig").ShutdownCoordinator;
 const metrics_mod = @import("metrics.zig");
 const WorkerMetrics = metrics_mod.WorkerMetrics;
 const config = @import("config.zig");
+const prom = @import("prom.zig");
 
 /// Pin calling thread to specified CPU core (Linux-only)
 /// This is architecturally required for proactor systems to ensure:
@@ -109,6 +110,7 @@ pub const Worker = struct {
         // This ensures NUMA-local memory and cache locality
         try pinThreadToCore(ctx.worker_id);
         log.worker_id = @intCast(ctx.worker_id);
+        prom.worker_id = @intCast(ctx.worker_id);
 
         defer ctx.allocator.destroy(ctx);
 

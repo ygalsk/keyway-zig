@@ -19,6 +19,9 @@ const Node = struct {
     // HTTP method -> Lua registry reference map at this leaf node (if any)
     methods: ?std.StringHashMap(i32),
 
+    // Route pattern string (e.g., "/users/{id}"), set on leaf nodes by addRoute
+    pattern: []const u8 = "",
+
     const ParamChild = struct {
         param_name: []const u8,
         node: *Node,
@@ -55,6 +58,11 @@ const Node = struct {
             self.allocator.free(param.param_name);
             param.node.deinit();
             self.allocator.destroy(param);
+        }
+
+        // Free pattern string
+        if (self.pattern.len > 0) {
+            self.allocator.free(self.pattern);
         }
 
         // Free handler methods map
@@ -193,12 +201,19 @@ pub const Router = struct {
             node.methods = std.StringHashMap(i32).init(self.allocator);
         }
 
+        // Store pattern on the leaf node (for Prometheus route labels)
+        if (node.pattern.len == 0) {
+            node.pattern = try self.allocator.dupe(u8, pattern);
+        }
+
         const method_copy = try self.allocator.dupe(u8, method);
         try node.methods.?.put(method_copy, lua_ref);
     }
 
+    pub const RouteMatch = struct { lua_ref: i32, pattern: []const u8 };
+
     /// Match a request against the radix tree
-    /// Returns lua_ref if match found, null otherwise
+    /// Returns RouteMatch if match found, null otherwise
     /// params_out is an inline ParamArray that will be populated with parameters
     /// This function does ZERO allocations
     pub inline fn match(
@@ -206,7 +221,7 @@ pub const Router = struct {
         method: []const u8,
         path: []const u8,
         params_out: *params.ParamArray,
-    ) error{TooManyParams}!?i32 {
+    ) error{TooManyParams}!?RouteMatch {
         var node = self.root;
         var start: usize = 1; // Skip leading '/'
 
@@ -231,8 +246,10 @@ pub const Router = struct {
         }
 
         // Check if we have a handler for this method at this node
-        if (node.methods) |m| {
-            return m.get(method);
+        if (node.methods) |mt| {
+            if (mt.get(method)) |ref| {
+                return .{ .lua_ref = ref, .pattern = node.pattern };
+            }
         }
 
         return null;
@@ -271,7 +288,7 @@ test "radix router: simple static route" {
 
     const result = try router.match("GET", "/users", &p);
     try std.testing.expect(result != null);
-    try std.testing.expectEqual(@as(i32, 1), result.?);
+    try std.testing.expectEqual(@as(i32, 1), result.?.lua_ref);
     try std.testing.expectEqual(@as(usize, 0), p.len);
 }
 
@@ -287,7 +304,7 @@ test "radix router: parameterized route" {
 
     const result = try router.match("GET", "/users/123", &p);
     try std.testing.expect(result != null);
-    try std.testing.expectEqual(@as(i32, 2), result.?);
+    try std.testing.expectEqual(@as(i32, 2), result.?.lua_ref);
     try std.testing.expectEqual(@as(usize, 1), p.len);
 
     const id = p.get("id").?;
@@ -306,7 +323,7 @@ test "radix router: multiple params" {
 
     const result = try router.match("GET", "/posts/42/comments/7", &p);
     try std.testing.expect(result != null);
-    try std.testing.expectEqual(@as(i32, 3), result.?);
+    try std.testing.expectEqual(@as(i32, 3), result.?.lua_ref);
     try std.testing.expectEqual(@as(usize, 2), p.len);
 
     try std.testing.expectEqualStrings("42", p.get("post_id").?);
@@ -341,18 +358,18 @@ test "radix router: shared prefix" {
 
     // Test /users
     const r1 = try router.match("GET", "/users", &p);
-    try std.testing.expectEqual(@as(i32, 1), r1.?);
+    try std.testing.expectEqual(@as(i32, 1), r1.?.lua_ref);
     p.clear();
 
     // Test /users/123
     const r2 = try router.match("GET", "/users/123", &p);
-    try std.testing.expectEqual(@as(i32, 2), r2.?);
+    try std.testing.expectEqual(@as(i32, 2), r2.?.lua_ref);
     try std.testing.expectEqualStrings("123", p.get("id").?);
     p.clear();
 
     // Test /users/456/posts
     const r3 = try router.match("GET", "/users/456/posts", &p);
-    try std.testing.expectEqual(@as(i32, 3), r3.?);
+    try std.testing.expectEqual(@as(i32, 3), r3.?.lua_ref);
     try std.testing.expectEqualStrings("456", p.get("id").?);
 }
 
