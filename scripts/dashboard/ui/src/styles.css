@@ -83,45 +83,30 @@
   .method-HEAD { color: var(--kw-accent); }
   .method-OPTIONS { color: var(--kw-yellow); }
 
-  .status-2xx { color: var(--kw-accent); }
-  .status-3xx { color: var(--kw-blue); }
-  .status-4xx { color: var(--kw-yellow); }
-  .status-5xx { color: var(--kw-red); }
+  .json-key { color: var(--kw-json-key, #6b9e3e); }
+  .json-string { color: var(--kw-json-string, rgba(255,255,255,0.55)); }
+  .json-number { color: var(--kw-json-number, var(--kw-blue)); }
+  .json-boolean { color: var(--kw-json-boolean, var(--kw-yellow)); }
+  .json-null { color: var(--kw-json-null, rgba(255,255,255,0.3)); }
 
-  .json-key { color: #6b9e3e; }
-  .json-string { color: rgba(255,255,255,0.55); }
-  .json-number { color: var(--kw-blue); }
-  .json-boolean { color: var(--kw-yellow); }
-  .json-null { color: rgba(255,255,255,0.3); }
+  /* Tree guide lines */
+  .tree-guide {
+    position: absolute;
+    width: 1px;
+    top: 0;
+    bottom: 0;
+    background: var(--kw-border);
+    pointer-events: none;
+  }
 
   /* View transition */
   .view-enter {
-    animation: view-fade-in 150ms ease-out;
+    animation: view-slide-in 200ms cubic-bezier(0.16, 1, 0.3, 1);
   }
 
-  /* Traffic row entrance */
-  .row-enter {
-    animation: row-slide-in 200ms ease-out;
-  }
-
-  @keyframes view-fade-in {
-    from { opacity: 0; }
-    to { opacity: 1; }
-  }
-
-  @keyframes row-slide-in {
-    from { opacity: 0; transform: translateY(-2px); }
+  @keyframes view-slide-in {
+    from { opacity: 0; transform: translateY(6px); }
     to { opacity: 1; transform: translateY(0); }
-  }
-
-  /* Sparkline entrance */
-  .sparkline-enter {
-    animation: sparkline-reveal 300ms ease-out;
-  }
-
-  @keyframes sparkline-reveal {
-    from { clip-path: inset(0 100% 0 0); }
-    to { clip-path: inset(0 0 0 0); }
   }
 
   /* Loading skeleton pulse */
@@ -141,25 +126,143 @@
     animation: pulse 2s cubic-bezier(0.4, 0, 0.6, 1) infinite;
   }
 
-  /* Lua syntax highlighting */
-  .hl-overlay { color: var(--kw-text); }
-  .hl-keyword { color: var(--kw-purple); font-weight: 500; }
-  .hl-string { color: var(--kw-accent); }
-  .hl-comment { color: rgba(255,255,255,0.25); font-style: italic; }
-  .hl-number { color: var(--kw-blue); }
-  .hl-error-line { background: rgba(238, 85, 85, 0.15); display: inline-block; width: 100%; }
-
-  /* Action feedback flash */
-  .flash-success { animation: flash-green 400ms ease-out; }
-  .flash-error { animation: flash-red 400ms ease-out; }
-
-  @keyframes flash-green {
-    0% { background-color: rgba(115, 180, 76, 0.2); }
-    100% { background-color: transparent; }
+  /* Connected glow — instrument-panel "system live" indicator */
+  .status-live {
+    box-shadow: 0 0 4px 1px var(--kw-accent), 0 0 8px 2px rgba(115, 180, 76, 0.2);
   }
 
-  @keyframes flash-red {
-    0% { background-color: rgba(238, 85, 85, 0.2); }
-    100% { background-color: transparent; }
+  /* Active tab underline — architectural indicator */
+  .tab-active {
+    color: var(--kw-accent);
+    box-shadow: inset 0 -2px 0 0 var(--kw-accent);
   }
+
+  /* Console drag handle — confident hover */
+  .drag-handle {
+    transition: background-color 150ms ease-out, height 150ms ease-out;
+  }
+  .drag-handle:hover {
+    background-color: rgba(115, 180, 76, 0.3);
+  }
+  .drag-handle:active {
+    background-color: var(--kw-accent);
+  }
+
+  /* Button press — satisfying tactile feedback */
+  .btn:active:not(:disabled) {
+    transform: translateY(1px);
+  }
+  .btn {
+    transition: transform 80ms ease-out, background-color 150ms ease-out, color 150ms ease-out, border-color 150ms ease-out;
+  }
+
+  /* Toast slide-in */
+  .toast-enter {
+    animation: toast-slide 250ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  @keyframes toast-slide {
+    from { opacity: 0; transform: translateY(-8px); }
+    to { opacity: 1; transform: translateY(0); }
+  }
+
+  /* Deploy/action feedback flash */
+  .feedback-flash {
+    animation: feedback-pop 300ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  @keyframes feedback-pop {
+    0% { opacity: 0; transform: translateX(-4px); }
+    50% { opacity: 1; }
+    100% { opacity: 1; transform: translateX(0); }
+  }
+
+  /* Console entry appear */
+  .console-entry {
+    animation: console-fade 150ms ease-out;
+  }
+  @keyframes console-fade {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+  /* Console prompt caret blink */
+  .prompt-caret {
+    animation: caret-pulse 1.2s step-end infinite;
+  }
+  @keyframes caret-pulse {
+    0%, 100% { opacity: 1; }
+    50% { opacity: 0; }
+  }
+
+  /* Connected status dot — subtle breathe when first connected */
+  .status-connected-enter {
+    animation: status-breathe 600ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  @keyframes status-breathe {
+    0% { transform: scale(0.5); opacity: 0.3; }
+    60% { transform: scale(1.4); }
+    100% { transform: scale(1); opacity: 1; }
+  }
+
+  /* Middleware drag handle */
+  .mw-drag-handle {
+    font-size: 14px;
+    line-height: 1;
+    user-select: none;
+  }
+
+  /* Middleware drop target indicator */
+  .mw-drop-target {
+    border-top: 2px solid var(--kw-accent);
+  }
+
+  /* Toggle switch — smooth slide */
+  .toggle {
+    transition: background-color 200ms ease-out;
+  }
+
+  /* Console button hover — warm glow */
+  .console-btn {
+    transition: color 150ms ease-out, background-color 150ms ease-out, transform 150ms ease-out;
+  }
+  .console-btn:hover {
+    transform: translateY(-1px);
+  }
+  .console-btn:active {
+    transform: translateY(1px);
+  }
+
+  /* Welcome overlay */
+  .welcome-enter {
+    animation: welcome-enter 300ms cubic-bezier(0.16, 1, 0.3, 1);
+  }
+  @keyframes welcome-enter {
+    from { opacity: 0; transform: scale(0.95) translateY(8px); }
+    to { opacity: 1; transform: scale(1) translateY(0); }
+  }
+
+  .welcome-backdrop {
+    animation: welcome-backdrop 200ms ease-out;
+  }
+  @keyframes welcome-backdrop {
+    from { opacity: 0; }
+    to { opacity: 1; }
+  }
+
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .view-enter { animation: none; }
+  .status-connecting { animation: none; }
+  .status-live { box-shadow: none; }
+  .skeleton-pulse { animation: none; background: var(--kw-surface); }
+  .toast-enter { animation: none; }
+  .feedback-flash { animation: none; }
+  .console-entry { animation: none; }
+  .prompt-caret { animation: none; }
+  .status-connected-enter { animation: none; }
+  .console-btn:hover { transform: none; }
+  .console-btn:active { transform: none; }
+  .btn:active:not(:disabled) { transform: none; }
+  .welcome-enter { animation: none; }
+  .welcome-backdrop { animation: none; }
 }

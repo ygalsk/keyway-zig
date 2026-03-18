@@ -19,7 +19,11 @@
     "typescript": "^5.5.0"
   },
   "dependencies": {
-    "@solidjs/router": "^0.15.4",
+    "@codemirror/language": "^6.12.2",
+    "@codemirror/legacy-modes": "^6.5.2",
+    "@codemirror/state": "^6.6.0",
+    "@codemirror/view": "^6.40.0",
+    "codemirror": "^6.0.2",
     "solid-js": "^1.9.11"
   }
 }

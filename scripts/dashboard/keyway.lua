@@ -1,90 +1,37 @@
--- keyway.lua — Admin dashboard + programmable control plane
--- Exercises every primitive: SSE, WebSocket, streaming, static files,
--- middleware, route params, query params, JSON, script engine.
+-- keyway.lua — Admin dashboard + file management control plane
+-- Lua files on disk control the runtime. The dashboard is a file editor.
 
 local response = require("keyway.response")
 local cjson = require("cjson")
 local dns = require("keyway.dns")
-local socket = require("keyway.socket")
+local http = require("keyway.http")
 
--- Dashboard libs
-local probe = require("scripts.dashboard.lib.probe")
-local scripts_store = require("scripts.dashboard.lib.scripts_store")
-local dispatch = require("scripts.dashboard.lib.dispatch")
-local hooks_store = require("scripts.dashboard.lib.hooks_store")
-local redis = require("scripts.dashboard.lib.redis_ring")
+-- ─── Middleware Registry ──────────────────────────────────────────────
 
--- Local HTTP request helper (uses keyway.socket which is ring-based, yields properly)
-local function self_request(host_hdr, port, method, path)
-    local tcp = socket.tcp()
-    tcp:settimeout(5000)
-    local ok, err = tcp:connect("127.0.0.1", port)
-    if not ok then return nil, "connect failed: " .. (err or "unknown") end
-    tcp:send(string.format("%s %s HTTP/1.1\r\nHost: %s\r\nConnection: close\r\n\r\n", method, path, host_hdr))
-    local status_line = tcp:receive("*l")
-    if not status_line then tcp:close(); return nil, "no response" end
-    local status_code = tonumber(status_line:match("^HTTP/%S+ (%d+)")) or 0
-    local headers, content_length = {}, nil
-    while true do
-        local line = tcp:receive("*l")
-        if not line or line == "" then break end
-        local name, value = line:match("^([^:]+):%s*(.-)%s*$")
-        if name then
-            headers[#headers + 1] = { name, value }
-            if name:lower() == "content-length" then content_length = tonumber(value) end
-        end
-    end
-    local body = ""
-    if content_length and content_length > 0 then
-        body = tcp:receive(content_length) or ""
-    else
-        -- No Content-Length: read until EOF (Connection: close)
-        local chunks = {}
-        while true do
-            local chunk, chunk_err = tcp:receive(4096)
-            if not chunk then break end
-            chunks[#chunks + 1] = chunk
-        end
-        if #chunks > 0 then body = table.concat(chunks) end
-    end
-    tcp:close()
-    return status_code, headers, body
+keyway.middleware = keyway.middleware or {}
+keyway.middleware._registry = {}
+
+function keyway.middleware.register(name, fn)
+    keyway.middleware._registry[name] = fn
 end
 
--- ─── Per-Worker Counters ──────────────────────────────────────────────
-local counters = {
-    ws_connections = 0,
-    ws_messages    = 0,
-    http_probes    = 0,
-    dns_lookups    = 0,
-    self_requests  = 0,
-    stream_tests   = 0,
-}
+function keyway.middleware.resolve(name_or_fn)
+    if type(name_or_fn) == "function" then return name_or_fn end
+    local fn = keyway.middleware._registry[name_or_fn]
+    if fn then return fn end
+    error("middleware not found: " .. tostring(name_or_fn))
+end
 
--- ─── Periodic Flush to Redis ────────────────────────────────────────
-local _last_flush = 0
-local FLUSH_INTERVAL_US = 5000000 -- 5 seconds
-
-local function flush_counters()
-    for key, val in pairs(counters) do
-        if val > 0 then
-            redis.incrby("kw:counters:" .. key, val)
-        end
+function keyway.middleware.list()
+    local result = {}
+    for name in pairs(keyway.middleware._registry) do
+        result[#result + 1] = name
     end
-    -- Reset local counters after flush (except ws_connections which tracks live state)
-    for key, _ in pairs(counters) do
-        if key ~= "ws_connections" then
-            counters[key] = 0
-        end
-    end
+    table.sort(result)
+    return result
 end
 
 -- ─── Helpers ──────────────────────────────────────────────────────────
-
-local function esc(s)
-    if not s then return "" end
-    return (s:gsub("&", "&amp;"):gsub("<", "&lt;"):gsub(">", "&gt;"):gsub('"', "&quot;"))
-end
 
 local function format_latency(us)
     if not us or us == 0 then return "-" end
@@ -93,120 +40,65 @@ local function format_latency(us)
     return string.format("%.2fs", us / 1000000)
 end
 
-local function status_cls(s)
-    if not s or s == 0 then return "s-0" end
-    if s < 300 then return "s-2xx" end
-    if s < 400 then return "s-3xx" end
-    if s < 500 then return "s-4xx" end
-    return "s-5xx"
-end
+-- Resolve a middleware function's name by scanning known scopes.
+-- debug.getinfo(fn, "n") doesn't work for function values in LuaJIT,
+-- so we scan the global table and the script's upvalue locals.
+local _mw_name_cache = setmetatable({}, { __mode = "k" })
+local function mw_name(mw, index, prefix)
+    local cached = _mw_name_cache[mw]
+    if cached then return cached end
 
--- Extract {param} from path: /__keyway/api/scripts/{id} style
-local function extract_path_id(path, prefix)
-    local id = path:match("^" .. prefix .. "/([^/]+)")
-    return id
-end
-
--- ─── Localhost Guard ─────────────────────────────────────────────────
--- Restricts /__keyway/ paths to localhost only.
-
-local function localhost_guard(ctx, next)
-    if ctx.path and ctx.path:match("^/__keyway/") then
-        local addr = ctx.remote_addr or ""
-        if addr ~= "127.0.0.1" and addr ~= "::1" then
-            ctx.status = 403
-            ctx.body = "Forbidden"
-            return
+    -- Try middleware registry first (reverse lookup fn→name)
+    if keyway.middleware and keyway.middleware._registry then
+        for name, fn in pairs(keyway.middleware._registry) do
+            if fn == mw then
+                _mw_name_cache[mw] = name
+                return name
+            end
         end
     end
-    next()
-end
 
--- ─── Access Log Middleware ────────────────────────────────────────────
--- Broadcasts JSON event per request via SSE.
-
-local function access_log_middleware(ctx, next)
-    local t0 = response.now_us()
-    next()
-    local latency_us = math.floor(response.now_us() - t0)
-    local method = ctx.method or "GET"
-    local status = ctx.status or 0
-    local wid = keyway.worker_id
-
-    -- Count request headers
-    local header_count = 0
-    if ctx.request_headers then
-        for _ in ipairs(ctx.request_headers) do header_count = header_count + 1 end
+    -- Try debug.getinfo first (works for C functions and some named funcs)
+    local info = debug.getinfo(mw, "nS")
+    if info and info.name and info.name ~= "" then
+        _mw_name_cache[mw] = info.name
+        return info.name
     end
 
-    -- Get response content-type
-    local content_type = ctx.headers and ctx.headers["Content-Type"] or ""
-
-    -- Collect matched scripts from dispatch
-    local matched_scripts = nil
-    if #dispatch._last_matched > 0 then
-        matched_scripts = dispatch._last_matched
+    -- Scan globals
+    for k, v in pairs(_G) do
+        if v == mw and type(k) == "string" then
+            _mw_name_cache[mw] = k
+            return k
+        end
     end
 
-    -- Check for hook capture (set by M_capture_hook)
-    local hook_id = ctx._hook_id or nil
-
-    pcall(response.broadcast_event, "keyway:access", {
-        method = method,
-        path = ctx.path or "--",
-        status = status,
-        latency_us = latency_us,
-        latency = format_latency(latency_us),
-        worker_id = wid ~= nil and tostring(wid) or "-",
-        content_type = content_type,
-        header_count = header_count,
-        scripts = matched_scripts,
-        hook_id = hook_id,
-    })
-
-    -- Periodic flush of counters to Redis
-    local now = response.now_us()
-    if (now - _last_flush) > FLUSH_INTERVAL_US then
-        _last_flush = now
-        pcall(flush_counters)
+    -- Scan upvalues of the calling function (2 levels up)
+    for level = 2, 5 do
+        local caller = debug.getinfo(level, "f")
+        if not caller or not caller.func then break end
+        local i = 1
+        while true do
+            local uname, uval = debug.getupvalue(caller.func, i)
+            if not uname then break end
+            if uval == mw and uname ~= "" and not uname:match("^%(") then
+                _mw_name_cache[mw] = uname
+                return uname
+            end
+            i = i + 1
+        end
     end
+
+    -- Fallback: source:line
+    if info and info.short_src and info.linedefined then
+        local fallback = info.short_src:match("([^/]+)$") .. ":" .. info.linedefined
+        _mw_name_cache[mw] = fallback
+        return fallback
+    end
+
+    return (prefix or "mw_") .. index
 end
 
--- ─── Test Middleware ──────────────────────────────────────────────────
-
-local function mw_before(ctx, next)
-    ctx.headers["X-MW-Before"] = "applied"
-    next()
-end
-
-local function mw_after(ctx, next)
-    next()
-    ctx.headers["X-MW-After"] = "applied"
-end
-
--- ─── Initialize Script Engine ────────────────────────────────────────
--- Reload is lazy: dispatch.dispatch checks _loaded on first request.
--- No startup call needed (cosocket yields require a handler coroutine).
-
--- ─── Shared Helpers ──────────────────────────────────────────────
-
-local function ws_reply(ws, tbl)
-    ws:send(cjson.encode(tbl))
-end
-
-local function ws_error(ws, cmd, msg)
-    ws_reply(ws, { cmd = cmd, error = msg })
-end
-
-local function mw_name(mw, index, prefix)
-    local name = (prefix or "mw_") .. index
-    local info = debug.getinfo(mw, "n")
-    if info and info.name then name = info.name end
-    return name
-end
-
-
---- Iterate static routes in keyway.routes, calling cb(pattern, methods_table, mw_names, http_methods).
 local function each_static_route(cb, mw_prefix)
     for pattern, methods in pairs(keyway.routes) do
         if type(methods) == "table" and pattern ~= "middleware" then
@@ -227,67 +119,55 @@ local function each_static_route(cb, mw_prefix)
     end
 end
 
+local function url_decode(s)
+    return s:gsub("%%(%x%x)", function(h) return string.char(tonumber(h, 16)) end)
+end
+
+-- ─── Localhost Guard ─────────────────────────────────────────────────
+
+local function localhost_guard(ctx, next)
+    if ctx.path and ctx.path:match("^/__keyway/") then
+        local addr = ctx.remote_addr or ""
+        if addr ~= "127.0.0.1" and addr ~= "::1" then
+            ctx.status = 403
+            ctx.body = "Forbidden"
+            return
+        end
+    end
+    next()
+end
+
+-- ─── Test Middleware ──────────────────────────────────────────────────
+
+local function mw_before(ctx, next)
+    ctx.headers["X-MW-Before"] = "applied"
+    next()
+end
+
+local function mw_after(ctx, next)
+    next()
+    ctx.headers["X-MW-After"] = "applied"
+end
+
+-- Register built-in middleware
+keyway.middleware.register("localhost_guard", localhost_guard)
+keyway.middleware.register("mw_before", mw_before)
+keyway.middleware.register("mw_after", mw_after)
+
+local function ws_reply(ws, tbl)
+    ws:send(cjson.encode(tbl))
+end
+
+local function ws_error(ws, cmd, msg)
+    ws_reply(ws, { cmd = cmd, error = msg })
+end
+
 -- ─── WebSocket Command Dispatch ──────────────────────────────────
 
 local ws_commands = {}
 
 ws_commands.ping = function(ws, _)
     ws_reply(ws, { cmd = "pong", ts = math.floor(response.now_us()), worker_id = keyway.worker_id })
-end
-
-ws_commands.info = function(ws, _)
-    local agg = {}
-    for key, val in pairs(counters) do
-        local redis_val = tonumber(redis.get("kw:counters:" .. key)) or 0
-        agg[key] = redis_val + val
-    end
-    ws_reply(ws, {
-        cmd = "info",
-        worker_id = keyway.worker_id,
-        ts = math.floor(response.now_us()),
-        counters = agg,
-    })
-end
-
-ws_commands.scripts = function(ws, _)
-    ws_reply(ws, { cmd = "scripts", scripts = scripts_store.list() })
-end
-
-ws_commands.hooks = function(ws, _)
-    ws_reply(ws, { cmd = "hooks", hooks = hooks_store.list() })
-end
-
-ws_commands.trigger = function(ws, msg)
-    local id = msg.id
-    if not id then return ws_error(ws, "trigger", "id required") end
-    local script = scripts_store.get(id)
-    if not script then return ws_error(ws, "trigger", "not found") end
-    local fn, compile_err = scripts_store.compile(script.code)
-    if not fn then return ws_error(ws, "trigger", compile_err) end
-    local mock_ctx = {
-        method = "GET", path = script.pattern, body = "",
-        status = 200, headers = {}, request_headers = {}, params = {},
-    }
-    local t0 = response.now_us()
-    local function err_handler(e) return debug.traceback(tostring(e), 2) end
-    local run_ok, run_err
-    if script.type == "middleware" then
-        run_ok, run_err = xpcall(fn, err_handler, mock_ctx, function() end)
-    else
-        run_ok, run_err = xpcall(fn, err_handler, mock_ctx)
-    end
-    local elapsed = math.floor(response.now_us() - t0)
-    ws_reply(ws, {
-        cmd = "trigger", id = id,
-        success = run_ok,
-        error = run_ok and nil or run_err,
-        result = { status = mock_ctx.status, body = mock_ctx.body, headers = mock_ctx.headers },
-        timing_us = elapsed,
-    })
-end
-
-ws_commands.routes = function(ws, _)
-    ws_reply(ws, { cmd = "routes", routes = dispatch.list_routes() })
 end
 
 ws_commands.lua = function(ws, msg)
@@ -306,28 +186,22 @@ ws_commands.lua = function(ws, msg)
     end
 end
 
-ws_commands.send_hook = function(ws, msg)
-    local id = msg.id
-    local body = msg.body or ""
-    if not id then return ws_error(ws, "send_hook", "id required") end
-    if not hooks_store.exists(id) then return ws_error(ws, "send_hook", "hook not found") end
-    hooks_store.capture(id, {
-        method = "WS", path = "/h/" .. id,
-        headers = {}, body = body,
-    })
-    ws_reply(ws, { cmd = "send_hook", ok = true, id = id })
-end
-
 -- ─── Static Mount ────────────────────────────────────────────────────
 
 keyway.static = {
     ["/__keyway/dashboard"] = { root = "scripts/dashboard/public", index = "index.html" },
 }
 
+-- ─── Reverse Proxy Mounts ────────────────────────────────────────────
+
+keyway.proxy = {
+    ["/__keyway/grafana"] = { host = "127.0.0.1", port = 3000, redirect = "/__keyway/dashboard/grafana.html", strip_prefix = false },
+}
+
 -- ─── Routes ──────────────────────────────────────────────────────────
 
 keyway.routes = {
-    middleware = { localhost_guard, access_log_middleware, dispatch.dispatch },
+    middleware = { localhost_guard },
 
     -- Dashboard: SSE event stream
     ["/__keyway/events"] = {
@@ -340,10 +214,8 @@ keyway.routes = {
     -- Dashboard: WebSocket command interface
     ["/__keyway/ws"] = {
         GET = function(ctx)
-            counters.ws_connections = counters.ws_connections + 1
             ctx.upgrade = "websocket"
             ctx.on_message = function(ws)
-                counters.ws_messages = counters.ws_messages + 1
                 local ok, msg = pcall(cjson.decode, ws.message)
                 if not ok then
                     ws_reply(ws, { error = "invalid json" })
@@ -356,32 +228,7 @@ keyway.routes = {
                     ws_reply(ws, { error = "unknown command: " .. tostring(msg.cmd) })
                 end
             end
-            ctx.on_close = function()
-                counters.ws_connections = math.max(0, counters.ws_connections - 1)
-            end
-        end,
-    },
-
-    -- ─── Metrics (JSON) ──────────────────────────────────────────
-
-    ["/__keyway/api/metrics"] = {
-        GET = function(ctx)
-            local host_hdr = response.get_header(ctx, "Host") or "localhost:8080"
-            local port = tonumber(host_hdr:match(":(%d+)$")) or 8080
-
-            local status, _, body = self_request(host_hdr, port, "GET", "/health")
-            if not status then
-                response.json_response(ctx, 200, { status = "error", error = "health check failed" })
-                return
-            end
-
-            local ok, m = pcall(cjson.decode, body)
-            if not ok then
-                response.json_response(ctx, 200, { status = "error", error = "invalid health response" })
-                return
-            end
-
-            response.json_response(ctx, 200, m)
+            ctx.on_close = function() end
         end,
     },
 
@@ -390,24 +237,23 @@ keyway.routes = {
     -- HTTP Probe
     ["/__keyway/api/probe"] = {
         POST = function(ctx)
-            counters.http_probes = counters.http_probes + 1
             local ok, body = pcall(cjson.decode, ctx.body)
             if not ok or not body.url then
                 response.json_response(ctx, 400, { error = "JSON body with 'url' field required" })
                 return
             end
-            local result, err = probe.execute(body.url)
+            local result, err = http.probe(body.url)
             if not result then
                 response.json_response(ctx, 200, { error = err })
                 return
             end
-            -- Broadcast probe as pseudo-traffic entry
+            local timing_us = (result.timing_ms or 0) * 1000
             pcall(response.broadcast_event, "keyway:access", {
                 method = "PROBE",
                 path = body.url,
                 status = result.status,
-                latency_us = result.timing_us,
-                latency = format_latency(result.timing_us),
+                latency_us = timing_us,
+                latency = format_latency(timing_us),
                 worker_id = keyway.worker_id ~= nil and tostring(keyway.worker_id) or "-",
                 content_type = "",
                 header_count = #result.headers,
@@ -416,7 +262,7 @@ keyway.routes = {
                 status       = result.status,
                 headers      = result.headers,
                 timing_ms    = result.timing_ms,
-                body_preview = result.body_preview,
+                body_preview = (result.body or ""):sub(1, 500),
             })
         end,
     },
@@ -424,7 +270,6 @@ keyway.routes = {
     -- DNS Lookup
     ["/__keyway/api/dns"] = {
         POST = function(ctx)
-            counters.dns_lookups = counters.dns_lookups + 1
             local ok, body = pcall(cjson.decode, ctx.body)
             if not ok or not body.domain then
                 response.json_response(ctx, 400, { error = "JSON body with 'domain' field required" })
@@ -441,35 +286,9 @@ keyway.routes = {
         end,
     },
 
-    -- Self-Request
-    ["/__keyway/api/self"] = {
-        POST = function(ctx)
-            counters.self_requests = counters.self_requests + 1
-            local ok, body = pcall(cjson.decode, ctx.body)
-            local path = (ok and body.path) or "/test/json"
-            local host_hdr = response.get_header(ctx, "Host") or "localhost:8080"
-            local port = tonumber(host_hdr:match(":(%d+)$")) or 8080
-
-            local t0 = response.now_us()
-            local status_code, _, resp_body = self_request(host_hdr, port, "GET", path)
-            local timing = math.floor(response.now_us() - t0)
-            if not status_code then
-                response.json_response(ctx, 200, { error = resp_body or "request failed" })
-                return
-            end
-            response.json_response(ctx, 200, {
-                status = status_code,
-                body = (resp_body or ""):sub(1, 500),
-                timing_us = timing,
-                path = path,
-            })
-        end,
-    },
-
     -- Stream Test
     ["/__keyway/api/stream"] = {
         GET = function(ctx)
-            counters.stream_tests = counters.stream_tests + 1
             ctx.upgrade = "stream"
             ctx.status = 200
             for i = 1, 5 do
@@ -480,26 +299,16 @@ keyway.routes = {
         end,
     },
 
-    -- Counters (read aggregated values from Redis)
-    ["/__keyway/api/counters"] = {
-        GET = function(ctx)
-            local result = {}
-            for key, _ in pairs(counters) do
-                local val = redis.get("kw:counters:" .. key)
-                result[key] = tonumber(val) or 0
-            end
-            -- Add unflushed local counters
-            for key, val in pairs(counters) do
-                result[key] = (result[key] or 0) + val
-            end
-            response.json_response(ctx, 200, result)
-        end,
-    },
-
     -- Route listing (with middleware chain info)
     ["/__keyway/api/routes"] = {
         GET = function(ctx)
-            local routes = dispatch.list_routes()
+            local global_mw = {}
+            if keyway.routes.middleware then
+                for i, mw in ipairs(keyway.routes.middleware) do
+                    global_mw[#global_mw + 1] = { name = mw_name(mw, i, "global_mw_"), index = i }
+                end
+            end
+            local routes = {}
             each_static_route(function(pattern, _, mw_names, http_methods)
                 for _, method in ipairs(http_methods) do
                     routes[#routes + 1] = {
@@ -510,25 +319,26 @@ keyway.routes = {
                     }
                 end
             end)
-            response.json_response(ctx, 200, { routes = routes })
+            response.json_response(ctx, 200, {
+                routes = routes,
+                global_middleware = global_mw,
+                available_middleware = keyway.middleware.list(),
+            })
         end,
     },
 
-    -- Effective config — compiled route table with resolved middleware chains
+    -- Effective config
     ["/__keyway/api/config/effective"] = {
         GET = function(ctx)
             local effective = {
                 global_middleware = {},
                 routes = {},
-                scripts = {},
             }
-            -- Global middleware from keyway.routes.middleware
             if keyway.routes.middleware then
                 for i, mw in ipairs(keyway.routes.middleware) do
                     effective.global_middleware[#effective.global_middleware + 1] = mw_name(mw, i, "global_mw_")
                 end
             end
-            -- Static routes
             each_static_route(function(pattern, _, mw_names, http_methods)
                 effective.routes[#effective.routes + 1] = {
                     pattern = pattern,
@@ -536,193 +346,265 @@ keyway.routes = {
                     middleware = mw_names,
                 }
             end, "route_mw_")
-            -- Script-defined routes
-            local script_routes = dispatch.list_routes()
-            for _, r in ipairs(script_routes) do
-                effective.scripts[#effective.scripts + 1] = {
-                    method = r.method,
-                    pattern = r.pattern,
-                    handler = r.handler,
-                    hits = r.hits,
-                    errors = r.errors,
-                }
-            end
-            -- Sort routes by pattern
             table.sort(effective.routes, function(a, b) return a.pattern < b.pattern end)
             response.json_response(ctx, 200, effective)
         end,
     },
 
-    -- ─── Scripts API ─────────────────────────────────────────────
+    -- ─── Middleware Management API ────────────────────────────────
 
-    ["/__keyway/api/scripts"] = {
+    -- List all registered middleware with source info
+    ["/__keyway/api/middleware"] = {
         GET = function(ctx)
-            response.json_response(ctx, 200, { scripts = scripts_store.list() })
-        end,
-        POST = function(ctx)
-            local body, err = response.parse_json_body(ctx)
-            if not body then return end
-            local script = scripts_store.create(body)
-            response.json_response(ctx, 201, { script = script })
+            local result = {}
+            for name, fn in pairs(keyway.middleware._registry) do
+                local info = debug.getinfo(fn, "S")
+                result[#result + 1] = {
+                    name = name,
+                    source = info and info.short_src or "unknown",
+                    line = info and info.linedefined or 0,
+                }
+            end
+            table.sort(result, function(a, b) return a.name < b.name end)
+            response.json_response(ctx, 200, { middleware = result })
         end,
     },
 
-    ["/__keyway/api/scripts/{id}"] = {
-        GET = function(ctx)
-            local script = scripts_store.get(ctx.params.id)
-            if not script then
-                response.json_not_found(ctx)
+    -- Update middleware for a specific route pattern
+    ["/__keyway/api/routes/{pattern}/middleware"] = {
+        PUT = function(ctx)
+            local ok, body = pcall(cjson.decode, ctx.body)
+            if not ok or type(body.middleware) ~= "table" then
+                response.json_response(ctx, 400, { error = "JSON body with 'middleware' array required" })
                 return
             end
-            response.json_response(ctx, 200, { script = script })
+
+            local pattern = "/" .. url_decode(ctx.params.pattern)
+
+            -- Validate all middleware names exist in registry
+            for _, name in ipairs(body.middleware) do
+                if not keyway.middleware._registry[name] then
+                    response.json_response(ctx, 400, { error = "unknown middleware: " .. tostring(name) })
+                    return
+                end
+            end
+
+            -- Find the route in keyway.routes
+            local route_entry = keyway.routes[pattern]
+            if not route_entry or type(route_entry) ~= "table" then
+                response.json_response(ctx, 404, { error = "route not found: " .. pattern })
+                return
+            end
+
+            -- Resolve string names to functions and update in-memory route
+            local resolved = {}
+            for _, name in ipairs(body.middleware) do
+                resolved[#resolved + 1] = keyway.middleware.resolve(name)
+            end
+            route_entry.middleware = resolved
+
+            -- Clear mw_name cache so names re-resolve on next API call
+            _mw_name_cache = setmetatable({}, { __mode = "k" })
+
+            -- Best-effort Redis persistence (inside coroutine, so yields work)
+            pcall(function()
+                local redis = require("keyway.redis_ring")
+                -- Build full overrides map from current route state
+                local overrides = {}
+                each_static_route(function(p, methods, _, _)
+                    if methods.middleware and #methods.middleware > 0 then
+                        local names = {}
+                        for j, mw in ipairs(methods.middleware) do
+                            names[#names + 1] = mw_name(mw, j, "mw_")
+                        end
+                        overrides[p] = names
+                    end
+                end)
+                if keyway.routes.middleware then
+                    local global_names = {}
+                    for j, mw in ipairs(keyway.routes.middleware) do
+                        global_names[#global_names + 1] = mw_name(mw, j, "global_mw_")
+                    end
+                    overrides["__global"] = global_names
+                end
+                redis.set("keyway:mw:overrides", cjson.encode(overrides))
+            end)
+
+            response.json_response(ctx, 200, { ok = true, pattern = pattern })
+        end,
+    },
+
+    -- Update global middleware order
+    ["/__keyway/api/middleware/global"] = {
+        PUT = function(ctx)
+            local ok, body = pcall(cjson.decode, ctx.body)
+            if not ok or type(body.middleware) ~= "table" then
+                response.json_response(ctx, 400, { error = "JSON body with 'middleware' array required" })
+                return
+            end
+
+            -- Validate all middleware names exist in registry
+            for _, name in ipairs(body.middleware) do
+                if not keyway.middleware._registry[name] then
+                    response.json_response(ctx, 400, { error = "unknown middleware: " .. tostring(name) })
+                    return
+                end
+            end
+
+            -- Resolve string names to functions and update global middleware
+            local resolved = {}
+            for _, name in ipairs(body.middleware) do
+                resolved[#resolved + 1] = keyway.middleware.resolve(name)
+            end
+            keyway.routes.middleware = resolved
+
+            -- Clear mw_name cache
+            _mw_name_cache = setmetatable({}, { __mode = "k" })
+
+            response.json_response(ctx, 200, { ok = true })
+        end,
+    },
+
+    -- Sync: load overrides from Redis and apply to in-memory routes
+    ["/__keyway/api/middleware/sync"] = {
+        POST = function(ctx)
+            local ok_redis, redis = pcall(require, "keyway.redis_ring")
+            if not ok_redis then
+                response.json_response(ctx, 200, { synced = false, reason = "redis not available" })
+                return
+            end
+
+            local data, err = redis.get("keyway:mw:overrides")
+            if not data then
+                response.json_response(ctx, 200, { synced = false, reason = err or "no overrides saved" })
+                return
+            end
+
+            local ok_json, overrides = pcall(cjson.decode, data)
+            if not ok_json then
+                response.json_response(ctx, 200, { synced = false, reason = "invalid json in redis" })
+                return
+            end
+
+            local applied = 0
+
+            -- Apply global middleware
+            if overrides["__global"] then
+                local resolved = {}
+                local all_ok = true
+                for _, name in ipairs(overrides["__global"]) do
+                    local fn = keyway.middleware._registry[name]
+                    if fn then
+                        resolved[#resolved + 1] = fn
+                    else
+                        all_ok = false
+                    end
+                end
+                if all_ok and #resolved > 0 then
+                    keyway.routes.middleware = resolved
+                    applied = applied + 1
+                end
+            end
+
+            -- Apply per-route overrides
+            for pattern, names in pairs(overrides) do
+                if pattern ~= "__global" and keyway.routes[pattern] then
+                    local resolved = {}
+                    local all_ok = true
+                    for _, name in ipairs(names) do
+                        local fn = keyway.middleware._registry[name]
+                        if fn then
+                            resolved[#resolved + 1] = fn
+                        else
+                            all_ok = false
+                        end
+                    end
+                    if all_ok then
+                        keyway.routes[pattern].middleware = resolved
+                        applied = applied + 1
+                    end
+                end
+            end
+
+            -- Clear mw_name cache
+            _mw_name_cache = setmetatable({}, { __mode = "k" })
+
+            response.json_response(ctx, 200, { synced = true, applied = applied })
+        end,
+    },
+
+    -- ─── File Management API ────────────────────────────────────
+
+    -- List all .lua files in the script directory
+    ["/__keyway/api/files"] = {
+        GET = function(ctx)
+            local files = __keyway_file_list("scripts")
+            response.json_response(ctx, 200, { files = files or {} })
+        end,
+    },
+
+    -- Read a file
+    ["/__keyway/api/files/{path}"] = {
+        GET = function(ctx)
+            local decoded = url_decode(ctx.params.path)
+            local file_path = "scripts/" .. decoded
+            local content, err = __keyway_file_read(file_path)
+            if not content then
+                response.json_response(ctx, 404, { error = err or "not found" })
+                return
+            end
+            response.json_response(ctx, 200, { path = decoded, content = content })
         end,
         PUT = function(ctx)
-            local body, err = response.parse_json_body(ctx)
-            if not body then return end
-            local script = scripts_store.update(ctx.params.id, body)
-            if not script then
-                response.json_not_found(ctx)
-                return
-            end
-            -- Reload dispatch if script is enabled
-            if script.enabled then dispatch.reload() end
-            response.json_response(ctx, 200, { script = script })
-        end,
-        DELETE = function(ctx)
-            local ok = scripts_store.delete(ctx.params.id)
-            if not ok then
-                response.json_not_found(ctx)
-                return
-            end
-            dispatch.reload()
-            response.json_response(ctx, 200, { ok = true })
-        end,
-    },
-
-    ["/__keyway/api/scripts/{id}/toggle"] = {
-        POST = function(ctx)
-            local script = scripts_store.toggle(ctx.params.id)
-            if not script then
-                response.json_not_found(ctx)
-                return
-            end
-            dispatch.reload()
-            -- Broadcast reload signal to all workers
-            pcall(response.broadcast_event, "keyway:scripts", { action = "reload" })
-            response.json_response(ctx, 200, { script = script })
-        end,
-    },
-
-    ["/__keyway/api/scripts/{id}/trigger"] = {
-        POST = function(ctx)
-            local script = scripts_store.get(ctx.params.id)
-            if not script then
-                response.json_not_found(ctx)
-                return
-            end
-            if not script.enabled then
-                scripts_store.toggle(ctx.params.id)
-                dispatch.reload()
-                pcall(response.broadcast_event, "keyway:scripts", { action = "reload" })
-            end
-            response.json_response(ctx, 200, { script = scripts_store.get(ctx.params.id), triggered = true })
-        end,
-    },
-
-    ["/__keyway/api/scripts/{id}/test"] = {
-        POST = function(ctx)
-            local script = scripts_store.get(ctx.params.id)
-            if not script then
-                response.json_not_found(ctx)
-                return
-            end
-            local fn, err = scripts_store.compile(script.code)
-            if not fn then
-                response.json_response(ctx, 200, { error = err })
-                return
-            end
-            -- Build mock context from request body
             local ok, body = pcall(cjson.decode, ctx.body)
-            local mock_ctx = {
-                method = (ok and body.method) or "GET",
-                path = (ok and body.path) or script.pattern,
-                body = (ok and body.body) or "",
-                status = 200,
-                headers = {},
-                request_headers = {},
-                params = {},
-            }
-            local next_called = false
-            local t0 = response.now_us()
-            local function err_handler(e) return debug.traceback(tostring(e), 2) end
-            local run_ok, run_err
-            if script.type == "middleware" then
-                run_ok, run_err = xpcall(fn, err_handler, mock_ctx, function() next_called = true end)
-            else
-                run_ok, run_err = xpcall(fn, err_handler, mock_ctx)
-            end
-            local elapsed = math.floor(response.now_us() - t0)
-            response.json_response(ctx, 200, {
-                success = run_ok,
-                error = run_ok and nil or run_err,
-                result = {
-                    status = mock_ctx.status,
-                    body = mock_ctx.body,
-                    headers = mock_ctx.headers,
-                    next_called = next_called,
-                },
-                timing_us = elapsed,
-            })
-        end,
-    },
-
-    -- ─── Hooks API ───────────────────────────────────────────────
-
-    ["/__keyway/api/hooks"] = {
-        GET = function(ctx)
-            response.json_response(ctx, 200, { hooks = hooks_store.list() })
-        end,
-        POST = function(ctx)
-            local hook = hooks_store.create()
-            response.json_response(ctx, 201, { hook = hook })
-        end,
-    },
-
-    ["/__keyway/api/hooks/{id}"] = {
-        GET = function(ctx)
-            local hook = hooks_store.get(ctx.params.id)
-            if not hook then
-                response.json_not_found(ctx)
+            if not ok or not body.content then
+                response.json_response(ctx, 400, { error = "JSON body with 'content' field required" })
                 return
             end
-            response.json_response(ctx, 200, {
-                hook = { id = hook.id, name = hook.name, created_at = hook.created_at, request_count = #hook.requests },
-                requests = hook.requests,
-            })
+            local decoded = url_decode(ctx.params.path)
+            local file_path = "scripts/" .. decoded
+            local success, err = __keyway_file_write(file_path, body.content)
+            if not success then
+                response.json_response(ctx, 500, { error = err or "write failed" })
+                return
+            end
+            response.json_response(ctx, 200, { path = decoded, ok = true })
         end,
         DELETE = function(ctx)
-            local ok = hooks_store.delete(ctx.params.id)
-            if not ok then
-                response.json_not_found(ctx)
+            local decoded = url_decode(ctx.params.path)
+            local file_path = "scripts/" .. decoded
+            local success, err = __keyway_file_delete(file_path)
+            if not success then
+                response.json_response(ctx, 404, { error = err or "not found" })
                 return
             end
             response.json_response(ctx, 200, { ok = true })
         end,
     },
 
-    ["/__keyway/api/hooks/{id}/events"] = {
-        GET = function(ctx)
-            ctx.upgrade = "sse"
-            ctx.sse_room = "hook:" .. ctx.params.id
+    -- Toggle file enabled/disabled (.lua <-> .lua.disabled)
+    ["/__keyway/api/files/{path}/toggle"] = {
+        POST = function(ctx)
+            local decoded = url_decode(ctx.params.path)
+            local file_path = "scripts/" .. decoded
+            local new_path
+            if decoded:match("%.lua%.disabled$") then
+                new_path = "scripts/" .. decoded:gsub("%.disabled$", "")
+            elseif decoded:match("%.lua$") then
+                new_path = file_path .. ".disabled"
+            else
+                response.json_response(ctx, 400, { error = "not a .lua file" })
+                return
+            end
+            local ok, err = __keyway_file_rename(file_path, new_path)
+            if not ok then
+                response.json_response(ctx, 500, { error = err or "rename failed" })
+                return
+            end
+            -- Compute new relative path
+            local new_rel = new_path:gsub("^scripts/", "")
+            response.json_response(ctx, 200, { ok = true, path = new_rel })
         end,
-    },
-
-    -- Webhook catch endpoint — captures any request to /h/{id}
-    ["/h/{id}"] = {
-        GET = function(ctx) M_capture_hook(ctx) end,
-        POST = function(ctx) M_capture_hook(ctx) end,
-        PUT = function(ctx) M_capture_hook(ctx) end,
-        DELETE = function(ctx) M_capture_hook(ctx) end,
     },
 
     -- ─── Integration Test Endpoints ──────────────────────────────
@@ -824,30 +706,3 @@ keyway.routes = {
         end,
     },
 }
-
--- ─── Webhook Capture Helper ──────────────────────────────────────────
-
-function M_capture_hook(ctx)
-    local id = ctx.params.id
-    if not hooks_store.exists(id) then
-        response.json_response(ctx, 404, { error = "hook not found" })
-        return
-    end
-    -- Tag for access_log_middleware to pick up
-    ctx._hook_id = id
-    local headers = {}
-    if ctx.request_headers then
-        for _, h in ipairs(ctx.request_headers) do
-            headers[h[1]] = h[2]
-        end
-    end
-    hooks_store.capture(id, {
-        method = ctx.method or "GET",
-        path = ctx.path or "",
-        headers = headers,
-        body = ctx.body or "",
-    })
-    ctx.status = 200
-    ctx.headers["Content-Type"] = "application/json"
-    ctx.body = '{"captured":true}'
-end

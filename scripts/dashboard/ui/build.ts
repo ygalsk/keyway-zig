@@ -23,6 +23,7 @@ const solidPlugin: import("bun").BunPlugin = {
 const result = await Bun.build({
   entrypoints: ["src/main.tsx"],
   outdir: "../public",
+  format: "iife",
   minify: true,
   sourcemap: "external",
   naming: "[name].js",
