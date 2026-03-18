@@ -68,6 +68,25 @@ pub const ConnectionPool = struct {
         return null;
     }
 
+    /// Sweep all pools, closing expired entries. Called periodically by the worker timer.
+    pub fn sweep(self: *ConnectionPool) void {
+        const now = std.time.milliTimestamp();
+        var it = self.pools.iterator();
+        while (it.next()) |entry| {
+            const pool = entry.value_ptr;
+            // Walk backward so we can swap-remove without invalidating indices
+            var i: usize = pool.entries.items.len;
+            while (i > 0) {
+                i -= 1;
+                const pe = pool.entries.items[i];
+                if (@max(0, now - pe.inserted_at_ms) > @as(i64, pool.max_idle_ms)) {
+                    std.posix.close(pe.fd);
+                    _ = pool.entries.swapRemove(i);
+                }
+            }
+        }
+    }
+
     /// Return a connection to the pool. Closes the fd if pool is full.
     /// timeout_ms == 0 means use DEFAULT_IDLE_TIMEOUT_MS.
     /// max_size == 0 means use DEFAULT_POOL_SIZE.

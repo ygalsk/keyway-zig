@@ -13,12 +13,18 @@ const Lua = @import("luajit").Lua;
 const lua_api = @import("lua_api.zig");
 const tls_mod = @import("tls.zig");
 const TlsConn = tls_mod.TlsConn;
+const config = @import("config.zig");
 
 /// WebSocket connection state — set after successful 101 upgrade.
-/// Stores Lua callback refs for the duration of the WS connection.
+/// Stores Lua callback refs and reassembly buffer for fragmented messages.
 pub const WsState = struct {
     on_message_ref: i32,
     on_close_ref: i32,
+    /// Reassembly buffer for fragmented messages (continuation frames).
+    /// Null when no fragmented message is in progress.
+    fragment_buf: ?std.ArrayListUnmanaged(u8) = null,
+    /// Original opcode of the first fragment (text or binary).
+    fragment_opcode: ws.Opcode = .text,
 };
 
 /// Validate upgrade request, build 101 response, store WsState, send it.
@@ -173,38 +179,79 @@ pub fn processWsFrames(conn: *Connection) void {
             .frame => |f| {
                 log.debug().string("msg", "ws got frame").int("opcode", @intFromEnum(f.frame.opcode)).int("payload_len", f.frame.payload.len).int("consumed", f.consumed).log();
                 conn.read_buffer.consume(f.consumed);
+                const wss = &conn.ws_state.?;
 
-                // v1: single-frame messages only
-                if (!f.frame.fin) {
-                    log.err().string("msg", "ws continuation frame, closing 1003").log();
-                    // Continuation frames not supported — close 1003
-                    sendWsClose(conn, 1003);
-                    return;
-                }
-
+                // Handle control frames immediately (RFC 6455 §5.5):
+                // control frames can be interleaved during fragmentation
                 switch (f.frame.opcode) {
-                    .text, .binary => {
-                        log.debug().string("msg", "ws dispatching text/binary message").log();
-                        dispatchWsMessage(conn, f.frame.payload);
-                        return; // dispatchWsMessage will call startWsRead when done
-                    },
                     .ping => {
-                        // Auto-pong
                         sendWsFrame(conn, .pong, f.frame.payload);
+                        continue;
                     },
-                    .pong => {
-                        // Ignore unsolicited pongs
-                    },
+                    .pong => continue,
                     .close => {
-                        // Echo close frame back, fire on_close callback, disconnect
                         handleWsClose(conn, f.frame.payload);
                         return;
                     },
-                    else => {
-                        // Unknown opcode — close 1002
+                    else => {},
+                }
+
+                // Data frames: handle fragmentation (RFC 6455 §5.4)
+                if (f.frame.opcode == .text or f.frame.opcode == .binary) {
+                    if (f.frame.fin) {
+                        // Single-frame message (common case)
+                        if (wss.fragment_buf != null) {
+                            // Protocol error: new message while fragmented message in progress
+                            sendWsClose(conn, 1002);
+                            return;
+                        }
+                        dispatchWsMessage(conn, f.frame.payload);
+                        return;
+                    }
+                    // First fragment of a multi-frame message
+                    if (wss.fragment_buf != null) {
+                        sendWsClose(conn, 1002); // already in a fragmented message
+                        return;
+                    }
+                    wss.fragment_opcode = f.frame.opcode;
+                    const alloc = conn.arena.allocator();
+                    var buf = std.ArrayListUnmanaged(u8){};
+                    buf.appendSlice(alloc, f.frame.payload) catch {
+                        sendWsClose(conn, 1011);
+                        return;
+                    };
+                    wss.fragment_buf = buf;
+                } else if (f.frame.opcode == .continuation) {
+                    var fb = wss.fragment_buf orelse {
+                        // Continuation without a starting fragment
                         sendWsClose(conn, 1002);
                         return;
-                    },
+                    };
+                    // Check reassembled size limit
+                    if (fb.items.len + f.frame.payload.len > config.WS_MAX_MESSAGE_SIZE) {
+                        fb.deinit(conn.arena.allocator());
+                        wss.fragment_buf = null;
+                        sendWsClose(conn, 1009); // message too big
+                        return;
+                    }
+                    fb.appendSlice(conn.arena.allocator(), f.frame.payload) catch {
+                        fb.deinit(conn.arena.allocator());
+                        wss.fragment_buf = null;
+                        sendWsClose(conn, 1011);
+                        return;
+                    };
+                    wss.fragment_buf = fb;
+                    if (f.frame.fin) {
+                        // Final fragment — dispatch the reassembled message
+                        const payload = fb.items;
+                        wss.fragment_buf = null;
+                        dispatchWsMessage(conn, payload);
+                        return;
+                    }
+                } else {
+                    // Unknown data opcode
+                    sendWsClose(conn, 1002);
+                    return;
                 }
             },
         }

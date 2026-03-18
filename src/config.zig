@@ -17,7 +17,7 @@ pub const LARGE_RESPONSE_THRESHOLD = 1024 * 1024;
 pub const MAX_ROUTE_PARAMS = 4;
 
 /// Maximum query string parameters per request.
-pub const MAX_QUERY_PARAMS = 4;
+pub const MAX_QUERY_PARAMS = 16;
 
 /// Submission/completion ring depth for batched cosocket I/O.
 pub const RING_DEPTH = 16;
@@ -52,6 +52,9 @@ pub const MAX_CONNECTIONS_PER_WORKER: u32 = 10_000;
 /// Timeout for receiving complete HTTP headers (ms). Protects against slowloris attacks.
 pub const HEADER_TIMEOUT_MS: u64 = 10_000;
 
+/// Maximum reassembled WebSocket message size (fragmented messages). 1 MB.
+pub const WS_MAX_MESSAGE_SIZE: usize = 1_048_576;
+
 /// Read buffer size for static file pread+send loop.
 pub const STATIC_READ_SIZE: usize = 65536;
 
@@ -70,8 +73,8 @@ comptime {
     // Param limits sanity check
     if (MAX_ROUTE_PARAMS > 8)
         @compileError("MAX_ROUTE_PARAMS must be <= 8");
-    if (MAX_QUERY_PARAMS > 8)
-        @compileError("MAX_QUERY_PARAMS must be <= 8");
+    if (MAX_QUERY_PARAMS > 32)
+        @compileError("MAX_QUERY_PARAMS must be <= 32");
     // Production safety constants
     if (REQUEST_TIMEOUT_MS == 0)
         @compileError("REQUEST_TIMEOUT_MS must be > 0");

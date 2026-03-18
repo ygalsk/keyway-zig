@@ -27,6 +27,7 @@ pub const Server = struct {
     address: std.net.Address,
     accept_completion: xev.Completion,
     accept_cancel_completion: xev.Completion = .{},
+    pool_sweep_completion: xev.Completion = undefined,
     coordinator: ?*ShutdownCoordinator = null,
     reload_coordinator: ?*@import("reload.zig").ReloadCoordinator = null,
     worker_id: usize = 0,
@@ -147,9 +148,30 @@ pub const Server = struct {
         };
     }
 
-    /// Start accepting connections
+    /// Start accepting connections and periodic housekeeping
     pub fn start(self: *Server) !void {
         self.acceptNext();
+        self.startPoolSweepTimer();
+    }
+
+    /// Periodic connection pool sweep — close idle connections that have exceeded
+    /// their max_idle_ms. Runs every 60s per-worker (no cross-worker coordination).
+    fn startPoolSweepTimer(self: *Server) void {
+        self.loop.timer(&self.pool_sweep_completion, 60_000, self, onPoolSweep);
+    }
+
+    fn onPoolSweep(
+        userdata: ?*anyopaque,
+        _: *xev.Loop,
+        _: *xev.Completion,
+        _: xev.Result,
+    ) xev.CallbackAction {
+        const self = castUserdata(Server, userdata);
+        if (self.draining) return .disarm;
+        self.lua_state.pool.sweep();
+        // Re-arm for next sweep
+        self.startPoolSweepTimer();
+        return .disarm;
     }
 
     fn acceptNext(self: *Server) void {

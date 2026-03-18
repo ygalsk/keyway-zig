@@ -138,6 +138,8 @@ pub const ClientTlsContext = struct {
             }
             c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_PEER, null);
         } else {
+            // Insecure mode: skip certificate verification (man-in-the-middle risk)
+            log.warn().string("msg", "TLS certificate verification disabled (SSL_VERIFY_NONE)").log();
             c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_NONE, null);
         }
 

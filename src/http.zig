@@ -222,6 +222,43 @@ pub const Parser = struct {
             }
         }
 
+        // Check for Transfer-Encoding: chunked (mutually exclusive with Content-Length)
+        var is_chunked = false;
+        if (content_length == 0) {
+            for (0..num_headers) |i| {
+                const h = c_headers[i];
+                const name = h.name[0..h.name_len];
+                if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+                    const val = h.value[0..h.value_len];
+                    if (std.ascii.indexOfIgnoreCase(val, "chunked") != null) {
+                        is_chunked = true;
+                        break;
+                    }
+                }
+            }
+        }
+
+        if (is_chunked) {
+            // Decode chunked body: hex-size\r\n + data\r\n + ... + 0\r\n\r\n
+            const chunk_data = buf[bytes_consumed..];
+            const decoded = decodeChunkedBody(chunk_data, self.allocator) catch |err| {
+                if (err == error.Incomplete) {
+                    self.allocator.free(headers);
+                    return error.Incomplete;
+                }
+                self.allocator.free(headers);
+                return error.InvalidRequest;
+            };
+            return Request{
+                .method = method,
+                .path = path,
+                .version = @as(u8, @intCast(minor_version)),
+                .headers = headers,
+                .body = decoded.body,
+                .raw_len = bytes_consumed + decoded.total_consumed,
+            };
+        }
+
         const total_needed = bytes_consumed + content_length;
         if (buf.len < total_needed) {
             // Body not fully received yet — need more data
@@ -360,6 +397,49 @@ pub fn encodeChunk(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
 /// Terminal chunk for chunked transfer encoding.
 pub const terminal_chunk = "0\r\n\r\n";
 
+/// Result of decoding a chunked transfer-encoded body.
+const ChunkedResult = struct {
+    body: []const u8,
+    total_consumed: usize,
+};
+
+/// Decode a chunked transfer-encoded body.
+/// Returns the reassembled body (arena-allocated) and total bytes consumed.
+/// Returns error.Incomplete if the terminal chunk hasn't been received yet.
+fn decodeChunkedBody(data: []const u8, allocator: std.mem.Allocator) !ChunkedResult {
+    var body_buf = std.ArrayListUnmanaged(u8){};
+    errdefer body_buf.deinit(allocator);
+    var pos: usize = 0;
+
+    while (pos < data.len) {
+        // Find end of chunk-size line
+        const crlf_pos = std.mem.indexOf(u8, data[pos..], "\r\n") orelse return error.Incomplete;
+        const size_str = std.mem.trim(u8, data[pos .. pos + crlf_pos], " \t");
+        // Strip chunk extensions (everything after ';')
+        const pure_size = if (std.mem.indexOfScalar(u8, size_str, ';')) |semi| size_str[0..semi] else size_str;
+        const chunk_size = std.fmt.parseInt(usize, pure_size, 16) catch return error.InvalidRequest;
+        pos += crlf_pos + 2; // skip past size line + CRLF
+
+        if (chunk_size == 0) {
+            // Terminal chunk — skip trailing CRLF
+            if (pos + 2 > data.len) return error.Incomplete;
+            pos += 2;
+            return .{
+                .body = body_buf.toOwnedSlice(allocator) catch return error.InvalidRequest,
+                .total_consumed = pos,
+            };
+        }
+
+        // Ensure full chunk data + trailing CRLF is available
+        if (pos + chunk_size + 2 > data.len) return error.Incomplete;
+
+        try body_buf.appendSlice(allocator, data[pos .. pos + chunk_size]);
+        pos += chunk_size + 2; // skip data + CRLF
+    }
+
+    return error.Incomplete;
+}
+
 /// Extract Content-Length from parsed request headers.
 /// Returns null if header is missing or value is malformed.
 pub fn getContentLength(request: *const Request) ?u64 {
@@ -442,6 +522,31 @@ test "encodeChunk with larger data" {
     defer allocator.free(chunk);
     try std.testing.expect(std.mem.startsWith(u8, chunk, "100\r\n")); // 256 = 0x100
     try std.testing.expect(std.mem.endsWith(u8, chunk, "\r\n"));
+}
+
+test "decodeChunkedBody decodes simple chunked body" {
+    const allocator = std.testing.allocator;
+    // "5\r\nHello\r\n6\r\n World\r\n0\r\n\r\n"
+    const data = "5\r\nHello\r\n6\r\n World\r\n0\r\n\r\n";
+    const result = try decodeChunkedBody(data, allocator);
+    defer allocator.free(result.body);
+    try std.testing.expectEqualStrings("Hello World", result.body);
+    try std.testing.expectEqual(data.len, result.total_consumed);
+}
+
+test "decodeChunkedBody returns Incomplete for partial data" {
+    const allocator = std.testing.allocator;
+    const data = "5\r\nHel";
+    try std.testing.expectError(error.Incomplete, decodeChunkedBody(data, allocator));
+}
+
+test "decodeChunkedBody handles hex sizes" {
+    const allocator = std.testing.allocator;
+    // 0xa = 10 bytes
+    const data = "a\r\n0123456789\r\n0\r\n\r\n";
+    const result = try decodeChunkedBody(data, allocator);
+    defer allocator.free(result.body);
+    try std.testing.expectEqualStrings("0123456789", result.body);
 }
 
 test "serializeChunkedHeaders omits Content-Length" {

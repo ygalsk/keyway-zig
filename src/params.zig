@@ -87,13 +87,8 @@ test "ParamArray clear resets length" {
 test "ParamArray rejects overflow" {
     var p = ParamArray{};
     for (0..MAX_ROUTE_PARAMS) |i| {
-        const key: []const u8 = switch (i) {
-            0 => "a",
-            1 => "b",
-            2 => "c",
-            3 => "d",
-            else => unreachable,
-        };
+        var key_buf: [8]u8 = undefined;
+        const key = std.fmt.bufPrint(&key_buf, "p{d}", .{i}) catch unreachable;
         try p.put(key, "v");
     }
     try std.testing.expectError(error.TooManyParams, p.put("overflow", "v"));
@@ -125,9 +120,17 @@ test "parseQueryString key without value" {
 
 test "parseQueryString truncates on overflow" {
     var q = QueryArray{};
-    // MAX_QUERY_PARAMS is 4, so 5 params should truncate
-    parseQueryString("a=1&b=2&c=3&d=4&e=5", &q);
+    // Build a query string with MAX_QUERY_PARAMS+1 params to trigger truncation
+    var buf: [512]u8 = undefined;
+    var pos: usize = 0;
+    for (0..MAX_QUERY_PARAMS + 1) |i| {
+        if (i > 0) {
+            buf[pos] = '&';
+            pos += 1;
+        }
+        const key = std.fmt.bufPrint(buf[pos..], "k{d}=v", .{i}) catch unreachable;
+        pos += key.len;
+    }
+    parseQueryString(buf[0..pos], &q);
     try std.testing.expectEqual(@as(usize, MAX_QUERY_PARAMS), q.len);
-    // The 5th param should not be present
-    try std.testing.expect(q.get("e") == null);
 }

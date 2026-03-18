@@ -11,8 +11,9 @@ Keyway is a programmable HTTP engine where Zig owns the execution engine and Lua
 ## Example
 
 ```lua
+local response = require("keyway.response")
+
 keyway.routes = {
-    -- Middleware runs on every request
     middleware = {
         function(ctx, next)
             request_count = request_count + 1
@@ -29,10 +30,37 @@ keyway.routes = {
 
     ["/users/{id}"] = {
         GET = function(ctx)
-            local user_id = ctx.params.id
+            response.json_response(ctx, 200, {
+                id = ctx.params.id,
+                status = "active",
+            })
+        end,
+    },
+
+    ["/events"] = {
+        GET = function(ctx)
+            ctx.upgrade = "sse"
+            ctx.sse_room = "updates"
+        end,
+    },
+
+    ["/ws"] = {
+        GET = function(ctx)
+            ctx.upgrade = "websocket"
+            ctx.on_message = function(ws)
+                ws:send(ws.message)
+            end
+            ctx.on_close = function() end
+        end,
+    },
+
+    ["/stream"] = {
+        GET = function(ctx)
+            ctx.upgrade = "stream"
             ctx.status = 200
-            ctx.headers["Content-Type"] = "application/json"
-            ctx.body = '{"id": ' .. user_id .. ', "status": "active"}'
+            ctx.body = "chunk 1\n"
+            coroutine.yield()
+            ctx.body = "chunk 2\n"
         end,
     },
 }
@@ -42,25 +70,124 @@ No `send()`, no `write()`, no lifecycle calls — only state assignment. Zig com
 
 ## Features
 
-- **Per-core isolation**: one worker thread, one Lua state, one event loop per CPU core — no locks
-- **Cosockets**: non-blocking outbound TCP (e.g. Redis, PostgreSQL) via coroutine yield/resume with connection pooling
-- **Middleware**: global and per-route middleware chains with short-circuit support
-- **Zero-copy parsing**: picohttpparser FFI produces slices into the read buffer
-- **Radix router**: O(path-length) route matching with `{param}` support, zero allocations
+- **Per-core isolation** — one worker thread, one Lua state, one event loop per CPU core. No locks.
+- **Cosockets** — non-blocking outbound TCP (Redis, PostgreSQL, etc.) via coroutine yield/resume with per-worker connection pooling.
+- **WebSocket** — upgrade via `ctx.upgrade = "websocket"`, frame encoding/decoding handled by Zig.
+- **SSE** — upgrade via `ctx.upgrade = "sse"`, cross-worker broadcast via `SseBroadcastBus`.
+- **Chunked streaming** — `ctx.upgrade = "stream"` with `coroutine.yield()` to flush chunks.
+- **TLS** — OpenSSL userspace handshake + optional kTLS kernel offload for the data path.
+- **Radix router** — O(path-length) trie with `{param}` support, zero allocations per match.
+- **Middleware** — global and per-route chains with short-circuit support.
+- **Zero-copy parsing** — picohttpparser produces slices into the read buffer. No copies.
+- **Hot reload** — `--watch` monitors `.lua` files and reloads without dropping connections.
+- **Static file serving** — Zig-native with ETag/Last-Modified caching, short-circuits before Lua.
+- **Built-in dashboard** — Solid.js control plane at `/__keyway/dashboard`.
+- **Prometheus metrics** — `/metrics` endpoint with request latency, connection gauges, Lua execution histograms.
+- **eBPF** — optional `SO_REUSEPORT` connection affinity via classic BPF.
 
 ## Build
 
 ```bash
 zig build          # Build the keyway binary
-zig build run      # Build and run the server (listens on 0.0.0.0:8080)
+zig build run      # Build and run the server
 zig build test     # Run all unit tests
 ```
 
 Requires Zig 0.15.0+. Dependencies (libxev, zig-luajit) are fetched automatically via `build.zig.zon`.
 
+## Configuration
+
+All flags have environment variable equivalents. CLI args take precedence over env vars.
+
+| Flag | Env | Default | Description |
+|---|---|---|---|
+| `--host <addr>` | `KEYWAY_HOST` | `0.0.0.0` | Bind address |
+| `--port <port>` | `KEYWAY_PORT` | `8080` | Listen port |
+| `--workers <n>` | `KEYWAY_WORKERS` | `0` (auto) | Worker threads (0 = CPU count) |
+| `--script <path>` | `KEYWAY_SCRIPT` | `keyway.lua` | Lua entry script |
+| `--tls-cert <path>` | `KEYWAY_TLS_CERT` | — | TLS certificate file |
+| `--tls-key <path>` | `KEYWAY_TLS_KEY` | — | TLS private key file |
+| `--log-level <lvl>` | `KEYWAY_LOG_LEVEL` | `info` | `err`, `warn`, `info`, `debug` |
+| `--log-format <fmt>` | `KEYWAY_LOG_FORMAT` | `logfmt` | `logfmt`, `json` |
+| `--enable-bpf` | `KEYWAY_ENABLE_BPF` | off | Enable eBPF connection affinity |
+| `--watch` | `KEYWAY_WATCH` | off | Hot-reload on `.lua` file changes |
+
+## Dashboard
+
+Keyway ships a built-in Solid.js dashboard at `/__keyway/dashboard`. It provides:
+
+- Real-time event stream via SSE
+- Route and middleware inspection
+- Lua file editor (read/write/delete)
+- HTTP probe tool and DNS lookup
+- Embedded Grafana view
+
+Access is restricted to localhost (`127.0.0.1` / `::1`). Manual reload: `POST /__keyway/reload`.
+
+## Lua API
+
+### ctx fields
+
+**Read:** `ctx.method`, `ctx.path`, `ctx.body`, `ctx.params.id`, `ctx.query.name`, `ctx.headers["Key"]`, `ctx.request_headers`, `ctx.remote_addr`
+
+**Write:** `ctx.status`, `ctx.body`, `ctx.headers["Key"]`, `ctx.upgrade`, `ctx.sse_room`, `ctx.on_message`, `ctx.on_close`
+
+### Protocol upgrades
+
+| Protocol | Directive | Notes |
+|---|---|---|
+| WebSocket | `ctx.upgrade = "websocket"` | Set `ctx.on_message` and `ctx.on_close` |
+| SSE | `ctx.upgrade = "sse"` | Set `ctx.sse_room` for room-based broadcast |
+| Streaming | `ctx.upgrade = "stream"` | `coroutine.yield()` flushes each chunk |
+
+### Stdlib modules
+
+| Module | Purpose |
+|---|---|
+| `keyway.response` | `json_response`, `get_header`, `broadcast_event`, `broadcast_html`, `now_us` |
+| `keyway.socket` | LuaSocket-compatible TCP — `connect`, `send`, `receive`, `setkeepalive` |
+| `keyway.ring` | Batched I/O ring — submit multiple ops, yield once |
+| `keyway.dns` | DNS A-record lookup, `resolve_host` via FFI getaddrinfo |
+| `keyway.http_client` | Outbound HTTP (`probe`, `post`) with SSRF protection |
+| `keyway.form` | Form data parsing |
+
+## Observability
+
+Keyway exposes Prometheus metrics at `/metrics` (text exposition format).
+
+Key metrics:
+- `keyway_http_requests_total` — counter by worker, method, status, route
+- `keyway_http_request_duration_seconds` — latency histogram
+- `keyway_connections_active` — per-worker gauge
+- `keyway_lua_coroutines_active` — per-worker gauge
+- `keyway_lua_script_duration_seconds` — Lua execution histogram
+
+A docker-compose stack for Prometheus + Grafana is included:
+
+```bash
+cd observability && docker compose up -d
+# Prometheus: http://localhost:9090
+# Grafana:    http://localhost:3000
+```
+
+## Testing
+
+```bash
+# Zig unit tests (embedded in source files)
+zig build test
+
+# Integration tests (requires bun, starts server automatically)
+bun test
+
+# CI / agent mode — bail on first failure
+CLAUDECODE=1 bun test --bail --timeout 10000
+```
+
+Integration tests use native `fetch`, `WebSocket`, and `EventSource` against a real server instance. Test suites cover routing, headers, body handling, streaming, WebSocket, SSE, and the dashboard API.
+
 ## Architecture
 
-See [MANIFEST.md](MANIFEST.md) for the full architecture manifesto.
+See [MANIFEST.md](MANIFEST.md) for the full architecture contract.
 
 ## References
 

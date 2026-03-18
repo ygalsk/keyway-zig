@@ -59,7 +59,7 @@ pub const LuaState = struct {
     cached_thread_ref: i32 = 0,
 
     // Cosocket: pending I/O intent written by C yield functions, read by Zig after LUA_YIELD.
-    // Safe because: written by C yield functions during lua_resume, read by submitOutboundIO
+    // Safe because: written by C yield functions during lua_resume, read by dispatchIo
     // in the same stack frame. libxev is single-threaded per worker — no concurrent access.
     pending_io: ?IoEntry = null,
 

@@ -89,15 +89,40 @@ pub const TlsState = struct {
 };
 
 /// Outbound cosocket I/O state — submission/completion rings and batch buffers.
-/// Inline on Connection (heap-allocated, never moves) so xev completions
-/// stored in batch_completions have stable addresses.
+/// batch_completions/batch_recv_bufs are lazy-allocated on first cosocket use
+/// via base_allocator (stable heap addresses for xev callbacks). Connections
+/// that never use cosocket I/O pay zero memory for these arrays.
 pub const CosocketState = struct {
     sq: ring.SubmissionRing = .{},
     cq: ring.CompletionRing = .{},
     pending_completions: u8 = 0,
-    batch_completions: [ring.SubmissionRing.MAX_DEPTH]xev.Completion = undefined,
-    batch_recv_bufs: [ring.SubmissionRing.MAX_DEPTH]?[]u8 = .{null} ** ring.SubmissionRing.MAX_DEPTH,
+    batch_completions: ?*[ring.SubmissionRing.MAX_DEPTH]xev.Completion = null,
+    batch_recv_bufs: ?*[ring.SubmissionRing.MAX_DEPTH]?[]u8 = null,
     suspended: ?SuspendedState = null,
+    /// True when a single-shot pending_io was converted to a degenerate SQ entry.
+    /// On completion, results are pushed to the Lua stack (legacy API) instead of
+    /// being left in the CQ for ring_result() reads.
+    single_shot_mode: bool = false,
+
+    /// Ensure batch arrays are allocated. Called at the start of drainSubmissionRing.
+    /// Returns false on allocation failure.
+    pub fn ensureBatchArrays(self: *CosocketState, allocator: std.mem.Allocator) bool {
+        if (self.batch_completions == null) {
+            self.batch_completions = allocator.create([ring.SubmissionRing.MAX_DEPTH]xev.Completion) catch return false;
+        }
+        if (self.batch_recv_bufs == null) {
+            self.batch_recv_bufs = allocator.create([ring.SubmissionRing.MAX_DEPTH]?[]u8) catch return false;
+            self.batch_recv_bufs.?.* = .{null} ** ring.SubmissionRing.MAX_DEPTH;
+        }
+        return true;
+    }
+
+    pub fn deinitBatchArrays(self: *CosocketState, allocator: std.mem.Allocator) void {
+        if (self.batch_completions) |bc| allocator.destroy(bc);
+        if (self.batch_recv_bufs) |br| allocator.destroy(br);
+        self.batch_completions = null;
+        self.batch_recv_bufs = null;
+    }
 };
 
 /// Connection handler - manages HTTP request/response lifecycle
@@ -261,18 +286,23 @@ pub const Connection = struct {
         // Remove from server's connection tracking list
         self.server.connections.remove(&self.link);
         // Clean up suspended coroutine state if connection closes mid-I/O
-        if (self.cs.suspended) |s| {
+        if (self.cs.suspended) |*s| {
             // Unref pinned coroutine to prevent Lua registry leak
             if (s.coroutine_ref != 0) {
                 self.lua_state.lua.unref(Lua.PseudoIndex.Registry, s.coroutine_ref);
             }
             // Close leaked outbound fd
             if (s.outbound_fd != -1) std.posix.close(s.outbound_fd);
+            // Free outbound TLS state if mid-handshake (#21)
+            s.cleanupTls(self.base_allocator);
         }
-        // Clean up WebSocket callback refs
-        if (self.ws_state) |wss| {
+        // Clean up lazy-allocated cosocket batch arrays
+        self.cs.deinitBatchArrays(self.base_allocator);
+        // Clean up WebSocket callback refs and reassembly buffer
+        if (self.ws_state) |*wss| {
             if (wss.on_message_ref != 0) self.lua_state.lua.unref(Lua.PseudoIndex.Registry, wss.on_message_ref);
             if (wss.on_close_ref != 0) self.lua_state.lua.unref(Lua.PseudoIndex.Registry, wss.on_close_ref);
+            if (wss.fragment_buf) |*fb| fb.deinit(self.arena.allocator());
         }
         // Clean up SSE state
         if (self.sse_state) |*ss| ss.deinit(self);
@@ -1016,6 +1046,7 @@ pub const Connection = struct {
         self.cs.sq.reset();
         self.cs.cq.reset();
         self.cs.pending_completions = 0;
+        self.cs.single_shot_mode = false;
         // Shrink arena if response was large to prevent unbounded growth
         // on keep-alive connections that occasionally serve large responses.
         if (bytes_written > LARGE_RESPONSE_THRESHOLD) {

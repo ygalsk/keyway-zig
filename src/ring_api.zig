@@ -42,7 +42,7 @@ pub fn keyway_ring_push(lua: *Lua) callconv(.c) c_int {
             return 0;
         },
         error.RingFull => {
-            lua.pushString("ring_push: ring full");
+            lua.pushString("ring_push: ring full (max 16 ops per batch, call ring_submit between batches)");
             lua.raiseError();
             return 0;
         },
