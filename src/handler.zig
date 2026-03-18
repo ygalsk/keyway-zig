@@ -669,6 +669,18 @@ pub const Connection = struct {
             return null;
         }
 
+        // Reload endpoint: POST /__keyway/reload triggers hot-reload on all workers
+        if (std.mem.eql(u8, clean_path, "/__keyway/reload") and std.mem.eql(u8, request.method, "POST")) {
+            self.serveReload(self.arena.allocator());
+            return null;
+        }
+
+        // Reverse proxy routes: forward matching prefixes to upstream servers
+        if (self.router.matchProxy(clean_path)) |proxy_match| {
+            self.proxyRequest(request, proxy_match, self.arena.allocator());
+            return null;
+        }
+
         // Static file routes: handled before Lua routing (zero Lua overhead)
         if (self.router.matchStatic(clean_path)) |match| {
             if (!std.mem.eql(u8, request.method, "GET") and !std.mem.eql(u8, request.method, "HEAD")) {
@@ -821,6 +833,130 @@ pub const Connection = struct {
         };
         self.logAccess(200);
         self.sendRawResponse(full);
+    }
+
+    /// Reload endpoint: signals all workers to hot-reload their Lua state.
+    fn serveReload(self: *Connection, alloc: std.mem.Allocator) void {
+        if (self.server.reload_coordinator) |coord| {
+            coord.signalReload();
+            const body = "{\"status\":\"reload_triggered\"}";
+            const response_text = std.fmt.allocPrint(alloc, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch {
+                error_response.sendError(self, .server_error, "reload response allocation failed");
+                return;
+            };
+            self.logAccess(200);
+            self.sendRawResponse(response_text);
+        } else {
+            const body = "{\"error\":\"reload not available\"}";
+            const response_text = std.fmt.allocPrint(alloc, "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch {
+                error_response.sendError(self, .server_error, "reload response allocation failed");
+                return;
+            };
+            self.logAccess(503);
+            self.sendRawResponse(response_text);
+        }
+    }
+
+    /// Reverse proxy: connect to upstream, forward request, relay response.
+    fn proxyRequest(self: *Connection, request: *const http.Request, proxy_match: Router.ProxyMatch, alloc: std.mem.Allocator) void {
+        const prefix = proxy_match.route.prefix;
+
+        // Bare prefix with a configured redirect → 302
+        if (proxy_match.route.redirect.len > 0 and
+            (proxy_match.suffix.len == 0 or std.mem.eql(u8, proxy_match.suffix, "/")))
+        {
+            const resp = std.fmt.allocPrint(alloc, "HTTP/1.1 302 Found\r\nLocation: {s}\r\nContent-Length: 0\r\n\r\n", .{proxy_match.route.redirect}) catch {
+                error_response.sendError(self, .server_error, "proxy redirect failed");
+                return;
+            };
+            self.logAccess(302);
+            self.sendRawResponse(resp);
+            return;
+        }
+
+        // Build upstream path
+        const raw_path = request.path;
+        const upstream_path: []const u8 = if (proxy_match.route.strip_prefix)
+            (if (raw_path.len >= prefix.len and std.mem.startsWith(u8, raw_path, prefix))
+                (if (raw_path[prefix.len..].len == 0) "/" else raw_path[prefix.len..])
+            else
+                "/")
+        else
+            raw_path;
+
+        // Connect to upstream
+        const stream = std.net.tcpConnectToHost(alloc, proxy_match.route.upstream_host, proxy_match.route.upstream_port) catch {
+            error_response.sendErrorStatus(self, 502, "proxy upstream connect failed");
+            return;
+        };
+        defer stream.close();
+
+        // Build upstream HTTP request
+        var req_buf = std.ArrayList(u8).initCapacity(alloc, 1024) catch {
+            error_response.sendErrorStatus(self, 502, "proxy request alloc failed");
+            return;
+        };
+        const req_writer = req_buf.writer(alloc);
+        std.fmt.format(req_writer, "{s} {s} HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\n", .{
+            request.method,
+            upstream_path,
+            proxy_match.route.upstream_host,
+            proxy_match.route.upstream_port,
+        }) catch {
+            error_response.sendErrorStatus(self, 502, "proxy request build failed");
+            return;
+        };
+        for (request.headers) |h| {
+            if (std.ascii.eqlIgnoreCase(h.name, "host")) continue;
+            if (std.ascii.eqlIgnoreCase(h.name, "connection")) continue;
+            std.fmt.format(req_writer, "{s}: {s}\r\n", .{ h.name, h.value }) catch {
+                error_response.sendErrorStatus(self, 502, "proxy header build failed");
+                return;
+            };
+        }
+        req_writer.writeAll("\r\n") catch {
+            error_response.sendErrorStatus(self, 502, "proxy request build failed");
+            return;
+        };
+
+        // Send request + body
+        stream.writeAll(req_buf.items) catch {
+            error_response.sendErrorStatus(self, 502, "proxy upstream write failed");
+            return;
+        };
+        if (request.body.len > 0) {
+            stream.writeAll(request.body) catch {
+                error_response.sendErrorStatus(self, 502, "proxy upstream body write failed");
+                return;
+            };
+        }
+
+        // Read entire upstream response
+        var resp_buf = std.ArrayList(u8).initCapacity(alloc, 4096) catch {
+            error_response.sendErrorStatus(self, 502, "proxy response alloc failed");
+            return;
+        };
+        var read_buf: [8192]u8 = undefined;
+        while (true) {
+            const n = stream.read(&read_buf) catch {
+                error_response.sendErrorStatus(self, 502, "proxy upstream read failed");
+                return;
+            };
+            if (n == 0) break;
+            resp_buf.appendSlice(alloc, read_buf[0..n]) catch {
+                error_response.sendErrorStatus(self, 502, "proxy response buffer failed");
+                return;
+            };
+        }
+
+        const upstream_response = resp_buf.items;
+        if (upstream_response.len == 0) {
+            error_response.sendErrorStatus(self, 502, "proxy upstream empty response");
+            return;
+        }
+
+        self.logAccess(200);
+        self.sendRawResponse(upstream_response);
     }
 
     fn onWrite(

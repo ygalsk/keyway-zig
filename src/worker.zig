@@ -9,6 +9,8 @@ const sse = @import("sse.zig");
 const SseRegistry = sse.SseRegistry;
 const SseBroadcastBus = sse.SseBroadcastBus;
 const ShutdownCoordinator = @import("shutdown.zig").ShutdownCoordinator;
+const ReloadCoordinator = @import("reload.zig").ReloadCoordinator;
+const FileWatcher = @import("file_watcher.zig").FileWatcher;
 const metrics_mod = @import("metrics.zig");
 const WorkerMetrics = metrics_mod.WorkerMetrics;
 const config = @import("config.zig");
@@ -53,49 +55,27 @@ pub const Worker = struct {
         bpf_ready: *std.atomic.Value(bool),
         sse_bus: ?*SseBroadcastBus,
         coordinator: ?*ShutdownCoordinator,
+        reload_coordinator: ?*ReloadCoordinator,
         metrics: *WorkerMetrics,
         all_metrics_ptrs: []const *WorkerMetrics,
         ready_count: *std.atomic.Value(usize),
         script_path: []const u8,
+        watch: bool,
     };
 
     /// Spawn a worker thread
-    pub fn spawn(
-        allocator: std.mem.Allocator,
-        server_config: Server.Config,
-        worker_id: usize,
-        num_workers: usize,
-        bpf_ready: *std.atomic.Value(bool),
-        sse_bus: ?*SseBroadcastBus,
-        coordinator: ?*ShutdownCoordinator,
-        worker_metrics: *WorkerMetrics,
-        all_metrics_ptrs: []const *WorkerMetrics,
-        ready_count: *std.atomic.Value(usize),
-        script_path: []const u8,
-    ) !Worker {
+    pub fn spawn(allocator: std.mem.Allocator, context: Context) !Worker {
         const ctx = try allocator.create(Context);
-        ctx.* = Context{
-            .allocator = allocator,
-            .config = server_config,
-            .worker_id = worker_id,
-            .num_workers = num_workers,
-            .bpf_ready = bpf_ready,
-            .sse_bus = sse_bus,
-            .coordinator = coordinator,
-            .metrics = worker_metrics,
-            .all_metrics_ptrs = all_metrics_ptrs,
-            .ready_count = ready_count,
-            .script_path = script_path,
-        };
+        ctx.* = context;
 
         const thread = try std.Thread.spawn(.{}, workerMain, .{ctx});
 
         return Worker{
             .allocator = allocator,
             .thread = thread,
-            .config = server_config,
+            .config = context.config,
             .router = undefined, // Each worker creates its own router
-            .worker_id = worker_id,
+            .worker_id = context.worker_id,
         };
     }
 
@@ -166,6 +146,9 @@ pub const Worker = struct {
         // Register cosocket API (needs stable *LuaState pointer)
         lua_state.registerCosocketApi();
 
+        // Register file I/O API (admin operations, behind localhost_guard)
+        lua_state.registerFileApi();
+
         // Expose per-worker globals to Lua (must be before loadScript)
         lua_state.setWorkerGlobals(ctx.worker_id);
 
@@ -173,6 +156,7 @@ pub const Worker = struct {
         try lua_state.loadScript(ctx.script_path);
         try lua_state.processRouteTable(&router);
         try lua_state.processStaticTable(&router);
+        try lua_state.processProxyTable(&router);
 
         if (router.isEmpty()) {
             log.warn().string("msg", "no routes registered — all requests will 404").log();
@@ -212,6 +196,34 @@ pub const Worker = struct {
             server.coordinator = coord;
             server.worker_id = ctx.worker_id;
         }
+        server.reload_coordinator = ctx.reload_coordinator;
+
+        // Register reload Async watcher (fires when ReloadCoordinator signals reload)
+        var reload_completion: xev.Completion = undefined;
+        if (ctx.reload_coordinator) |reload_coord| {
+            const reload_async = reload_coord.getAsync(ctx.worker_id);
+            const reload_ctx = try ctx.allocator.create(ReloadContext);
+            reload_ctx.* = .{
+                .lua_state = &lua_state,
+                .router = &router,
+                .script_path = ctx.script_path,
+            };
+            reload_async.wait(&loop, &reload_completion, ReloadContext, reload_ctx, onReloadSignal);
+        }
+
+        // Start file watcher if --watch enabled
+        var file_watcher: ?FileWatcher = null;
+        if (ctx.watch) {
+            file_watcher = FileWatcher.init(ctx.allocator, ctx.script_path, &lua_state, &router) catch |err| blk: {
+                log.warn().string("msg", "file watcher init failed — continuing without watch").err(err).log();
+                break :blk null;
+            };
+            if (file_watcher) |*fw| {
+                fw.start(&loop);
+                log.info().string("msg", "file watcher started").string("script", ctx.script_path).log();
+            }
+        }
+        defer if (file_watcher) |*fw| fw.deinit();
 
         // Start accepting connections
         try server.start();
@@ -298,6 +310,29 @@ fn onDrainDeadline(
     return .disarm;
 }
 
+/// Context for reload signal callback.
+const ReloadContext = struct {
+    lua_state: *LuaState,
+    router: *Router,
+    script_path: []const u8,
+};
+
+/// xev.Async callback — fires on the worker's event loop when reload signal received.
+fn onReloadSignal(
+    ctx_opt: ?*ReloadContext,
+    _: *xev.Loop,
+    _: *xev.Completion,
+    r: xev.Async.WaitError!void,
+) xev.CallbackAction {
+    _ = r catch return .disarm;
+    const ctx = ctx_opt orelse return .disarm;
+
+    log.info().string("msg", "performing hot reload").log();
+    ctx.lua_state.reload(ctx.router, ctx.script_path);
+
+    return .rearm;
+}
+
 /// Thread pool manager
 pub const ThreadPool = struct {
     allocator: std.mem.Allocator,
@@ -305,6 +340,7 @@ pub const ThreadPool = struct {
     bpf_ready: *std.atomic.Value(bool),
     sse_bus: ?*SseBroadcastBus,
     coordinator: ?*ShutdownCoordinator = null,
+    reload_coordinator: ?*ReloadCoordinator = null,
     worker_metrics: []WorkerMetrics,
     all_metrics_ptrs: []*WorkerMetrics,
     ready_count: *std.atomic.Value(usize),
@@ -316,7 +352,9 @@ pub const ThreadPool = struct {
         server_config: Server.Config,
         worker_count: u16,
         coordinator: ?*ShutdownCoordinator,
+        reload_coordinator: ?*ReloadCoordinator,
         script_path: []const u8,
+        watch: bool,
     ) !ThreadPool {
         const num_cpus = try std.Thread.getCpuCount();
         const num_workers: usize = if (worker_count > 0) @intCast(worker_count) else num_cpus;
@@ -353,7 +391,21 @@ pub const ThreadPool = struct {
 
         // Spawn workers
         for (workers, 0..) |*worker, i| {
-            worker.* = try Worker.spawn(allocator, server_config, i, num_workers, bpf_ready, sse_bus, coordinator, &worker_metrics[i], all_metrics_ptrs, ready_count, script_path);
+            worker.* = try Worker.spawn(allocator, .{
+                .allocator = allocator,
+                .config = server_config,
+                .worker_id = i,
+                .num_workers = num_workers,
+                .bpf_ready = bpf_ready,
+                .sse_bus = sse_bus,
+                .coordinator = coordinator,
+                .reload_coordinator = reload_coordinator,
+                .metrics = &worker_metrics[i],
+                .all_metrics_ptrs = all_metrics_ptrs,
+                .ready_count = ready_count,
+                .script_path = script_path,
+                .watch = watch,
+            });
         }
 
         return ThreadPool{
@@ -362,6 +414,7 @@ pub const ThreadPool = struct {
             .bpf_ready = bpf_ready,
             .sse_bus = sse_bus,
             .coordinator = coordinator,
+            .reload_coordinator = reload_coordinator,
             .worker_metrics = worker_metrics,
             .all_metrics_ptrs = all_metrics_ptrs,
             .ready_count = ready_count,

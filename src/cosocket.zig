@@ -320,7 +320,10 @@ fn drainSubmissionRing(self: *Connection) void {
         }
     }
     self.cs.sq.reset();
-    if (io_index > 0) prom.ringSubmissions(io_index);
+    if (io_index > 0) {
+        prom.ringSubmissions(io_index);
+        prom.ringBatchSize(io_index);
+    }
 
     if (self.cs.pending_completions == 0) {
         // All ops were synchronous (pool hits, setkeepalive) — resume immediately

@@ -74,6 +74,11 @@ pub const LuaState = struct {
     // Used by ring C bridge functions to access the Connection's SQ/CQ.
     current_connection: ?*anyopaque = null,
 
+    // Lua script timing: start timestamp for duration histogram
+    coroutine_start_us: ?i64 = null,
+    // Route pattern for the current coroutine (for Prometheus labels)
+    coroutine_route: []const u8 = "",
+
     // SSE: per-worker registry for broadcast (set by worker.zig)
     sse_registry: ?*SseRegistry = null,
 
@@ -187,6 +192,12 @@ pub const LuaState = struct {
         try @import("route_loader.zig").processStaticTable(self.lua, router);
     }
 
+    /// Process keyway.proxy declarative table after script load.
+    /// Registers reverse proxy routes with the router.
+    pub fn processProxyTable(self: *LuaState, router: *Router) !void {
+        try @import("route_loader.zig").processProxyTable(self.lua, router);
+    }
+
     /// Call a Lua function by name
     /// The function should be at the global scope
     pub fn callGlobalFunction(self: *LuaState, name: [:0]const u8) !void {
@@ -240,12 +251,25 @@ pub const LuaState = struct {
 
         // Resume the coroutine: thread stack has [handler_fn, userdata]
         prom.luaCoroutineStarted();
+        self.coroutine_start_us = std.time.microTimestamp();
+        // Capture route for duration labeling from Connection's http_state
+        if (self.current_connection) |conn_ptr| {
+            const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+            self.coroutine_route = conn.http_state.route_pattern;
+        } else {
+            self.coroutine_route = "";
+        }
         const status = lua_resume(@ptrCast(thread), 1);
 
         switch (status) {
             0 => {
                 // LUA_OK — handler completed normally
                 prom.luaCoroutineFinished();
+                if (self.coroutine_start_us) |start| {
+                    const elapsed = std.time.microTimestamp() - start;
+                    prom.luaScriptDuration(self.coroutine_route, elapsed);
+                    self.coroutine_start_us = null;
+                }
                 if (self.cached_thread_ref == 0) self.lua.pop(1);
                 return .completed;
             },
@@ -315,13 +339,17 @@ pub const LuaState = struct {
         nresults: c_int,
         _: *HttpExchange,
     ) !HandlerResult {
-        _ = self;
         const status = lua_resume(thread, nresults);
 
         switch (status) {
             0 => {
                 // LUA_OK — handler completed
                 prom.luaCoroutineFinished();
+                if (self.coroutine_start_us) |start| {
+                    const elapsed = std.time.microTimestamp() - start;
+                    prom.luaScriptDuration(self.coroutine_route, elapsed);
+                    self.coroutine_start_us = null;
+                }
                 return .completed;
             },
             1 => {
@@ -330,6 +358,11 @@ pub const LuaState = struct {
             },
             else => {
                 prom.luaCoroutineFinished();
+                if (self.coroutine_start_us) |start| {
+                    const elapsed = std.time.microTimestamp() - start;
+                    prom.luaScriptDuration(self.coroutine_route, elapsed);
+                    self.coroutine_start_us = null;
+                }
                 const lua_thread: *Lua = @ptrCast(@alignCast(thread));
                 if (lua_thread.isString(-1)) {
                     const err_msg = lua_thread.toString(-1) catch "unknown error";
@@ -347,6 +380,210 @@ pub const LuaState = struct {
         self.lua.pushInteger(@intCast(worker_id)); // push value
         self.lua.setField(-2, "worker_id");        // keyway.worker_id = N
         self.lua.pop(1);                           // pop keyway table
+    }
+
+    /// Register file I/O C functions as Lua globals.
+    /// Admin-only operations — used by dashboard routes behind localhost_guard.
+    pub fn registerFileApi(self: *LuaState) void {
+        const file_funcs = .{
+            .{ "__keyway_file_read", keyway_file_read },
+            .{ "__keyway_file_write", keyway_file_write },
+            .{ "__keyway_file_delete", keyway_file_delete },
+            .{ "__keyway_file_list", keyway_file_list },
+            .{ "__keyway_file_rename", keyway_file_rename },
+        };
+        inline for (file_funcs) |entry| {
+            self.lua.pushLightUserdata(self);
+            self.lua.pushCClosure(entry[1], 1);
+            self.lua.setGlobal(entry[0]);
+        }
+    }
+
+    /// __keyway_file_read(path) -> string or nil, error
+    fn keyway_file_read(lua: *Lua) callconv(.c) c_int {
+        const state: *LuaState = blk: {
+            const ud = lua.toUserdata(Lua.PseudoIndex.upvalue(1)) orelse return 0;
+            break :blk castUserdata(LuaState, @as(?*anyopaque, ud));
+        };
+        const path_c = lua.toString(1) catch {
+            lua.pushNil();
+            lua.pushString("path argument required");
+            return 2;
+        };
+        const path = std.mem.span(path_c);
+
+        const file = std.fs.cwd().openFile(path, .{}) catch {
+            lua.pushNil();
+            lua.pushString("file not found");
+            return 2;
+        };
+        defer file.close();
+
+        const content = file.readToEndAlloc(state.allocator, 10 * 1024 * 1024) catch {
+            lua.pushNil();
+            lua.pushString("read error");
+            return 2;
+        };
+        defer state.allocator.free(content);
+
+        lua.pushLString(content);
+        return 1;
+    }
+
+    /// __keyway_file_write(path, content) -> true or nil, error
+    fn keyway_file_write(lua: *Lua) callconv(.c) c_int {
+        const path_c = lua.toString(1) catch {
+            lua.pushNil();
+            lua.pushString("path argument required");
+            return 2;
+        };
+        const content_c = lua.toString(2) catch {
+            lua.pushNil();
+            lua.pushString("content argument required");
+            return 2;
+        };
+        const path = std.mem.span(path_c);
+        const content = std.mem.span(content_c);
+
+        // Atomic write: write to tmp file, then rename
+        const state: *LuaState = blk: {
+            const ud = lua.toUserdata(Lua.PseudoIndex.upvalue(1)) orelse return 0;
+            break :blk castUserdata(LuaState, @as(?*anyopaque, ud));
+        };
+        const dir_path = std.fs.path.dirname(path) orelse ".";
+
+        // Ensure parent directory exists
+        std.fs.cwd().makePath(dir_path) catch {};
+
+        // Write tmp file and rename
+        const tmp_path = std.fmt.allocPrint(state.allocator, "{s}.tmp", .{path}) catch {
+            lua.pushNil();
+            lua.pushString("allocation failed");
+            return 2;
+        };
+        defer state.allocator.free(tmp_path);
+
+        const file = std.fs.cwd().createFile(tmp_path, .{}) catch {
+            lua.pushNil();
+            lua.pushString("failed to create tmp file");
+            return 2;
+        };
+        file.writeAll(content) catch {
+            file.close();
+            lua.pushNil();
+            lua.pushString("write error");
+            return 2;
+        };
+        file.close();
+
+        // Rename tmp -> target (atomic on same filesystem)
+        std.fs.cwd().rename(tmp_path, path) catch {
+            lua.pushNil();
+            lua.pushString("rename failed");
+            return 2;
+        };
+
+        lua.pushBoolean(true);
+        return 1;
+    }
+
+    /// __keyway_file_delete(path) -> true or nil, error
+    fn keyway_file_delete(lua: *Lua) callconv(.c) c_int {
+        const path_c = lua.toString(1) catch {
+            lua.pushNil();
+            lua.pushString("path argument required");
+            return 2;
+        };
+        const path = std.mem.span(path_c);
+
+        std.fs.cwd().deleteFile(path) catch {
+            lua.pushNil();
+            lua.pushString("delete failed");
+            return 2;
+        };
+
+        lua.pushBoolean(true);
+        return 1;
+    }
+
+    /// __keyway_file_rename(old_path, new_path) -> true or nil, error
+    fn keyway_file_rename(lua: *Lua) callconv(.c) c_int {
+        const old_c = lua.toString(1) catch {
+            lua.pushNil();
+            lua.pushString("old_path argument required");
+            return 2;
+        };
+        const new_c = lua.toString(2) catch {
+            lua.pushNil();
+            lua.pushString("new_path argument required");
+            return 2;
+        };
+        const old_path = std.mem.span(old_c);
+        const new_path = std.mem.span(new_c);
+
+        std.fs.cwd().rename(old_path, new_path) catch {
+            lua.pushNil();
+            lua.pushString("rename failed");
+            return 2;
+        };
+
+        lua.pushBoolean(true);
+        return 1;
+    }
+
+    /// __keyway_file_list(dir) -> table of {path, name} or nil, error
+    fn keyway_file_list(lua: *Lua) callconv(.c) c_int {
+        const state: *LuaState = blk: {
+            const ud = lua.toUserdata(Lua.PseudoIndex.upvalue(1)) orelse return 0;
+            break :blk castUserdata(LuaState, @as(?*anyopaque, ud));
+        };
+        const dir_c = lua.toString(1) catch {
+            lua.pushNil();
+            lua.pushString("dir argument required");
+            return 2;
+        };
+        const dir_path = std.mem.span(dir_c);
+
+        lua.createTable(0, 0);
+        var idx: i32 = 1;
+
+        listLuaFilesRecursive(lua, state.allocator, dir_path, dir_path, &idx);
+
+        return 1;
+    }
+
+    fn listLuaFilesRecursive(lua: *Lua, alloc: std.mem.Allocator, base: []const u8, dir_path: []const u8, idx: *i32) void {
+        var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
+        defer dir.close();
+        var iter = dir.iterate();
+        while (iter.next() catch null) |entry| {
+            if (entry.kind == .directory) {
+                const sub = std.fs.path.join(alloc, &.{ dir_path, entry.name }) catch continue;
+                defer alloc.free(sub);
+                listLuaFilesRecursive(lua, alloc, base, sub, idx);
+            } else if (entry.kind == .file and (std.mem.endsWith(u8, entry.name, ".lua") or std.mem.endsWith(u8, entry.name, ".lua.disabled"))) {
+                const full = std.fs.path.join(alloc, &.{ dir_path, entry.name }) catch continue;
+                defer alloc.free(full);
+
+                // Compute relative path from base
+                const rel = if (std.mem.startsWith(u8, full, base))
+                    if (full.len > base.len and full[base.len] == '/') full[base.len + 1 ..] else full[base.len..]
+                else
+                    full;
+
+                const enabled = std.mem.endsWith(u8, entry.name, ".lua");
+
+                lua.createTable(0, 3);
+                lua.pushLString(rel);
+                lua.setField(-2, "path");
+                lua.pushLString(entry.name);
+                lua.setField(-2, "name");
+                lua.pushBoolean(enabled);
+                lua.setField(-2, "enabled");
+                lua.setTableIndexRaw(-2, idx.*);
+                idx.* += 1;
+            }
+        }
     }
 
     /// Register cosocket C functions as Lua globals with *LuaState as upvalue.
@@ -445,6 +682,66 @@ pub const LuaState = struct {
         }
 
         lua.pop(2); // pop preload + package
+    }
+
+    /// Hot-reload: unref old routes, reset router, clear package.loaded, re-execute script.
+    /// On script error: logs the error and leaves the router empty (all requests 404).
+    pub fn reload(self: *LuaState, router: *Router, script_path: []const u8) void {
+        // 1. Collect old lua_refs from router and unref each
+        var refs: std.ArrayListUnmanaged(i32) = .{};
+        defer refs.deinit(self.allocator);
+        router.collectLuaRefs(self.allocator, &refs) catch {};
+        for (refs.items) |ref| {
+            self.lua.unref(Lua.PseudoIndex.Registry, ref);
+        }
+
+        // 2. Reset router (free trie + static routes)
+        router.reset() catch |err| {
+            log.err().string("msg", "reload: router reset failed").err(err).log();
+            return;
+        };
+
+        // 3. Clear package.loaded for non-stdlib modules
+        self.lua.doString(
+            \\local keep = {
+            \\    ["keyway"] = true, ["keyway.socket"] = true, ["keyway.ring"] = true,
+            \\    ["keyway.dns"] = true, ["keyway.db_socket"] = true, ["keyway.form"] = true,
+            \\    ["keyway.response"] = true, ["keyway.crypto"] = true, ["keyway.http"] = true,
+            \\    ["string"] = true, ["table"] = true, ["math"] = true, ["io"] = true,
+            \\    ["os"] = true, ["debug"] = true, ["coroutine"] = true, ["package"] = true,
+            \\    ["bit"] = true, ["ffi"] = true, ["jit"] = true, ["jit.opt"] = true,
+            \\    ["jit.util"] = true, ["cjson"] = true,
+            \\}
+            \\for name in pairs(package.loaded) do
+            \\    if not keep[name] and not name:match("^keyway%.") then
+            \\        package.loaded[name] = nil
+            \\    end
+            \\end
+        ) catch |err| {
+            log.warn().string("msg", "reload: failed to clear package.loaded").err(err).log();
+        };
+
+        // 4. Re-execute the entry point script
+        self.loadScript(script_path) catch |err| {
+            log.err().string("msg", "reload: script load failed").string("path", script_path).err(err).log();
+            return;
+        };
+
+        // 5. Rebuild route table from fresh keyway.routes
+        self.processRouteTable(router) catch |err| {
+            log.err().string("msg", "reload: processRouteTable failed").err(err).log();
+            return;
+        };
+        self.processStaticTable(router) catch |err| {
+            log.err().string("msg", "reload: processStaticTable failed").err(err).log();
+            return;
+        };
+        self.processProxyTable(router) catch |err| {
+            log.err().string("msg", "reload: processProxyTable failed").err(err).log();
+            return;
+        };
+
+        log.info().string("msg", "reload complete").string("script", script_path).log();
     }
 
     /// Clean up Lua state

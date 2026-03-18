@@ -1,5 +1,6 @@
 const std = @import("std");
 const logz = @import("logz");
+const cli = @import("cli.zig");
 
 /// Per-worker identity, set once at thread start via worker.zig
 pub threadlocal var worker_id: u16 = 0;
@@ -18,12 +19,16 @@ fn toLogzLevel(level: std.log.Level) logz.Level {
 }
 
 /// Initialize the logz pool. Call after worker count is known.
-pub fn init(allocator: std.mem.Allocator, level: std.log.Level, num_workers: usize) !void {
+pub fn init(allocator: std.mem.Allocator, level: std.log.Level, log_format: cli.Config.LogFormat, num_workers: usize) !void {
+    const encoding: logz.Config.Encoding = switch (log_format) {
+        .logfmt => .logfmt,
+        .json => .json,
+    };
     try logz.setup(allocator, .{
         .level = toLogzLevel(level),
         .pool_size = @intCast(num_workers * 4),
         .output = .stderr,
-        .encoding = .logfmt,
+        .encoding = encoding,
     });
     initialized = true;
 }

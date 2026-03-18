@@ -30,27 +30,30 @@ pub const Metrics = struct {
     // -- io_uring / Ring buffer --
     ring_submissions_total: ConnectionCounter,
     ring_completions_total: ConnectionCounter,
+    ring_batch_size: RingBatchSizeHist,
 
     // -- Lua runtime --
     lua_coroutines_active: ConnectionGauge,
+    lua_script_duration_seconds: LuaScriptDuration,
+
+    // Bucket bounds (must live inside the struct so HistogramVec comptime refs resolve)
+    const latency_buckets = [_]f64{ 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0, 10.0 };
+    const ring_batch_buckets = [_]f64{ 1, 2, 4, 8, 16 };
+    const body_size_buckets = [_]u64{ 64, 256, 1_024, 4_096, 16_384, 65_536, 262_144, 1_048_576, 4_194_304 };
 
     // Labeled types
     const WorkerLabels = struct { worker_id: u16 };
     const RequestLabels = struct { worker_id: u16, method: []const u8, status: u16, route: []const u8 };
+    const RequestDurationLabels = struct { worker_id: u16, route: []const u8 };
+    const ScriptDurationLabels = struct { worker_id: u16, route: []const u8 };
     const HttpRequestsTotal = m.CounterVec(u64, RequestLabels);
-    const HttpRequestDuration = m.HistogramVec(f64, WorkerLabels, &latency_buckets_seconds);
-    const BodySizeHist = m.Histogram(u64, &size_buckets_bytes);
+    const HttpRequestDuration = m.HistogramVec(f64, RequestDurationLabels, &latency_buckets);
+    const BodySizeHist = m.Histogram(u64, &body_size_buckets);
     const ConnectionCounter = m.CounterVec(u64, WorkerLabels);
     const ConnectionGauge = m.GaugeVec(i64, WorkerLabels);
+    const RingBatchSizeHist = m.HistogramVec(f64, WorkerLabels, &ring_batch_buckets);
+    const LuaScriptDuration = m.HistogramVec(f64, ScriptDurationLabels, &latency_buckets);
 };
-
-/// Latency bucket bounds in seconds (Prometheus convention).
-/// 0.5ms, 1ms, 5ms, 10ms, 25ms, 50ms, 100ms, 250ms, 500ms, 1s, 5s, 10s
-const latency_buckets_seconds = [_]f64{ 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0, 10.0 };
-
-/// Body size bucket bounds in bytes.
-/// 64, 256, 1K, 4K, 16K, 64K, 256K, 1M, 4M
-const size_buckets_bytes = [_]u64{ 64, 256, 1_024, 4_096, 16_384, 65_536, 262_144, 1_048_576, 4_194_304 };
 
 /// Initialize the global metrics instance. Call once at startup before spawning workers.
 pub fn init(allocator: Allocator) !void {
@@ -82,8 +85,14 @@ pub fn init(allocator: Allocator) !void {
         .ring_completions_total = try Metrics.ConnectionCounter.init(allocator, "keyway_ring_completions_total", .{
             .help = "Total ring buffer completions",
         }, .{}),
+        .ring_batch_size = try Metrics.RingBatchSizeHist.init(allocator, "keyway_ring_batch_size", .{
+            .help = "Submissions per batch drain",
+        }, .{}),
         .lua_coroutines_active = try Metrics.ConnectionGauge.init(allocator, "keyway_lua_coroutines_active", .{
             .help = "Active Lua coroutines",
+        }, .{}),
+        .lua_script_duration_seconds = try Metrics.LuaScriptDuration.init(allocator, "keyway_lua_script_duration_seconds", .{
+            .help = "Lua script execution time in seconds",
         }, .{}),
     };
 }
@@ -96,7 +105,9 @@ pub fn deinit() void {
     global.connections_rejected_total.deinit();
     global.ring_submissions_total.deinit();
     global.ring_completions_total.deinit();
+    global.ring_batch_size.deinit();
     global.lua_coroutines_active.deinit();
+    global.lua_script_duration_seconds.deinit();
 }
 
 /// Write all metrics in Prometheus text exposition format.
@@ -116,7 +127,7 @@ fn wlabels() Metrics.WorkerLabels {
 pub fn recordRequest(method: []const u8, status: u16, latency_us: u64, route: []const u8) void {
     global.http_requests_total.incr(.{ .worker_id = worker_id, .method = method, .status = status, .route = route }) catch {};
     const latency_seconds: f64 = @as(f64, @floatFromInt(latency_us)) / 1_000_000.0;
-    global.http_request_duration_seconds.observe(wlabels(), latency_seconds) catch {};
+    global.http_request_duration_seconds.observe(.{ .worker_id = worker_id, .route = route }, latency_seconds) catch {};
 }
 
 /// Record request body size.
@@ -165,6 +176,17 @@ pub fn luaCoroutineFinished() void {
     global.lua_coroutines_active.incrBy(wlabels(), -1) catch {};
 }
 
+/// Record ring batch size (SQEs per drain).
+pub fn ringBatchSize(count: u8) void {
+    global.ring_batch_size.observe(wlabels(), @floatFromInt(count)) catch {};
+}
+
+/// Record Lua script execution duration.
+pub fn luaScriptDuration(route: []const u8, duration_us: i64) void {
+    const duration_seconds: f64 = @as(f64, @floatFromInt(duration_us)) / 1_000_000.0;
+    global.lua_script_duration_seconds.observe(.{ .worker_id = worker_id, .route = route }, duration_seconds) catch {};
+}
+
 // =============================================================================
 // Tests
 // =============================================================================
@@ -181,6 +203,8 @@ test "prom: init and record" {
     connectionClosed();
     recordRequestBodySize(512);
     recordResponseBodySize(2048);
+    ringBatchSize(3);
+    luaScriptDuration("/users", 500);
 }
 
 test "prom: write produces output with worker_id labels" {
@@ -204,4 +228,7 @@ test "prom: write produces output with worker_id labels" {
     try std.testing.expect(std.mem.indexOf(u8, buf, "worker_id=") != null);
     // Verify route label is present on requests counter
     try std.testing.expect(std.mem.indexOf(u8, buf, "route=") != null);
+    // Verify new metrics are present
+    try std.testing.expect(std.mem.indexOf(u8, buf, "# TYPE keyway_ring_batch_size histogram") != null);
+    try std.testing.expect(std.mem.indexOf(u8, buf, "# TYPE keyway_lua_script_duration_seconds histogram") != null);
 }

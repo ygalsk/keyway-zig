@@ -28,6 +28,7 @@ pub const Server = struct {
     accept_completion: xev.Completion,
     accept_cancel_completion: xev.Completion = .{},
     coordinator: ?*ShutdownCoordinator = null,
+    reload_coordinator: ?*@import("reload.zig").ReloadCoordinator = null,
     worker_id: usize = 0,
     router: *Router,
     lua_state: *LuaState,

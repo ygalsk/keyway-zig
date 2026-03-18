@@ -86,11 +86,21 @@ pub const StaticRoute = struct {
     index: []const u8,
 };
 
+/// Reverse proxy route configuration.
+pub const ProxyRoute = struct {
+    prefix: []const u8, // e.g. "/__keyway/grafana"
+    upstream_host: []const u8, // e.g. "127.0.0.1"
+    upstream_port: u16, // e.g. 3000
+    redirect: []const u8 = "", // if set, bare prefix requests 302 to this URL
+    strip_prefix: bool = true, // if false, forward the full path to upstream
+};
+
 /// Segment-level trie router — O(path_length) route matching
 pub const Router = struct {
     allocator: std.mem.Allocator,
     root: *Node,
     static_routes: std.ArrayListUnmanaged(StaticRoute) = .{},
+    proxy_routes: std.ArrayListUnmanaged(ProxyRoute) = .{},
 
     /// Initialize radix router
     pub fn init(allocator: std.mem.Allocator) !Router {
@@ -130,6 +140,39 @@ pub const Router = struct {
                 if (suffix.len == 0 or suffix[0] == '/') {
                     if (best == null or sr.prefix.len > best.?.route.prefix.len) {
                         best = .{ .route = sr, .suffix = suffix };
+                    }
+                }
+            }
+        }
+        return best;
+    }
+
+    /// Register a reverse proxy route.
+    pub fn addProxyRoute(self: *Router, prefix: []const u8, upstream_host: []const u8, upstream_port: u16, redirect: []const u8, strip_prefix: bool) !void {
+        const prefix_copy = try self.allocator.dupe(u8, prefix);
+        const host_copy = try self.allocator.dupe(u8, upstream_host);
+        const redirect_copy = if (redirect.len > 0) try self.allocator.dupe(u8, redirect) else "";
+        try self.proxy_routes.append(self.allocator, .{
+            .prefix = prefix_copy,
+            .upstream_host = host_copy,
+            .upstream_port = upstream_port,
+            .redirect = redirect_copy,
+            .strip_prefix = strip_prefix,
+        });
+    }
+
+    pub const ProxyMatch = struct { route: ProxyRoute, suffix: []const u8 };
+
+    /// Match a path against proxy route prefixes (longest prefix wins).
+    pub fn matchProxy(self: *const Router, path: []const u8) ?ProxyMatch {
+        if (self.proxy_routes.items.len == 0) return null;
+        var best: ?ProxyMatch = null;
+        for (self.proxy_routes.items) |pr| {
+            if (std.mem.startsWith(u8, path, pr.prefix)) {
+                const suffix = path[pr.prefix.len..];
+                if (suffix.len == 0 or suffix[0] == '/') {
+                    if (best == null or pr.prefix.len > best.?.route.prefix.len) {
+                        best = .{ .route = pr, .suffix = suffix };
                     }
                 }
             }
@@ -255,6 +298,60 @@ pub const Router = struct {
         return null;
     }
 
+    /// Collect all lua_ref values from the trie (for unreffing before reset).
+    pub fn collectLuaRefs(self: *const Router, alloc: std.mem.Allocator, refs: *std.ArrayListUnmanaged(i32)) !void {
+        try collectNodeRefs(self.root, alloc, refs);
+    }
+
+    fn collectNodeRefs(node: *Node, alloc: std.mem.Allocator, refs: *std.ArrayListUnmanaged(i32)) !void {
+        if (node.methods) |mt| {
+            var it = mt.iterator();
+            while (it.next()) |entry| {
+                try refs.append(alloc, entry.value_ptr.*);
+            }
+        }
+        var child_it = node.children.iterator();
+        while (child_it.next()) |entry| {
+            try collectNodeRefs(entry.value_ptr.*, alloc, refs);
+        }
+        if (node.param_child) |param| {
+            try collectNodeRefs(param.node, alloc, refs);
+        }
+    }
+
+    /// Free all static route string allocations.
+    fn freeStaticRoutes(self: *Router) void {
+        for (self.static_routes.items) |sr| {
+            self.allocator.free(sr.prefix);
+            self.allocator.free(sr.root);
+            self.allocator.free(sr.real_root);
+            self.allocator.free(sr.index);
+        }
+    }
+
+    /// Free all proxy route string allocations.
+    fn freeProxyRoutes(self: *Router) void {
+        for (self.proxy_routes.items) |pr| {
+            self.allocator.free(pr.prefix);
+            self.allocator.free(pr.upstream_host);
+            if (pr.redirect.len > 0) self.allocator.free(pr.redirect);
+        }
+    }
+
+    /// Reset the router: free the entire trie and all static/proxy routes, reinit fresh.
+    pub fn reset(self: *Router) !void {
+        self.freeStaticRoutes();
+        self.static_routes.clearRetainingCapacity();
+        self.freeProxyRoutes();
+        self.proxy_routes.clearRetainingCapacity();
+
+        // Free trie
+        self.root.deinit();
+
+        // Reinit fresh root
+        self.root = try Node.init(self.allocator, "");
+    }
+
     /// Returns true if no routes have been registered
     pub fn isEmpty(self: *const Router) bool {
         return self.root.children.count() == 0 and
@@ -264,13 +361,10 @@ pub const Router = struct {
 
     /// Clean up router resources
     pub fn deinit(self: *Router) void {
-        for (self.static_routes.items) |sr| {
-            self.allocator.free(sr.prefix);
-            self.allocator.free(sr.root);
-            self.allocator.free(sr.real_root);
-            self.allocator.free(sr.index);
-        }
+        self.freeStaticRoutes();
         self.static_routes.deinit(self.allocator);
+        self.freeProxyRoutes();
+        self.proxy_routes.deinit(self.allocator);
         self.root.deinit();
     }
 };
@@ -412,6 +506,51 @@ test "security: path traversal in param is literal string" {
     const r3 = try router.match("GET", "/h/..%2F..%2Fetc%2Fpasswd", &p);
     try std.testing.expect(r3 != null);
     try std.testing.expectEqualStrings("..%2F..%2Fetc%2Fpasswd", p.get("id").?);
+}
+
+test "router reset clears all routes" {
+    const allocator = std.testing.allocator;
+
+    var router = try Router.init(allocator);
+    defer router.deinit();
+
+    try router.addRoute("GET", "/users", 1);
+    try router.addRoute("POST", "/users/{id}", 2);
+    try std.testing.expect(!router.isEmpty());
+
+    try router.reset();
+    try std.testing.expect(router.isEmpty());
+
+    // After reset, no routes match
+    var p = params.ParamArray{};
+    const result = try router.match("GET", "/users", &p);
+    try std.testing.expect(result == null);
+}
+
+test "collectLuaRefs gathers all refs" {
+    const allocator = std.testing.allocator;
+
+    var router = try Router.init(allocator);
+    defer router.deinit();
+
+    try router.addRoute("GET", "/a", 10);
+    try router.addRoute("POST", "/a", 20);
+    try router.addRoute("GET", "/b/{id}", 30);
+
+    var refs: std.ArrayListUnmanaged(i32) = .{};
+    defer refs.deinit(allocator);
+    try router.collectLuaRefs(allocator, &refs);
+
+    try std.testing.expectEqual(@as(usize, 3), refs.items.len);
+
+    // All three refs should be present (order not guaranteed)
+    var found: [3]bool = .{ false, false, false };
+    for (refs.items) |ref| {
+        if (ref == 10) found[0] = true;
+        if (ref == 20) found[1] = true;
+        if (ref == 30) found[2] = true;
+    }
+    try std.testing.expect(found[0] and found[1] and found[2]);
 }
 
 test "security: traversal does not escape route tree" {

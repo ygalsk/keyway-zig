@@ -3,6 +3,8 @@ const std = @import("std");
 /// CLI configuration for the Keyway server.
 /// Resolution order: CLI argument > environment variable > default value.
 pub const Config = struct {
+    pub const LogFormat = enum { logfmt, json };
+
     host: []const u8 = "0.0.0.0",
     port: u16 = 8080,
     workers: u16 = 0,
@@ -10,7 +12,9 @@ pub const Config = struct {
     tls_cert_path: ?[]const u8 = null,
     tls_key_path: ?[]const u8 = null,
     log_level: std.log.Level = .info,
+    log_format: LogFormat = .logfmt,
     enable_bpf: bool = false,
+    watch: bool = false,
     show_help: bool = false,
     show_version: bool = false,
 };
@@ -19,6 +23,7 @@ const ParseError = error{
     InvalidPort,
     InvalidWorkers,
     InvalidLogLevel,
+    InvalidLogFormat,
     MissingValue,
     UnknownOption,
 };
@@ -37,7 +42,9 @@ pub fn parse(allocator: std.mem.Allocator) (ParseError || std.process.ArgIterato
     var cli_tls_cert = false;
     var cli_tls_key = false;
     var cli_log_level = false;
+    var cli_log_format = false;
     var cli_enable_bpf = false;
+    var cli_watch = false;
 
     // Parse CLI arguments
     var args = try std.process.argsWithAllocator(allocator);
@@ -76,9 +83,16 @@ pub fn parse(allocator: std.mem.Allocator) (ParseError || std.process.ArgIterato
             const val = args.next() orelse return ParseError.MissingValue;
             config.log_level = parseLogLevel(val) orelse return ParseError.InvalidLogLevel;
             cli_log_level = true;
+        } else if (std.mem.eql(u8, arg, "--log-format")) {
+            const val = args.next() orelse return ParseError.MissingValue;
+            config.log_format = parseLogFormat(val) orelse return ParseError.InvalidLogFormat;
+            cli_log_format = true;
         } else if (std.mem.eql(u8, arg, "--enable-bpf")) {
             config.enable_bpf = true;
             cli_enable_bpf = true;
+        } else if (std.mem.eql(u8, arg, "--watch")) {
+            config.watch = true;
+            cli_watch = true;
         } else {
             return ParseError.UnknownOption;
         }
@@ -112,13 +126,29 @@ pub fn parse(allocator: std.mem.Allocator) (ParseError || std.process.ArgIterato
             config.log_level = parseLogLevel(val) orelse return ParseError.InvalidLogLevel;
         }
     }
+    if (!cli_log_format) {
+        if (std.posix.getenv("KEYWAY_LOG_FORMAT")) |val| {
+            config.log_format = parseLogFormat(val) orelse return ParseError.InvalidLogFormat;
+        }
+    }
     if (!cli_enable_bpf) {
         if (std.posix.getenv("KEYWAY_ENABLE_BPF")) |val| {
             config.enable_bpf = std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
         }
     }
+    if (!cli_watch) {
+        if (std.posix.getenv("KEYWAY_WATCH")) |val| {
+            config.watch = std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
+        }
+    }
 
     return config;
+}
+
+fn parseLogFormat(val: []const u8) ?Config.LogFormat {
+    if (std.mem.eql(u8, val, "logfmt")) return .logfmt;
+    if (std.mem.eql(u8, val, "json")) return .json;
+    return null;
 }
 
 fn parseLogLevel(val: []const u8) ?std.log.Level {
@@ -144,7 +174,9 @@ pub fn printHelp() void {
         \\  --tls-cert <path>   TLS certificate file (env: KEYWAY_TLS_CERT)
         \\  --tls-key <path>    TLS private key file (env: KEYWAY_TLS_KEY)
         \\  --log-level <level> Log level: err, warn, info, debug (default: info, env: KEYWAY_LOG_LEVEL)
+        \\  --log-format <fmt>  Log encoding: logfmt, json (default: logfmt, env: KEYWAY_LOG_FORMAT)
         \\  --enable-bpf        Enable eBPF SO_REUSEPORT affinity (env: KEYWAY_ENABLE_BPF=1)
+        \\  --watch             Watch script directory for .lua changes and hot-reload (env: KEYWAY_WATCH=1)
         \\  -h, --help          Show this help message
         \\  -v, --version       Show version information
         \\
@@ -179,6 +211,12 @@ test "parseLogLevel valid values" {
     try std.testing.expectEqual(std.log.Level.info, parseLogLevel("info").?);
     try std.testing.expectEqual(std.log.Level.debug, parseLogLevel("debug").?);
     try std.testing.expectEqual(@as(?std.log.Level, null), parseLogLevel("invalid"));
+}
+
+test "parseLogFormat valid values" {
+    try std.testing.expectEqual(Config.LogFormat.logfmt, parseLogFormat("logfmt").?);
+    try std.testing.expectEqual(Config.LogFormat.json, parseLogFormat("json").?);
+    try std.testing.expectEqual(@as(?Config.LogFormat, null), parseLogFormat("invalid"));
 }
 
 test "parse returns defaults when no args or env vars" {

@@ -126,20 +126,48 @@ fn collectMiddleware(
     const combined = try allocator.alloc(i32, parent_refs.len + count);
     @memcpy(combined[0..parent_refs.len], parent_refs);
 
-    // Ref each middleware function
+    // Ref each middleware function (supports both function values and string names)
     for (0..count) |i| {
         _ = lua.getTableIndexRaw(abs_idx, @intCast(i + 1));
-        if (!lua.isFunction(-1)) {
+
+        if (lua.isString(-1)) {
+            // String middleware name — resolve via keyway.middleware.resolve()
+            const name_cstr = lua.toString(-1) catch {
+                for (0..i) |j| lua.unref(Lua.PseudoIndex.Registry, combined[parent_refs.len + j]);
+                lua.pop(1);
+                allocator.free(combined);
+                log.err().string("msg", "middleware string read failed").int("index", i + 1).log();
+                return error.Runtime;
+            };
+            const name = std.mem.span(name_cstr);
+            lua.pop(1); // pop the string
+
+            // Call keyway.middleware.resolve(name)
+            _ = lua.getGlobal("keyway");
+            _ = lua.getField(-1, "middleware");
+            _ = lua.getField(-1, "resolve");
+            lua.remove(-2); // remove keyway.middleware table
+            lua.remove(-2); // remove keyway table
+            _ = lua.pushString(name);
+            lua.callProtected(1, 1, 0) catch {
+                for (0..i) |j| lua.unref(Lua.PseudoIndex.Registry, combined[parent_refs.len + j]);
+                allocator.free(combined);
+                log.err().string("msg", "middleware resolve failed").string("name", name).log();
+                return error.Runtime;
+            };
+            combined[parent_refs.len + i] = lua.ref(Lua.PseudoIndex.Registry);
+        } else if (lua.isFunction(-1)) {
+            combined[parent_refs.len + i] = lua.ref(Lua.PseudoIndex.Registry);
+        } else {
             // Clean up already-refed entries
             for (0..i) |j| {
                 lua.unref(Lua.PseudoIndex.Registry, combined[parent_refs.len + j]);
             }
             lua.pop(1);
             allocator.free(combined);
-            log.err().string("msg", "middleware is not a function").int("index", i + 1).log();
+            log.err().string("msg", "middleware is not a function or string").int("index", i + 1).log();
             return error.Runtime;
         }
-        combined[parent_refs.len + i] = lua.ref(Lua.PseudoIndex.Registry);
     }
 
     return combined;
@@ -250,4 +278,82 @@ pub fn processStaticTable(lua: *Lua, router: *Router) !void {
     }
 
     lua.pop(2); // pop static + keyway
+}
+
+/// Process keyway.proxy table after script load.
+/// Registers reverse proxy routes with the router.
+/// Format: keyway.proxy = { ["/__keyway/grafana"] = { host = "127.0.0.1", port = 3000 } }
+pub fn processProxyTable(lua: *Lua, router: *Router) !void {
+    const keyway_type = lua.getGlobal("keyway");
+    if (keyway_type != .table) {
+        lua.pop(1);
+        return;
+    }
+
+    const proxy_type = lua.getField(-1, "proxy");
+    if (proxy_type != .table) {
+        lua.pop(2);
+        return;
+    }
+
+    lua.pushNil();
+    while (lua.next(-2)) {
+        const key_cstr = lua.toString(-2) catch {
+            lua.pop(1);
+            continue;
+        };
+        const prefix = std.mem.span(key_cstr);
+
+        if (!lua.isTable(-1) or prefix.len == 0 or prefix[0] != '/') {
+            log.warn().string("msg", "keyway.proxy ignoring invalid entry").string("key", prefix).log();
+            lua.pop(1);
+            continue;
+        }
+
+        // Read host (required)
+        const host_type = lua.getField(-1, "host");
+        const host_str = if (host_type == .string) std.mem.span(lua.toString(-1) catch "") else "";
+        lua.pop(1);
+
+        if (host_str.len == 0) {
+            log.warn().string("msg", "keyway.proxy missing 'host' field").string("prefix", prefix).log();
+            lua.pop(1);
+            continue;
+        }
+
+        // Read port (required)
+        const port_type = lua.getField(-1, "port");
+        const port: u16 = if (port_type == .number) blk: {
+            const n = lua.toInteger(-1);
+            break :blk if (n >= 1 and n <= 65535) @intCast(n) else 0;
+        } else 0;
+        lua.pop(1);
+
+        if (port == 0) {
+            log.warn().string("msg", "keyway.proxy missing or invalid 'port' field").string("prefix", prefix).log();
+            lua.pop(1);
+            continue;
+        }
+
+        // Read redirect (optional)
+        const redirect_type = lua.getField(-1, "redirect");
+        const redirect_str = if (redirect_type == .string) std.mem.span(lua.toString(-1) catch "") else "";
+        lua.pop(1);
+
+        // Read strip_prefix (optional, defaults to true)
+        const sp_type = lua.getField(-1, "strip_prefix");
+        const strip_prefix = if (sp_type == .boolean) lua.toBoolean(-1) else true;
+        lua.pop(1);
+
+        router.addProxyRoute(prefix, host_str, port, redirect_str, strip_prefix) catch |err| {
+            log.err().string("msg", "keyway.proxy failed to register").string("prefix", prefix).err(err).log();
+            lua.pop(1);
+            continue;
+        };
+
+        log.info().string("msg", "proxy route registered").string("prefix", prefix).string("host", host_str).int("port", port).log();
+        lua.pop(1);
+    }
+
+    lua.pop(2); // pop proxy + keyway
 }

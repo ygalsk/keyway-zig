@@ -4,6 +4,7 @@ const cli = @import("cli.zig");
 const Server = @import("server.zig").Server;
 const ThreadPool = @import("worker.zig").ThreadPool;
 const shutdown = @import("shutdown.zig");
+const reload = @import("reload.zig");
 const prom = @import("prom.zig");
 
 pub const version = "0.1.0";
@@ -68,7 +69,7 @@ pub fn main() !void {
     const num_workers: usize = if (cli_config.workers > 0) @intCast(cli_config.workers) else num_cpus;
 
     // Initialize structured logging (needs worker count for pool sizing)
-    try log.init(allocator, cli_config.log_level, num_workers);
+    try log.init(allocator, cli_config.log_level, cli_config.log_format, num_workers);
     defer log.deinit();
 
     log.info().string("msg", "Keyway - Starting...").log();
@@ -80,8 +81,12 @@ pub fn main() !void {
     // Register SIGTERM/SIGINT handlers (first signal drains, second force-kills)
     shutdown.registerSignalHandlers(&coordinator);
 
+    // Create reload coordinator (one Async per worker for hot-reload notifications)
+    var reload_coordinator = try reload.ReloadCoordinator.init(allocator, num_workers);
+    defer reload_coordinator.deinit();
+
     // Create thread pool — workers receive coordinator for drain integration
-    var pool = try ThreadPool.init(allocator, server_config, cli_config.workers, &coordinator, cli_config.script);
+    var pool = try ThreadPool.init(allocator, server_config, cli_config.workers, &coordinator, &reload_coordinator, cli_config.script, cli_config.watch);
     defer pool.deinit();
 
     // Block until all workers have bound sockets and are accepting connections
@@ -104,6 +109,7 @@ comptime {
     _ = @import("cosocket.zig");
     _ = @import("cosocket_ops.zig");
     _ = @import("error_response.zig");
+    _ = @import("file_watcher.zig");
     _ = @import("handler.zig");
     _ = @import("helpers.zig");
     _ = @import("http.zig");
@@ -112,6 +118,7 @@ comptime {
     _ = @import("metrics.zig");
     _ = @import("params.zig");
     _ = @import("prom.zig");
+    _ = @import("reload.zig");
     _ = @import("ring.zig");
     _ = @import("router.zig");
     _ = @import("server.zig");
