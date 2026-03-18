@@ -91,7 +91,7 @@ pub const ProxyRoute = struct {
     prefix: []const u8, // e.g. "/__keyway/grafana"
     upstream_host: []const u8, // e.g. "127.0.0.1"
     upstream_port: u16, // e.g. 3000
-    redirect: []const u8 = "", // if set, bare prefix requests 302 to this URL
+    redirect: ?[]const u8 = null, // if set, bare prefix requests 302 to this URL
     strip_prefix: bool = true, // if false, forward the full path to upstream
 };
 
@@ -126,32 +126,18 @@ pub const Router = struct {
         });
     }
 
-    const StaticMatch = struct { route: StaticRoute, suffix: []const u8 };
+    pub const StaticMatch = PrefixMatch(StaticRoute);
 
     /// Match a path against static route prefixes (longest prefix wins).
-    /// Returns the StaticRoute and the path suffix after the prefix.
     pub fn matchStatic(self: *const Router, path: []const u8) ?StaticMatch {
-        if (self.static_routes.items.len == 0) return null;
-        var best: ?StaticMatch = null;
-        for (self.static_routes.items) |sr| {
-            if (std.mem.startsWith(u8, path, sr.prefix)) {
-                const suffix = path[sr.prefix.len..];
-                // Suffix must be empty or start with '/'
-                if (suffix.len == 0 or suffix[0] == '/') {
-                    if (best == null or sr.prefix.len > best.?.route.prefix.len) {
-                        best = .{ .route = sr, .suffix = suffix };
-                    }
-                }
-            }
-        }
-        return best;
+        return longestPrefixMatch(StaticRoute, self.static_routes.items, path);
     }
 
     /// Register a reverse proxy route.
     pub fn addProxyRoute(self: *Router, prefix: []const u8, upstream_host: []const u8, upstream_port: u16, redirect: []const u8, strip_prefix: bool) !void {
         const prefix_copy = try self.allocator.dupe(u8, prefix);
         const host_copy = try self.allocator.dupe(u8, upstream_host);
-        const redirect_copy = if (redirect.len > 0) try self.allocator.dupe(u8, redirect) else "";
+        const redirect_copy: ?[]const u8 = if (redirect.len > 0) try self.allocator.dupe(u8, redirect) else null;
         try self.proxy_routes.append(self.allocator, .{
             .prefix = prefix_copy,
             .upstream_host = host_copy,
@@ -161,23 +147,11 @@ pub const Router = struct {
         });
     }
 
-    pub const ProxyMatch = struct { route: ProxyRoute, suffix: []const u8 };
+    pub const ProxyMatch = PrefixMatch(ProxyRoute);
 
     /// Match a path against proxy route prefixes (longest prefix wins).
     pub fn matchProxy(self: *const Router, path: []const u8) ?ProxyMatch {
-        if (self.proxy_routes.items.len == 0) return null;
-        var best: ?ProxyMatch = null;
-        for (self.proxy_routes.items) |pr| {
-            if (std.mem.startsWith(u8, path, pr.prefix)) {
-                const suffix = path[pr.prefix.len..];
-                if (suffix.len == 0 or suffix[0] == '/') {
-                    if (best == null or pr.prefix.len > best.?.route.prefix.len) {
-                        best = .{ .route = pr, .suffix = suffix };
-                    }
-                }
-            }
-        }
-        return best;
+        return longestPrefixMatch(ProxyRoute, self.proxy_routes.items, path);
     }
 
     /// Add a route to the radix tree
@@ -334,7 +308,7 @@ pub const Router = struct {
         for (self.proxy_routes.items) |pr| {
             self.allocator.free(pr.prefix);
             self.allocator.free(pr.upstream_host);
-            if (pr.redirect.len > 0) self.allocator.free(pr.redirect);
+            if (pr.redirect) |r| self.allocator.free(r);
         }
     }
 
@@ -368,6 +342,28 @@ pub const Router = struct {
         self.root.deinit();
     }
 };
+
+/// Longest-prefix-match over a slice of routes that have a `.prefix` field.
+/// Returns the best match and the path suffix after the prefix.
+fn PrefixMatch(comptime T: type) type {
+    return struct { route: T, suffix: []const u8 };
+}
+
+fn longestPrefixMatch(comptime T: type, routes: []const T, path: []const u8) ?PrefixMatch(T) {
+    if (routes.len == 0) return null;
+    var best: ?PrefixMatch(T) = null;
+    for (routes) |r| {
+        if (std.mem.startsWith(u8, path, r.prefix)) {
+            const suffix = path[r.prefix.len..];
+            if (suffix.len == 0 or suffix[0] == '/') {
+                if (best == null or r.prefix.len > best.?.route.prefix.len) {
+                    best = .{ .route = r, .suffix = suffix };
+                }
+            }
+        }
+    }
+    return best;
+}
 
 // Tests
 test "radix router: simple static route" {

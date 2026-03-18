@@ -265,11 +265,7 @@ pub const LuaState = struct {
             0 => {
                 // LUA_OK — handler completed normally
                 prom.luaCoroutineFinished();
-                if (self.coroutine_start_us) |start| {
-                    const elapsed = std.time.microTimestamp() - start;
-                    prom.luaScriptDuration(self.coroutine_route, elapsed);
-                    self.coroutine_start_us = null;
-                }
+                self.recordCoroutineDuration();
                 if (self.cached_thread_ref == 0) self.lua.pop(1);
                 return .completed;
             },
@@ -345,11 +341,7 @@ pub const LuaState = struct {
             0 => {
                 // LUA_OK — handler completed
                 prom.luaCoroutineFinished();
-                if (self.coroutine_start_us) |start| {
-                    const elapsed = std.time.microTimestamp() - start;
-                    prom.luaScriptDuration(self.coroutine_route, elapsed);
-                    self.coroutine_start_us = null;
-                }
+                self.recordCoroutineDuration();
                 return .completed;
             },
             1 => {
@@ -358,11 +350,7 @@ pub const LuaState = struct {
             },
             else => {
                 prom.luaCoroutineFinished();
-                if (self.coroutine_start_us) |start| {
-                    const elapsed = std.time.microTimestamp() - start;
-                    prom.luaScriptDuration(self.coroutine_route, elapsed);
-                    self.coroutine_start_us = null;
-                }
+                self.recordCoroutineDuration();
                 const lua_thread: *Lua = @ptrCast(@alignCast(thread));
                 if (lua_thread.isString(-1)) {
                     const err_msg = lua_thread.toString(-1) catch "unknown error";
@@ -380,6 +368,28 @@ pub const LuaState = struct {
         self.lua.pushInteger(@intCast(worker_id)); // push value
         self.lua.setField(-2, "worker_id");        // keyway.worker_id = N
         self.lua.pop(1);                           // pop keyway table
+    }
+
+    /// Record coroutine execution duration for Prometheus metrics.
+    fn recordCoroutineDuration(self: *LuaState) void {
+        if (self.coroutine_start_us) |start| {
+            const elapsed = std.time.microTimestamp() - start;
+            prom.luaScriptDuration(self.coroutine_route, elapsed);
+            self.coroutine_start_us = null;
+        }
+    }
+
+    /// Extract the LuaState pointer from upvalue(1) closure.
+    fn getLuaState(lua: *Lua) ?*LuaState {
+        const ud = lua.toUserdata(Lua.PseudoIndex.upvalue(1)) orelse return null;
+        return castUserdata(LuaState, @as(?*anyopaque, ud));
+    }
+
+    /// Push nil + error message and return 2 (Lua convention for value, err).
+    fn luaError(lua: *Lua, msg: [:0]const u8) c_int {
+        lua.pushNil();
+        lua.pushString(msg);
+        return 2;
     }
 
     /// Register file I/O C functions as Lua globals.
@@ -401,29 +411,14 @@ pub const LuaState = struct {
 
     /// __keyway_file_read(path) -> string or nil, error
     fn keyway_file_read(lua: *Lua) callconv(.c) c_int {
-        const state: *LuaState = blk: {
-            const ud = lua.toUserdata(Lua.PseudoIndex.upvalue(1)) orelse return 0;
-            break :blk castUserdata(LuaState, @as(?*anyopaque, ud));
-        };
-        const path_c = lua.toString(1) catch {
-            lua.pushNil();
-            lua.pushString("path argument required");
-            return 2;
-        };
+        const state = getLuaState(lua) orelse return 0;
+        const path_c = lua.toString(1) catch return luaError(lua, "path argument required");
         const path = std.mem.span(path_c);
 
-        const file = std.fs.cwd().openFile(path, .{}) catch {
-            lua.pushNil();
-            lua.pushString("file not found");
-            return 2;
-        };
+        const file = std.fs.cwd().openFile(path, .{}) catch return luaError(lua, "file not found");
         defer file.close();
 
-        const content = file.readToEndAlloc(state.allocator, 10 * 1024 * 1024) catch {
-            lua.pushNil();
-            lua.pushString("read error");
-            return 2;
-        };
+        const content = file.readToEndAlloc(state.allocator, 10 * 1024 * 1024) catch return luaError(lua, "read error");
         defer state.allocator.free(content);
 
         lua.pushLString(content);
@@ -432,56 +427,31 @@ pub const LuaState = struct {
 
     /// __keyway_file_write(path, content) -> true or nil, error
     fn keyway_file_write(lua: *Lua) callconv(.c) c_int {
-        const path_c = lua.toString(1) catch {
-            lua.pushNil();
-            lua.pushString("path argument required");
-            return 2;
-        };
-        const content_c = lua.toString(2) catch {
-            lua.pushNil();
-            lua.pushString("content argument required");
-            return 2;
-        };
+        const path_c = lua.toString(1) catch return luaError(lua, "path argument required");
+        const content_c = lua.toString(2) catch return luaError(lua, "content argument required");
         const path = std.mem.span(path_c);
         const content = std.mem.span(content_c);
 
         // Atomic write: write to tmp file, then rename
-        const state: *LuaState = blk: {
-            const ud = lua.toUserdata(Lua.PseudoIndex.upvalue(1)) orelse return 0;
-            break :blk castUserdata(LuaState, @as(?*anyopaque, ud));
-        };
+        const state = getLuaState(lua) orelse return 0;
         const dir_path = std.fs.path.dirname(path) orelse ".";
 
         // Ensure parent directory exists
         std.fs.cwd().makePath(dir_path) catch {};
 
         // Write tmp file and rename
-        const tmp_path = std.fmt.allocPrint(state.allocator, "{s}.tmp", .{path}) catch {
-            lua.pushNil();
-            lua.pushString("allocation failed");
-            return 2;
-        };
+        const tmp_path = std.fmt.allocPrint(state.allocator, "{s}.tmp", .{path}) catch return luaError(lua, "allocation failed");
         defer state.allocator.free(tmp_path);
 
-        const file = std.fs.cwd().createFile(tmp_path, .{}) catch {
-            lua.pushNil();
-            lua.pushString("failed to create tmp file");
-            return 2;
-        };
+        const file = std.fs.cwd().createFile(tmp_path, .{}) catch return luaError(lua, "failed to create tmp file");
         file.writeAll(content) catch {
             file.close();
-            lua.pushNil();
-            lua.pushString("write error");
-            return 2;
+            return luaError(lua, "write error");
         };
         file.close();
 
         // Rename tmp -> target (atomic on same filesystem)
-        std.fs.cwd().rename(tmp_path, path) catch {
-            lua.pushNil();
-            lua.pushString("rename failed");
-            return 2;
-        };
+        std.fs.cwd().rename(tmp_path, path) catch return luaError(lua, "rename failed");
 
         lua.pushBoolean(true);
         return 1;
@@ -489,18 +459,10 @@ pub const LuaState = struct {
 
     /// __keyway_file_delete(path) -> true or nil, error
     fn keyway_file_delete(lua: *Lua) callconv(.c) c_int {
-        const path_c = lua.toString(1) catch {
-            lua.pushNil();
-            lua.pushString("path argument required");
-            return 2;
-        };
+        const path_c = lua.toString(1) catch return luaError(lua, "path argument required");
         const path = std.mem.span(path_c);
 
-        std.fs.cwd().deleteFile(path) catch {
-            lua.pushNil();
-            lua.pushString("delete failed");
-            return 2;
-        };
+        std.fs.cwd().deleteFile(path) catch return luaError(lua, "delete failed");
 
         lua.pushBoolean(true);
         return 1;
@@ -508,24 +470,12 @@ pub const LuaState = struct {
 
     /// __keyway_file_rename(old_path, new_path) -> true or nil, error
     fn keyway_file_rename(lua: *Lua) callconv(.c) c_int {
-        const old_c = lua.toString(1) catch {
-            lua.pushNil();
-            lua.pushString("old_path argument required");
-            return 2;
-        };
-        const new_c = lua.toString(2) catch {
-            lua.pushNil();
-            lua.pushString("new_path argument required");
-            return 2;
-        };
+        const old_c = lua.toString(1) catch return luaError(lua, "old_path argument required");
+        const new_c = lua.toString(2) catch return luaError(lua, "new_path argument required");
         const old_path = std.mem.span(old_c);
         const new_path = std.mem.span(new_c);
 
-        std.fs.cwd().rename(old_path, new_path) catch {
-            lua.pushNil();
-            lua.pushString("rename failed");
-            return 2;
-        };
+        std.fs.cwd().rename(old_path, new_path) catch return luaError(lua, "rename failed");
 
         lua.pushBoolean(true);
         return 1;
@@ -533,15 +483,8 @@ pub const LuaState = struct {
 
     /// __keyway_file_list(dir) -> table of {path, name} or nil, error
     fn keyway_file_list(lua: *Lua) callconv(.c) c_int {
-        const state: *LuaState = blk: {
-            const ud = lua.toUserdata(Lua.PseudoIndex.upvalue(1)) orelse return 0;
-            break :blk castUserdata(LuaState, @as(?*anyopaque, ud));
-        };
-        const dir_c = lua.toString(1) catch {
-            lua.pushNil();
-            lua.pushString("dir argument required");
-            return 2;
-        };
+        const state = getLuaState(lua) orelse return 0;
+        const dir_c = lua.toString(1) catch return luaError(lua, "dir argument required");
         const dir_path = std.mem.span(dir_c);
 
         lua.createTable(0, 0);

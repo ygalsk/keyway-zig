@@ -786,12 +786,11 @@ pub const Connection = struct {
         const server = self.server;
         const status_str: []const u8 = if (server.draining) "draining" else "ok";
         const http_status: u16 = if (server.draining) 503 else 200;
+        const status_text: []const u8 = if (server.draining) "Service Unavailable" else "OK";
 
         // Aggregate metrics from all workers via the metrics slice stored on server
         const agg = metrics_mod.aggregate(server.all_worker_metrics, status_str);
 
-        // Build full HTTP response in a single allocation (JSON body is small and bounded)
-        const status_line: []const u8 = if (http_status == 200) "HTTP/1.1 200 OK" else "HTTP/1.1 503 Service Unavailable";
         const json_fmt = "{{\"status\":\"{s}\",\"worker_count\":{d},\"total_requests\":{d},\"total_errors\":{d},\"active_connections\":{d},\"rejected_connections\":{d},\"latency\":{{\"min_us\":{d},\"max_us\":{d},\"avg_us\":{d}}}}}";
         const json_args = .{
             agg.status,
@@ -804,14 +803,11 @@ pub const Connection = struct {
             agg.latency_max_us,
             agg.latency_avg_us,
         };
-        const json_len = std.fmt.count(json_fmt, json_args);
-        const response_text = std.fmt.allocPrint(alloc, "{s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n" ++ json_fmt, .{status_line, json_len} ++ json_args) catch {
+        const body = std.fmt.allocPrint(alloc, json_fmt, json_args) catch {
             error_response.sendError(self, .server_error, "health endpoint allocation failed");
             return;
         };
-
-        self.logAccess(http_status);
-        self.sendRawResponse(response_text);
+        self.sendJsonResponse(alloc, http_status, status_text, body);
     }
 
     /// Prometheus metrics endpoint. Returns text exposition format.
@@ -835,25 +831,23 @@ pub const Connection = struct {
         self.sendRawResponse(full);
     }
 
+    /// Format and send a JSON HTTP response with the given status and body.
+    fn sendJsonResponse(self: *Connection, alloc: std.mem.Allocator, status_code: u16, status_text: []const u8, body: []const u8) void {
+        const resp = std.fmt.allocPrint(alloc, "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ status_code, status_text, body.len, body }) catch {
+            error_response.sendError(self, .server_error, "response allocation failed");
+            return;
+        };
+        self.logAccess(status_code);
+        self.sendRawResponse(resp);
+    }
+
     /// Reload endpoint: signals all workers to hot-reload their Lua state.
     fn serveReload(self: *Connection, alloc: std.mem.Allocator) void {
         if (self.server.reload_coordinator) |coord| {
             coord.signalReload();
-            const body = "{\"status\":\"reload_triggered\"}";
-            const response_text = std.fmt.allocPrint(alloc, "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch {
-                error_response.sendError(self, .server_error, "reload response allocation failed");
-                return;
-            };
-            self.logAccess(200);
-            self.sendRawResponse(response_text);
+            self.sendJsonResponse(alloc, 200, "OK", "{\"status\":\"reload_triggered\"}");
         } else {
-            const body = "{\"error\":\"reload not available\"}";
-            const response_text = std.fmt.allocPrint(alloc, "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch {
-                error_response.sendError(self, .server_error, "reload response allocation failed");
-                return;
-            };
-            self.logAccess(503);
-            self.sendRawResponse(response_text);
+            self.sendJsonResponse(alloc, 503, "Service Unavailable", "{\"error\":\"reload not available\"}");
         }
     }
 
@@ -862,16 +856,16 @@ pub const Connection = struct {
         const prefix = proxy_match.route.prefix;
 
         // Bare prefix with a configured redirect → 302
-        if (proxy_match.route.redirect.len > 0 and
-            (proxy_match.suffix.len == 0 or std.mem.eql(u8, proxy_match.suffix, "/")))
-        {
-            const resp = std.fmt.allocPrint(alloc, "HTTP/1.1 302 Found\r\nLocation: {s}\r\nContent-Length: 0\r\n\r\n", .{proxy_match.route.redirect}) catch {
-                error_response.sendError(self, .server_error, "proxy redirect failed");
+        if (proxy_match.route.redirect) |redirect| {
+            if (proxy_match.suffix.len == 0 or std.mem.eql(u8, proxy_match.suffix, "/")) {
+                const resp = std.fmt.allocPrint(alloc, "HTTP/1.1 302 Found\r\nLocation: {s}\r\nContent-Length: 0\r\n\r\n", .{redirect}) catch {
+                    error_response.sendError(self, .server_error, "proxy redirect failed");
+                    return;
+                };
+                self.logAccess(302);
+                self.sendRawResponse(resp);
                 return;
-            };
-            self.logAccess(302);
-            self.sendRawResponse(resp);
-            return;
+            }
         }
 
         // Build upstream path
