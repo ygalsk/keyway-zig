@@ -50,19 +50,16 @@ fn encodeValue(lua: *Lua, idx: i32, buf: *Buf, depth: u32) EncodeError!void {
     // Compute absolute index so stack growth during recursion doesn't shift it.
     const abs = if (idx > 0) idx else lua.getTop() + idx + 1;
 
-    if (lua.isNil(abs)) {
-        buf.appendSlice(alloc, "null") catch return error.OutOfMemory;
-    } else if (lua.isBoolean(abs)) {
-        buf.appendSlice(alloc, if (lua.toBoolean(abs)) "true" else "false") catch return error.OutOfMemory;
-    } else if (lua.isNumber(abs)) {
-        try encodeNumber(lua, abs, buf);
-    } else if (lua.isString(abs)) {
-        const str = lua.toLString(abs) catch return error.NotSerializable;
-        try encodeString(str, buf);
-    } else if (lua.isTable(abs)) {
-        try encodeTable(lua, abs, buf, depth);
-    } else {
-        return error.NotSerializable;
+    switch (lua.getType(abs)) {
+        .nil, .none => buf.appendSlice(alloc, "null") catch return error.OutOfMemory,
+        .boolean => buf.appendSlice(alloc, if (lua.toBoolean(abs)) "true" else "false") catch return error.OutOfMemory,
+        .string => {
+            const str = lua.toLString(abs) catch return error.NotSerializable;
+            try encodeString(str, buf);
+        },
+        .number => try encodeNumber(lua, abs, buf),
+        .table => try encodeTable(lua, abs, buf, depth),
+        else => return error.NotSerializable,
     }
 }
 
