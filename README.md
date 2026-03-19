@@ -155,12 +155,25 @@ Access is restricted to localhost (`127.0.0.1` / `::1`). Manual reload: `POST /_
 
 Keyway exposes Prometheus metrics at `/metrics` (text exposition format).
 
-Key metrics:
+**HTTP**
 - `keyway_http_requests_total` — counter by worker, method, status, route
-- `keyway_http_request_duration_seconds` — latency histogram
+- `keyway_http_request_duration_seconds` — latency histogram by worker, route
+- `keyway_http_request_body_bytes` — request body size histogram
+- `keyway_http_response_body_bytes` — response body size histogram
+
+**Connections**
+- `keyway_connections_accepted_total` — per-worker counter
 - `keyway_connections_active` — per-worker gauge
+- `keyway_connections_rejected_total` — per-worker counter
+
+**io_uring**
+- `keyway_ring_submissions_total` — SQE count per worker
+- `keyway_ring_completions_total` — CQE count per worker
+- `keyway_ring_batch_size` — submissions per batch histogram
+
+**Lua runtime**
 - `keyway_lua_coroutines_active` — per-worker gauge
-- `keyway_lua_script_duration_seconds` — Lua execution histogram
+- `keyway_lua_script_duration_seconds` — execution time histogram by worker, route
 
 A docker-compose stack for Prometheus + Grafana is included:
 
