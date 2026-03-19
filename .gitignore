@@ -27,6 +27,12 @@ certs/
 # Node modules
 node_modules/
 
+# Planning artifacts
+.planning/
+
+# Test results
+tests/test-results/
+
 # Profiling
 perf.data*
 *.svg
