@@ -148,8 +148,8 @@ pub const Connection = struct {
     peer_addr_len: u8 = 0,
 
     // Completions (must have stable address!)
-    read_completion: xev.Completion,
-    write_completion: xev.Completion,
+    read_completion: xev.Completion = .{},
+    write_completion: xev.Completion = .{},
 
     // Buffers (allocated from base_allocator, persist across requests)
     read_buffer: LinearBuffer,
@@ -231,8 +231,8 @@ pub const Connection = struct {
             .socket = socket,
             .router = router,
             .lua_state = lua_state,
-            .read_completion = undefined,
-            .write_completion = undefined,
+            .read_completion = .{},
+            .write_completion = .{},
             .read_buffer = read_buf,
             .param_cache = ParamArray{},
             .query_cache = QueryArray{},

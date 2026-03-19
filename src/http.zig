@@ -359,11 +359,11 @@ test "picohttpparser websocket upgrade headers" {
     defer allocator.free(request.headers);
 
     // Verify picohttpparser returns exact header value (no trailing whitespace)
-    const sec_key = getHeader(&request, "Sec-WebSocket-Key").?;
+    const sec_key = Parser.getHeader(&request, "Sec-WebSocket-Key").?;
     try std.testing.expectEqualStrings("VRr1Px7jQfIhHCVGc+tb4w==", sec_key);
     try std.testing.expectEqual(@as(usize, 24), sec_key.len);
 
-    const upgrade = getHeader(&request, "Upgrade").?;
+    const upgrade = Parser.getHeader(&request, "Upgrade").?;
     try std.testing.expectEqualStrings("websocket", upgrade);
 
     // Verify accept key computation with this specific key
@@ -374,10 +374,6 @@ test "picohttpparser websocket upgrade headers" {
 
     // Verify the accept key is valid base64 (28 chars)
     try std.testing.expectEqual(@as(usize, 28), accept_key.len);
-}
-
-fn getHeader(req: *const Request, name: []const u8) ?[]const u8 {
-    return Parser.getHeader(req, name);
 }
 
 /// Encode data as a chunked transfer encoding chunk: "{hex_len}\r\n{data}\r\n"

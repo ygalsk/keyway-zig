@@ -123,6 +123,8 @@ import { ConsoleCore } from "./views/console";
 // ─── App ────────────────────────────────────────────────
 
 const TRAFFIC_MAX = 500;
+const WS_MESSAGE_MAX = 200;
+const ERROR_MAX = 10;
 const MAC = typeof navigator !== "undefined" && /Mac/.test(navigator.userAgent);
 const CONSOLE_MIN_H = 120;
 const CONSOLE_MAX_VH = 70;
@@ -133,6 +135,10 @@ const NAV = [
   { path: "/files",  label: "Files" },
   { path: "/routes", label: "Routes" },
 ];
+
+function getClientY(e: MouseEvent | TouchEvent): number {
+  return "touches" in e ? e.touches[0].clientY : e.clientY;
+}
 
 interface ToastError { message: string; ts: number; }
 
@@ -162,7 +168,7 @@ function App() {
   function onDragStart(e: MouseEvent | TouchEvent) {
     e.preventDefault();
     dragging = true;
-    dragStartY = "touches" in e ? e.touches[0].clientY : e.clientY;
+    dragStartY = getClientY(e);
     dragStartH = consoleHeight();
     document.addEventListener("mousemove", onDragMove);
     document.addEventListener("mouseup", onDragEnd);
@@ -173,7 +179,7 @@ function App() {
   function onDragMove(e: MouseEvent | TouchEvent) {
     if (!dragging) return;
     if ("touches" in e) e.preventDefault();
-    const clientY = "touches" in e ? e.touches[0].clientY : e.clientY;
+    const clientY = getClientY(e);
     const maxH = window.innerHeight * (CONSOLE_MAX_VH / 100);
     const delta = dragStartY - clientY;
     const newH = Math.min(maxH, Math.max(CONSOLE_MIN_H, dragStartH + delta));
@@ -194,9 +200,9 @@ function App() {
     setTraffic(prev => { const n = [entry, ...prev]; if (n.length > TRAFFIC_MAX) n.length = TRAFFIC_MAX; return n; });
   }
   function pushWsMessage(msg: Record<string, unknown>) {
-    setWsMessages(prev => [...(prev.length >= 200 ? prev.slice(1) : prev), { ...msg, _ts: Date.now() }]);
+    setWsMessages(prev => [...(prev.length >= WS_MESSAGE_MAX ? prev.slice(1) : prev), { ...msg, _ts: Date.now() }]);
   }
-  function pushError(message: string) { setErrors(prev => [...prev.slice(-9), { message, ts: Date.now() }]); }
+  function pushError(message: string) { setErrors(prev => [...prev.slice(-(ERROR_MAX - 1)), { message, ts: Date.now() }]); }
   function dismissError(ts: number) { setErrors(prev => prev.filter(e => e.ts !== ts)); }
   _pushError = pushError;
 
