@@ -1,0 +1,39 @@
+# Production compose — CPU-pinned keyway with observability stack.
+#
+# Keyway's proactor model pins one worker per physical core for cache
+# locality, NUMA-local allocation, and eBPF connection affinity.
+# For this to work in Docker, the container needs dedicated cores.
+#
+# Adjust cpuset and KEYWAY_WORKERS to match your host topology:
+#   - cpuset must list the exact cores keyway owns
+#   - KEYWAY_WORKERS must equal the number of cores in cpuset
+#   - Keep observability services OFF those cores
+#
+# Usage:
+#   docker compose -f docker-compose.prod.yml up
+
+services:
+  keyway:
+    build: .
+    ports: ["8080:8080"]
+    env_file: .env
+    cpuset: "0-3"
+    environment:
+      - KEYWAY_WORKERS=4
+    cap_add:
+      - SYS_NICE       # sched_setaffinity
+      - NET_ADMIN       # SO_ATTACH_REUSEPORT_CBPF
+
+  prometheus:
+    image: prom/prometheus:v3.2.1
+    cpuset: "4-5"
+    volumes: ["./observability/prometheus.yml:/etc/prometheus/prometheus.yml"]
+    ports: ["9090:9090"]
+
+  grafana:
+    image: grafana/grafana:11.5.2
+    cpuset: "4-5"
+    volumes:
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning
+      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards
+    ports: ["3000:3000"]
