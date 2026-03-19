@@ -85,6 +85,25 @@ No `send()`, no `write()`, no lifecycle calls — only state assignment. Zig com
 - **Prometheus metrics** — `/metrics` endpoint with request latency, connection gauges, Lua execution histograms.
 - **eBPF** — optional `SO_REUSEPORT` connection affinity via classic BPF.
 
+## Project Structure
+
+```
+src/
+├── main.zig
+├── core/           # server, worker, handler, shutdown, reload
+├── http/           # HTTP types, exchange, router, params, static
+├── protocol/       # WebSocket, SSE, chunked streaming
+├── tls/            # TLS primitives, inbound/outbound handshake
+├── io/             # cosocket engine, ring, connection pool, BPF
+├── lua/            # LuaJIT state management, Lua API bindings
+├── observability/  # logging, metrics, Prometheus
+└── util/           # buffer, helpers, config, CLI
+dashboard/          # Solid.js admin dashboard + keyway.lua entry script
+lua/                # Lua stdlib modules (keyway.socket, keyway.dns, etc.)
+tests/              # Integration tests (Bun)
+observability/      # Prometheus + Grafana config
+```
+
 ## Build
 
 ```bash
@@ -178,7 +197,8 @@ Keyway exposes Prometheus metrics at `/metrics` (text exposition format).
 A docker-compose stack for Prometheus + Grafana is included:
 
 ```bash
-cd observability && docker compose up -d
+docker compose up
+# Keyway:     http://localhost:8080
 # Prometheus: http://localhost:9090
 # Grafana:    http://localhost:3000
 ```
