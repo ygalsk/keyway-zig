@@ -1,11 +1,11 @@
 const std = @import("std");
-const log = @import("log.zig");
-const cli = @import("cli.zig");
-const Server = @import("server.zig").Server;
-const ThreadPool = @import("worker.zig").ThreadPool;
-const shutdown = @import("shutdown.zig");
-const reload = @import("reload.zig");
-const prom = @import("prom.zig");
+const log = @import("observability/log.zig");
+const cli = @import("util/cli.zig");
+const Server = @import("core/server.zig").Server;
+const ThreadPool = @import("core/worker.zig").ThreadPool;
+const shutdown = @import("core/shutdown.zig");
+const reload = @import("core/reload.zig");
+const prom = @import("observability/prom.zig");
 
 pub const version = "0.1.0";
 
@@ -102,29 +102,29 @@ pub fn main() !void {
 // the comptime/runtime code path. Explicitly referencing every test-bearing
 // module here ensures `zig build test` runs the full suite.
 comptime {
-    _ = @import("bpf_reuseport.zig");
-    _ = @import("buffer.zig");
-    _ = @import("cli.zig");
-    _ = @import("connection_pool.zig");
-    _ = @import("cosocket.zig");
-    _ = @import("cosocket_ops.zig");
-    _ = @import("error_response.zig");
-    _ = @import("file_watcher.zig");
-    _ = @import("handler.zig");
-    _ = @import("helpers.zig");
-    _ = @import("http.zig");
-    _ = @import("log.zig");
-    _ = @import("lua_state.zig");
-    _ = @import("metrics.zig");
-    _ = @import("params.zig");
-    _ = @import("prom.zig");
-    _ = @import("reload.zig");
-    _ = @import("ring.zig");
-    _ = @import("router.zig");
-    _ = @import("server.zig");
-    _ = @import("shutdown.zig");
-    _ = @import("sse.zig");
-    _ = @import("static.zig");
-    _ = @import("tls.zig");
-    _ = @import("ws.zig");
+    _ = @import("io/bpf_reuseport.zig");
+    _ = @import("util/buffer.zig");
+    _ = @import("util/cli.zig");
+    _ = @import("io/connection_pool.zig");
+    _ = @import("io/cosocket.zig");
+    _ = @import("io/cosocket_ops.zig");
+    _ = @import("http/error_response.zig");
+    _ = @import("io/file_watcher.zig");
+    _ = @import("core/handler.zig");
+    _ = @import("util/helpers.zig");
+    _ = @import("http/http.zig");
+    _ = @import("observability/log.zig");
+    _ = @import("lua/lua_state.zig");
+    _ = @import("observability/metrics.zig");
+    _ = @import("http/params.zig");
+    _ = @import("observability/prom.zig");
+    _ = @import("core/reload.zig");
+    _ = @import("io/ring.zig");
+    _ = @import("http/router.zig");
+    _ = @import("core/server.zig");
+    _ = @import("core/shutdown.zig");
+    _ = @import("protocol/sse.zig");
+    _ = @import("http/static.zig");
+    _ = @import("tls/tls.zig");
+    _ = @import("protocol/ws.zig");
 }

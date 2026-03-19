@@ -9,7 +9,7 @@ import { resolve } from "path";
 
 const PROJECT_ROOT = resolve(import.meta.dir, "..");
 const BINARY = resolve(PROJECT_ROOT, "zig-out/bin/keyway");
-const SCRIPT = resolve(PROJECT_ROOT, "scripts/dashboard/keyway.lua");
+const SCRIPT = resolve(PROJECT_ROOT, "dashboard/keyway.lua");
 const PORT = 10000 + Math.floor(Math.random() * 50000);
 
 declare global {

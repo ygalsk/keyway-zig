@@ -27,6 +27,7 @@
         "build.zig",
         "build.zig.zon",
         "src",
-        "scripts",
+        "lua",
+        "dashboard",
     },
 }

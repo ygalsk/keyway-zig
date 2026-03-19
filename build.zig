@@ -79,9 +79,9 @@ fn addSharedDeps(
     compile.root_module.addImport("luajit", luajit_dep.module("luajit"));
     compile.root_module.addImport("metrics", metrics_dep.module("metrics"));
     compile.root_module.addImport("logz", logz_dep.module("logz"));
-    // Lua stdlib: scripts/keyway/stdlib.zig uses @embedFile for sibling .lua files
+    // Lua stdlib: lua/stdlib.zig uses @embedFile for sibling .lua files
     compile.root_module.addImport("stdlib", b.createModule(.{
-        .root_source_file = b.path("scripts/keyway/stdlib.zig"),
+        .root_source_file = b.path("lua/stdlib.zig"),
     }));
     compile.addCSourceFile(.{
         .file = b.path("vendor/picohttpparser.c"),
