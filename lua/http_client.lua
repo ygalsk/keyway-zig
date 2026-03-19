@@ -3,7 +3,7 @@
 -- Supports GET (probe) and POST requests.
 
 local socket  = require("keyway.socket")
-local url_lib = require("net.url")
+-- Minimal URL parser (replaces net.url LuaRock)
 local dns     = require("keyway.dns")
 
 local ffi = require("ffi")
@@ -47,25 +47,28 @@ local function parse_url(raw)
     if not raw or raw == "" then
         return nil, "URL is required"
     end
-    local u = url_lib.parse(raw)
-    if not u or not u.host or u.host == "" then
-        return nil, "Invalid URL: could not parse host"
-    end
-    if u.scheme ~= "http" and u.scheme ~= "https" then
+    local scheme, rest = raw:match("^(https?)://(.+)$")
+    if not scheme then
         return nil, "Only HTTP and HTTPS URLs are supported"
     end
-    -- Use parsed path from url library, fall back to "/"
-    local path_and_query = tostring(u.path) or "/"
-    if path_and_query == "" then path_and_query = "/" end
-    if u.query and tostring(u.query) ~= "" then
-        path_and_query = path_and_query .. "?" .. tostring(u.query)
+    -- Split authority from path
+    local authority, path_query = rest:match("^([^/]+)(.*)$")
+    if not authority or authority == "" then
+        return nil, "Invalid URL: could not parse host"
     end
-    local default_port = (u.scheme == "https") and 443 or 80
+    -- Split host:port
+    local host, port_str = authority:match("^(.+):(%d+)$")
+    if not host then host = authority end
+    if host == "" then
+        return nil, "Invalid URL: could not parse host"
+    end
+    local default_port = (scheme == "https") and 443 or 80
+    local path_and_query = (path_query and path_query ~= "") and path_query or "/"
     return {
-        host           = u.host,
-        port           = tonumber(u.port) or default_port,
+        host           = host,
+        port           = tonumber(port_str) or default_port,
         path_and_query = path_and_query,
-        scheme         = u.scheme,
+        scheme         = scheme,
     }
 end
 

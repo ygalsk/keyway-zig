@@ -2,7 +2,7 @@
 -- Lua files on disk control the runtime. The dashboard is a file editor.
 
 local response = require("keyway.response")
-local cjson = require("cjson")
+local json = require("keyway.json")
 local dns = require("keyway.dns")
 local http = require("keyway.http")
 
@@ -128,7 +128,8 @@ end
 local function localhost_guard(ctx, next)
     if ctx.path and ctx.path:match("^/__keyway/") then
         local addr = ctx.remote_addr or ""
-        if addr ~= "127.0.0.1" and addr ~= "::1" then
+        -- Allow localhost and Docker bridge networks (172.x.x.x)
+        if addr ~= "127.0.0.1" and addr ~= "::1" and not addr:match("^172%.") then
             ctx.status = 403
             ctx.body = "Forbidden"
             return
@@ -155,7 +156,7 @@ keyway.middleware.register("mw_before", mw_before)
 keyway.middleware.register("mw_after", mw_after)
 
 local function ws_reply(ws, tbl)
-    ws:send(cjson.encode(tbl))
+    ws:send(json.encode(tbl))
 end
 
 local function ws_error(ws, cmd, msg)
@@ -216,7 +217,7 @@ keyway.routes = {
         GET = function(ctx)
             ctx.upgrade = "websocket"
             ctx.on_message = function(ws)
-                local ok, msg = pcall(cjson.decode, ws.message)
+                local ok, msg = pcall(json.decode, ws.message)
                 if not ok then
                     ws_reply(ws, { error = "invalid json" })
                     return
@@ -237,7 +238,7 @@ keyway.routes = {
     -- HTTP Probe
     ["/__keyway/api/probe"] = {
         POST = function(ctx)
-            local ok, body = pcall(cjson.decode, ctx.body)
+            local ok, body = pcall(json.decode, ctx.body)
             if not ok or not body.url then
                 response.json_response(ctx, 400, { error = "JSON body with 'url' field required" })
                 return
@@ -270,7 +271,7 @@ keyway.routes = {
     -- DNS Lookup
     ["/__keyway/api/dns"] = {
         POST = function(ctx)
-            local ok, body = pcall(cjson.decode, ctx.body)
+            local ok, body = pcall(json.decode, ctx.body)
             if not ok or not body.domain then
                 response.json_response(ctx, 400, { error = "JSON body with 'domain' field required" })
                 return
@@ -373,7 +374,7 @@ keyway.routes = {
     -- Update middleware for a specific route pattern
     ["/__keyway/api/routes/{pattern}/middleware"] = {
         PUT = function(ctx)
-            local ok, body = pcall(cjson.decode, ctx.body)
+            local ok, body = pcall(json.decode, ctx.body)
             if not ok or type(body.middleware) ~= "table" then
                 response.json_response(ctx, 400, { error = "JSON body with 'middleware' array required" })
                 return
@@ -427,7 +428,7 @@ keyway.routes = {
                     end
                     overrides["__global"] = global_names
                 end
-                redis.set("keyway:mw:overrides", cjson.encode(overrides))
+                redis.set("keyway:mw:overrides", json.encode(overrides))
             end)
 
             response.json_response(ctx, 200, { ok = true, pattern = pattern })
@@ -437,7 +438,7 @@ keyway.routes = {
     -- Update global middleware order
     ["/__keyway/api/middleware/global"] = {
         PUT = function(ctx)
-            local ok, body = pcall(cjson.decode, ctx.body)
+            local ok, body = pcall(json.decode, ctx.body)
             if not ok or type(body.middleware) ~= "table" then
                 response.json_response(ctx, 400, { error = "JSON body with 'middleware' array required" })
                 return
@@ -480,7 +481,7 @@ keyway.routes = {
                 return
             end
 
-            local ok_json, overrides = pcall(cjson.decode, data)
+            local ok_json, overrides = pcall(json.decode, data)
             if not ok_json then
                 response.json_response(ctx, 200, { synced = false, reason = "invalid json in redis" })
                 return
@@ -556,7 +557,7 @@ keyway.routes = {
             response.json_response(ctx, 200, { path = decoded, content = content })
         end,
         PUT = function(ctx)
-            local ok, body = pcall(cjson.decode, ctx.body)
+            local ok, body = pcall(json.decode, ctx.body)
             if not ok or not body.content then
                 response.json_response(ctx, 400, { error = "JSON body with 'content' field required" })
                 return

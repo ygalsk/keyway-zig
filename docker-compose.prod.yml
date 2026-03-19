@@ -16,6 +16,7 @@ services:
   keyway:
     build: .
     ports: ["8080:8080"]
+    security_opt: [seccomp:unconfined]  # io_uring requires unconfined seccomp
     env_file:
       - path: .env
         required: false
@@ -29,13 +30,13 @@ services:
   prometheus:
     image: prom/prometheus:v3.2.1
     cpuset: "4-5"
-    volumes: ["./observability/prometheus.yml:/etc/prometheus/prometheus.yml"]
+    volumes: ["./observability/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
     ports: ["9090:9090"]
 
   grafana:
     image: grafana/grafana:11.5.2
     cpuset: "4-5"
     volumes:
-      - ./observability/grafana/provisioning:/etc/grafana/provisioning
-      - ./observability/grafana/dashboards:/var/lib/grafana/dashboards
+      - ./observability/grafana/provisioning:/etc/grafana/provisioning:ro
+      - ./observability/grafana/dashboards-json:/var/lib/grafana/dashboards:ro
     ports: ["3000:3000"]

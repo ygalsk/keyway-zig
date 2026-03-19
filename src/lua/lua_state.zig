@@ -32,6 +32,7 @@ pub extern "c" fn lua_resume(L: *anyopaque, narg: c_int) c_int;
 // Embedded stdlib modules — compiled into the binary at build time.
 // Registered as package.preload["keyway.*"] so require() resolves without disk I/O.
 // scripts/keyway/stdlib.zig uses @embedFile for sibling .lua files, imported via build.zig.
+const json = @import("json.zig");
 const stdlib = @import("stdlib");
 const embedded_modules = .{
     .{ "keyway.socket", stdlib.socket },
@@ -42,6 +43,7 @@ const embedded_modules = .{
     .{ "keyway.response", stdlib.response },
     .{ "keyway.crypto", stdlib.crypto },
     .{ "keyway.http", stdlib.http },
+    .{ "keyway.json", stdlib.json },
 };
 
 /// Lua state manager - Deep module with simple interface
@@ -108,6 +110,12 @@ pub const LuaState = struct {
 
         // Embed stdlib modules as package.preload entries (always available, no disk I/O)
         registerEmbeddedModules(lua);
+
+        // Register JSON C functions as globals (used by lua/json.lua wrapper)
+        lua.pushCFunction(json.jsonEncode);
+        lua.setGlobal("__keyway_json_encode");
+        lua.pushCFunction(json.jsonDecode);
+        lua.setGlobal("__keyway_json_decode");
 
         // Create reusable coroutine thread (avoids lua_newThread per request)
         const cached_thread = lua.newThread();
@@ -653,7 +661,7 @@ pub const LuaState = struct {
             \\    ["string"] = true, ["table"] = true, ["math"] = true, ["io"] = true,
             \\    ["os"] = true, ["debug"] = true, ["coroutine"] = true, ["package"] = true,
             \\    ["bit"] = true, ["ffi"] = true, ["jit"] = true, ["jit.opt"] = true,
-            \\    ["jit.util"] = true, ["cjson"] = true,
+            \\    ["jit.util"] = true, ["keyway.json"] = true,
             \\}
             \\for name in pairs(package.loaded) do
             \\    if not keep[name] and not name:match("^keyway%.") then
@@ -834,6 +842,7 @@ test "embedded stdlib modules are preloaded" {
     try state.loadString("assert(type(package.preload['keyway.response']) == 'function')");
     try state.loadString("assert(type(package.preload['keyway.crypto']) == 'function')");
     try state.loadString("assert(type(package.preload['keyway.http']) == 'function')");
+    try state.loadString("assert(type(package.preload['keyway.json']) == 'function')");
 }
 
 test "middleware execution order" {

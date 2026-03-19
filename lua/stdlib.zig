@@ -9,3 +9,4 @@ pub const form = @embedFile("form.lua");
 pub const response = @embedFile("response.lua");
 pub const crypto = @embedFile("pgcrypto.lua");
 pub const http = @embedFile("http_client.lua");
+pub const json = @embedFile("json.lua");

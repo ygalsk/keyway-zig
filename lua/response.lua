@@ -1,5 +1,5 @@
 -- response.lua — Universal response helpers (stdlib)
-local cjson = require("cjson")
+local json = require("keyway.json")
 
 local M = {}
 
@@ -7,7 +7,7 @@ local M = {}
 function M.json_response(ctx, status, data)
     ctx.status = status
     ctx.headers["Content-Type"] = "application/json; charset=utf-8"
-    ctx.body = cjson.encode(data)
+    ctx.body = json.encode(data)
 end
 
 --- Case-insensitive header lookup
@@ -49,7 +49,7 @@ end
 
 --- Broadcast an SSE event with automatic JSON encoding
 function M.broadcast_event(room, data)
-    __keyway_sse_broadcast(room, "data: " .. cjson.encode(data) .. "\n")
+    __keyway_sse_broadcast(room, "data: " .. json.encode(data) .. "\n")
 end
 
 --- Broadcast a typed SSE event with raw data (e.g. pre-rendered HTML)
@@ -64,7 +64,7 @@ end
 
 --- Parse JSON body, send 400 on failure. Returns (data, nil) or (nil, true).
 function M.parse_json_body(ctx)
-    local ok, data = pcall(cjson.decode, ctx.body)
+    local ok, data = pcall(json.decode, ctx.body)
     if not ok then
         M.json_response(ctx, 400, { error = "invalid JSON" })
         return nil, true
