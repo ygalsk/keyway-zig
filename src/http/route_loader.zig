@@ -221,22 +221,29 @@ fn registerRoute(
     }
 }
 
-/// Process keyway.static table after script load.
-/// Registers static file serving routes with the router.
-pub fn processStaticTable(lua: *Lua, router: *Router) !void {
+/// Walk a keyway sub-table (e.g. keyway.static or keyway.proxy).
+/// For each entry with a valid "/" prefix and table value, calls the visitor with the
+/// Lua state (value table on top), prefix, and router. The visitor returns true to
+/// continue iteration, false to skip (already logged its own warning).
+fn walkKeywaySubtable(
+    lua: *Lua,
+    router: *Router,
+    sub_table: [:0]const u8,
+    log_context: []const u8,
+    visitor: *const fn (*Lua, *Router, []const u8) void,
+) void {
     const keyway_type = lua.getGlobal("keyway");
     if (keyway_type != .table) {
         lua.pop(1);
-        return; // no keyway table — not an error
+        return;
     }
 
-    const static_type = lua.getField(-1, "static");
-    if (static_type != .table) {
+    const field_type = lua.getField(-1, sub_table);
+    if (field_type != .table) {
         lua.pop(2);
-        return; // no keyway.static — not an error, static serving is optional
+        return;
     }
 
-    // Iterate keyway.static entries: { ["/prefix"] = { root = "...", index = "..." } }
     lua.pushNil();
     while (lua.next(-2)) {
         const key_cstr = lua.toString(-2) catch {
@@ -246,114 +253,94 @@ pub fn processStaticTable(lua: *Lua, router: *Router) !void {
         const prefix = std.mem.span(key_cstr);
 
         if (!lua.isTable(-1) or prefix.len == 0 or prefix[0] != '/') {
-            log.warn().string("msg", "keyway.static ignoring invalid entry").string("key", prefix).log();
+            log.warn().string("msg", "ignoring invalid entry").string("context", log_context).string("key", prefix).log();
             lua.pop(1);
             continue;
         }
 
-        // Read root (required)
-        const root_type = lua.getField(-1, "root");
-        const root_str = if (root_type == .string) std.mem.span(lua.toString(-1) catch "") else "";
-        lua.pop(1);
+        visitor(lua, router, prefix);
 
-        if (root_str.len == 0) {
-            log.warn().string("msg", "keyway.static missing 'root' field").string("prefix", prefix).log();
-            lua.pop(1);
-            continue;
-        }
-
-        // Read index (optional, defaults to "index.html")
-        const index_type = lua.getField(-1, "index");
-        const index_str = if (index_type == .string) std.mem.span(lua.toString(-1) catch "index.html") else "index.html";
-        lua.pop(1);
-
-        router.addStaticRoute(prefix, root_str, index_str) catch |err| {
-            log.err().string("msg", "keyway.static failed to register").string("prefix", prefix).err(err).log();
-            lua.pop(1);
-            continue;
-        };
-
-        log.info().string("msg", "static route registered").string("prefix", prefix).string("root", root_str).string("index", index_str).log();
         lua.pop(1); // pop value, keep key
     }
 
-    lua.pop(2); // pop static + keyway
+    lua.pop(2); // pop sub-table + keyway
+}
+
+/// Process keyway.static table after script load.
+/// Registers static file serving routes with the router.
+pub fn processStaticTable(lua: *Lua, router: *Router) void {
+    walkKeywaySubtable(lua, router, "static", "keyway.static", registerStaticEntry);
+}
+
+fn registerStaticEntry(lua: *Lua, router: *Router, prefix: []const u8) void {
+    // Read root (required)
+    const root_type = lua.getField(-1, "root");
+    const root_str = if (root_type == .string) std.mem.span(lua.toString(-1) catch "") else "";
+    lua.pop(1);
+
+    if (root_str.len == 0) {
+        log.warn().string("msg", "keyway.static missing 'root' field").string("prefix", prefix).log();
+        return;
+    }
+
+    // Read index (optional, defaults to "index.html")
+    const index_type = lua.getField(-1, "index");
+    const index_str = if (index_type == .string) std.mem.span(lua.toString(-1) catch "index.html") else "index.html";
+    lua.pop(1);
+
+    router.addStaticRoute(prefix, root_str, index_str) catch |err| {
+        log.err().string("msg", "keyway.static failed to register").string("prefix", prefix).err(err).log();
+        return;
+    };
+
+    log.info().string("msg", "static route registered").string("prefix", prefix).string("root", root_str).string("index", index_str).log();
 }
 
 /// Process keyway.proxy table after script load.
 /// Registers reverse proxy routes with the router.
 /// Format: keyway.proxy = { ["/__keyway/grafana"] = { host = "127.0.0.1", port = 3000 } }
-pub fn processProxyTable(lua: *Lua, router: *Router) !void {
-    const keyway_type = lua.getGlobal("keyway");
-    if (keyway_type != .table) {
-        lua.pop(1);
+pub fn processProxyTable(lua: *Lua, router: *Router) void {
+    walkKeywaySubtable(lua, router, "proxy", "keyway.proxy", registerProxyEntry);
+}
+
+fn registerProxyEntry(lua: *Lua, router: *Router, prefix: []const u8) void {
+    // Read host (required)
+    const host_type = lua.getField(-1, "host");
+    const host_str = if (host_type == .string) std.mem.span(lua.toString(-1) catch "") else "";
+    lua.pop(1);
+
+    if (host_str.len == 0) {
+        log.warn().string("msg", "keyway.proxy missing 'host' field").string("prefix", prefix).log();
         return;
     }
 
-    const proxy_type = lua.getField(-1, "proxy");
-    if (proxy_type != .table) {
-        lua.pop(2);
+    // Read port (required)
+    const port_type = lua.getField(-1, "port");
+    const port: u16 = if (port_type == .number) blk: {
+        const n = lua.toInteger(-1);
+        break :blk if (n >= 1 and n <= 65535) @intCast(n) else 0;
+    } else 0;
+    lua.pop(1);
+
+    if (port == 0) {
+        log.warn().string("msg", "keyway.proxy missing or invalid 'port' field").string("prefix", prefix).log();
         return;
     }
 
-    lua.pushNil();
-    while (lua.next(-2)) {
-        const key_cstr = lua.toString(-2) catch {
-            lua.pop(1);
-            continue;
-        };
-        const prefix = std.mem.span(key_cstr);
+    // Read redirect (optional)
+    const redirect_type = lua.getField(-1, "redirect");
+    const redirect_str = if (redirect_type == .string) std.mem.span(lua.toString(-1) catch "") else "";
+    lua.pop(1);
 
-        if (!lua.isTable(-1) or prefix.len == 0 or prefix[0] != '/') {
-            log.warn().string("msg", "keyway.proxy ignoring invalid entry").string("key", prefix).log();
-            lua.pop(1);
-            continue;
-        }
+    // Read strip_prefix (optional, defaults to true)
+    const sp_type = lua.getField(-1, "strip_prefix");
+    const strip_prefix = if (sp_type == .boolean) lua.toBoolean(-1) else true;
+    lua.pop(1);
 
-        // Read host (required)
-        const host_type = lua.getField(-1, "host");
-        const host_str = if (host_type == .string) std.mem.span(lua.toString(-1) catch "") else "";
-        lua.pop(1);
+    router.addProxyRoute(prefix, host_str, port, redirect_str, strip_prefix) catch |err| {
+        log.err().string("msg", "keyway.proxy failed to register").string("prefix", prefix).err(err).log();
+        return;
+    };
 
-        if (host_str.len == 0) {
-            log.warn().string("msg", "keyway.proxy missing 'host' field").string("prefix", prefix).log();
-            lua.pop(1);
-            continue;
-        }
-
-        // Read port (required)
-        const port_type = lua.getField(-1, "port");
-        const port: u16 = if (port_type == .number) blk: {
-            const n = lua.toInteger(-1);
-            break :blk if (n >= 1 and n <= 65535) @intCast(n) else 0;
-        } else 0;
-        lua.pop(1);
-
-        if (port == 0) {
-            log.warn().string("msg", "keyway.proxy missing or invalid 'port' field").string("prefix", prefix).log();
-            lua.pop(1);
-            continue;
-        }
-
-        // Read redirect (optional)
-        const redirect_type = lua.getField(-1, "redirect");
-        const redirect_str = if (redirect_type == .string) std.mem.span(lua.toString(-1) catch "") else "";
-        lua.pop(1);
-
-        // Read strip_prefix (optional, defaults to true)
-        const sp_type = lua.getField(-1, "strip_prefix");
-        const strip_prefix = if (sp_type == .boolean) lua.toBoolean(-1) else true;
-        lua.pop(1);
-
-        router.addProxyRoute(prefix, host_str, port, redirect_str, strip_prefix) catch |err| {
-            log.err().string("msg", "keyway.proxy failed to register").string("prefix", prefix).err(err).log();
-            lua.pop(1);
-            continue;
-        };
-
-        log.info().string("msg", "proxy route registered").string("prefix", prefix).string("host", host_str).int("port", port).log();
-        lua.pop(1);
-    }
-
-    lua.pop(2); // pop proxy + keyway
+    log.info().string("msg", "proxy route registered").string("prefix", prefix).string("host", host_str).int("port", port).log();
 }

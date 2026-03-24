@@ -162,12 +162,8 @@ fn submitRecv(self: *Connection) void {
 /// Timeout cleanup: release TLS state and coroutine ref without resuming.
 fn handleTimeoutCleanup(self: *Connection) xev.CallbackAction {
     self.cs.pending_completions -= 1;
-    cleanup(self);
     if (self.cs.suspended) |*s| {
-        if (s.coroutine_ref != 0) {
-            self.lua_state.lua.unref(Lua.PseudoIndex.Registry, s.coroutine_ref);
-            s.coroutine_ref = 0;
-        }
+        s.cleanup(self.lua_state.lua, self.base_allocator);
         self.cs.suspended = null;
     }
     self.maybeFinishClose();

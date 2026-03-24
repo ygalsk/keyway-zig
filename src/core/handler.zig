@@ -61,6 +61,22 @@ pub const SuspendedState = struct {
             self.outbound_tls = null;
         }
     }
+
+    /// Atomically release all resources owned by this suspended state.
+    /// Call this before setting `suspended = null` whenever the completion
+    /// path hasn't already cleaned up individual fields.
+    /// `lua` is needed to unref the pinned coroutine; `alloc` for TLS teardown.
+    pub fn cleanup(self: *SuspendedState, lua: *Lua, alloc: std.mem.Allocator) void {
+        if (self.coroutine_ref != 0) {
+            lua.unref(Lua.PseudoIndex.Registry, self.coroutine_ref);
+            self.coroutine_ref = 0;
+        }
+        if (self.outbound_fd != -1) {
+            std.posix.close(self.outbound_fd);
+            self.outbound_fd = -1;
+        }
+        self.cleanupTls(alloc);
+    }
 };
 
 const READ_BUFFER_SIZE = config.READ_BUFFER_SIZE;
@@ -88,6 +104,13 @@ pub const TlsState = struct {
     }
 };
 
+pub const CosocketMode = enum {
+    /// Ring API: completions left in CQ for ring_result() reads.
+    batch,
+    /// Legacy single-shot API: results pushed to Lua stack directly.
+    single_shot,
+};
+
 /// Outbound cosocket I/O state — submission/completion rings and batch buffers.
 /// batch_completions/batch_recv_bufs are lazy-allocated on first cosocket use
 /// via base_allocator (stable heap addresses for xev callbacks). Connections
@@ -99,10 +122,10 @@ pub const CosocketState = struct {
     batch_completions: ?*[ring.SubmissionRing.MAX_DEPTH]xev.Completion = null,
     batch_recv_bufs: ?*[ring.SubmissionRing.MAX_DEPTH]?[]u8 = null,
     suspended: ?SuspendedState = null,
-    /// True when a single-shot pending_io was converted to a degenerate SQ entry.
-    /// On completion, results are pushed to the Lua stack (legacy API) instead of
-    /// being left in the CQ for ring_result() reads.
-    single_shot_mode: bool = false,
+    /// How cosocket completions are dispatched back to Lua.
+    /// `single_shot`: legacy API — results pushed to Lua stack directly.
+    /// `batch`: ring API — results left in CQ for ring_result() reads.
+    mode: CosocketMode = .batch,
 
     /// Ensure batch arrays are allocated. Called at the start of drainSubmissionRing.
     /// Returns false on allocation failure.
@@ -125,9 +148,28 @@ pub const CosocketState = struct {
     }
 };
 
+/// State for in-progress async reverse proxy.
+/// Lifecycle: proxyRequest → onProxyConnect → onProxySend (loop) → onProxyRecv (loop) → sendRawResponse
+pub const ProxyState = struct {
+    upstream_fd: std.posix.socket_t,
+    phase: Phase,
+    request_buf: []const u8, // arena-allocated HTTP request to send upstream
+    send_offset: usize, // bytes of request_buf already sent
+    response_buf: std.ArrayList(u8), // accumulated upstream response
+    recv_buf: []u8, // base_allocator — reusable read buffer
+
+    const Phase = enum { connecting, sending, receiving };
+
+    pub fn deinit(self: *ProxyState, base_alloc: std.mem.Allocator) void {
+        std.posix.close(self.upstream_fd);
+        self.response_buf.deinit(base_alloc);
+        base_alloc.free(self.recv_buf);
+    }
+};
+
 /// Connection handler - manages HTTP request/response lifecycle
 pub const Connection = struct {
-    pub const State = enum { reading, processing, writing, websocket, sse, streaming, static_file, closing };
+    pub const State = enum { reading, processing, writing, websocket, sse, streaming, static_file, proxying, closing };
     pub const List = std.DoublyLinkedList;
 
     // Intrusive linked list node for Server.connections tracking.
@@ -177,6 +219,10 @@ pub const Connection = struct {
 
     // Static file: non-null when serving a static file
     static_state: ?static_mod.StaticState = null,
+
+    // Reverse proxy: non-null when proxying to upstream
+    proxy_state: ?ProxyState = null,
+    proxy_completion: xev.Completion = .{},
 
     // Per-request timeout: timer fires after REQUEST_TIMEOUT_MS, sending 504
     // Completions initialized to .{} per xev requirements (Pitfall 3: never undefined)
@@ -287,14 +333,7 @@ pub const Connection = struct {
         self.server.connections.remove(&self.link);
         // Clean up suspended coroutine state if connection closes mid-I/O
         if (self.cs.suspended) |*s| {
-            // Unref pinned coroutine to prevent Lua registry leak
-            if (s.coroutine_ref != 0) {
-                self.lua_state.lua.unref(Lua.PseudoIndex.Registry, s.coroutine_ref);
-            }
-            // Close leaked outbound fd
-            if (s.outbound_fd != -1) std.posix.close(s.outbound_fd);
-            // Free outbound TLS state if mid-handshake (#21)
-            s.cleanupTls(self.base_allocator);
+            s.cleanup(self.lua_state.lua, self.base_allocator);
         }
         // Clean up lazy-allocated cosocket batch arrays
         self.cs.deinitBatchArrays(self.base_allocator);
@@ -308,6 +347,8 @@ pub const Connection = struct {
         if (self.sse_state) |*ss| ss.deinit(self);
         // Clean up static file state
         if (self.static_state) |*ss| ss.deinit(self.base_allocator);
+        // Clean up proxy state (close upstream fd, free buffers)
+        if (self.proxy_state) |*ps| ps.deinit(self.base_allocator);
         // Clean up TLS resources
         self.tls_state.deinit(self.base_allocator);
         std.posix.close(self.socket);
@@ -881,11 +922,14 @@ pub const Connection = struct {
         }
     }
 
-    /// Reverse proxy: connect to upstream, forward request, relay response.
+    /// Reverse proxy: async connect → send → recv loop via xev.
+    ///
+    /// State machine: proxyRequest → onProxyConnect → onProxySend (loop) → onProxyRecv (loop) → sendRawResponse.
+    /// All I/O is non-blocking via io_uring/libxev. No event loop stalls.
     fn proxyRequest(self: *Connection, request: *const http.Request, proxy_match: Router.ProxyMatch, alloc: std.mem.Allocator) void {
         const prefix = proxy_match.route.prefix;
 
-        // Bare prefix with a configured redirect → 302
+        // Bare prefix with a configured redirect → 302 (no I/O needed)
         if (proxy_match.route.redirect) |redirect| {
             if (proxy_match.suffix.len == 0 or std.mem.eql(u8, proxy_match.suffix, "/")) {
                 const resp = std.fmt.allocPrint(alloc, "HTTP/1.1 302 Found\r\nLocation: {s}\r\nContent-Length: 0\r\n\r\n", .{redirect}) catch {
@@ -908,14 +952,7 @@ pub const Connection = struct {
         else
             raw_path;
 
-        // Connect to upstream
-        const stream = std.net.tcpConnectToHost(alloc, proxy_match.route.upstream_host, proxy_match.route.upstream_port) catch {
-            error_response.sendErrorStatus(self, 502, "proxy upstream connect failed");
-            return;
-        };
-        defer stream.close();
-
-        // Build upstream HTTP request
+        // Build upstream HTTP request into arena buffer
         var req_buf = std.ArrayList(u8).initCapacity(alloc, 1024) catch {
             error_response.sendErrorStatus(self, 502, "proxy request alloc failed");
             return;
@@ -942,45 +979,213 @@ pub const Connection = struct {
             error_response.sendErrorStatus(self, 502, "proxy request build failed");
             return;
         };
-
-        // Send request + body
-        stream.writeAll(req_buf.items) catch {
-            error_response.sendErrorStatus(self, 502, "proxy upstream write failed");
-            return;
-        };
+        // Append body if present
         if (request.body.len > 0) {
-            stream.writeAll(request.body) catch {
-                error_response.sendErrorStatus(self, 502, "proxy upstream body write failed");
+            req_writer.writeAll(request.body) catch {
+                error_response.sendErrorStatus(self, 502, "proxy request body build failed");
                 return;
             };
         }
 
-        // Read entire upstream response
-        var resp_buf = std.ArrayList(u8).initCapacity(alloc, 4096) catch {
-            error_response.sendErrorStatus(self, 502, "proxy response alloc failed");
+        // Create non-blocking upstream socket
+        const sock = std.posix.socket(std.posix.AF.INET, std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC | std.posix.SOCK.NONBLOCK, 0) catch {
+            error_response.sendErrorStatus(self, 502, "proxy socket creation failed");
             return;
         };
-        var read_buf: [8192]u8 = undefined;
-        while (true) {
-            const n = stream.read(&read_buf) catch {
-                error_response.sendErrorStatus(self, 502, "proxy upstream read failed");
-                return;
-            };
-            if (n == 0) break;
-            resp_buf.appendSlice(alloc, read_buf[0..n]) catch {
-                error_response.sendErrorStatus(self, 502, "proxy response buffer failed");
-                return;
-            };
-        }
 
-        const upstream_response = resp_buf.items;
-        if (upstream_response.len == 0) {
-            error_response.sendErrorStatus(self, 502, "proxy upstream empty response");
+        const addr = std.net.Address.parseIp4(proxy_match.route.upstream_host, proxy_match.route.upstream_port) catch {
+            std.posix.close(sock);
+            error_response.sendErrorStatus(self, 502, "proxy upstream address invalid");
             return;
+        };
+
+        // Allocate recv buffer from base_allocator (survives arena resets)
+        const recv_buf = self.base_allocator.alloc(u8, 8192) catch {
+            std.posix.close(sock);
+            error_response.sendErrorStatus(self, 502, "proxy recv buffer alloc failed");
+            return;
+        };
+
+        self.proxy_state = .{
+            .upstream_fd = sock,
+            .phase = .connecting,
+            .request_buf = req_buf.items,
+            .send_offset = 0,
+            .response_buf = std.ArrayList(u8).initCapacity(self.base_allocator, 4096) catch {
+                self.base_allocator.free(recv_buf);
+                std.posix.close(sock);
+                error_response.sendErrorStatus(self, 502, "proxy response buffer alloc failed");
+                return;
+            },
+            .recv_buf = recv_buf,
+        };
+        self.state = .proxying;
+
+        // Submit async connect
+        self.proxy_completion = .{
+            .op = .{ .connect = .{ .socket = sock, .addr = addr } },
+            .userdata = self,
+            .callback = onProxyConnect,
+        };
+        self.pending_io_ops += 1;
+        self.loop.add(&self.proxy_completion);
+    }
+
+    fn proxyError(self: *Connection, status: u16, msg: []const u8) void {
+        if (self.proxy_state) |*ps| {
+            ps.deinit(self.base_allocator);
+            self.proxy_state = null;
+        }
+        error_response.sendErrorStatus(self, status, msg);
+    }
+
+    fn onProxyConnect(
+        userdata: ?*anyopaque,
+        loop: *xev.Loop,
+        completion: *xev.Completion,
+        result: xev.Result,
+    ) xev.CallbackAction {
+        _ = loop;
+        _ = completion;
+        const self = castUserdata(Connection, userdata);
+        self.pending_io_ops -= 1;
+
+        if (self.state == .closing) { self.maybeFinishClose(); return .disarm; }
+
+        _ = result.connect catch {
+            self.proxyError(502, "proxy upstream connect failed");
+            return .disarm;
+        };
+
+        // Connect succeeded — start sending the request
+        const ps = &self.proxy_state.?;
+        ps.phase = .sending;
+        const data = ps.request_buf[ps.send_offset..];
+
+        self.proxy_completion = .{
+            .op = .{ .send = .{ .fd = ps.upstream_fd, .buffer = .{ .slice = data } } },
+            .userdata = self,
+            .callback = onProxySend,
+        };
+        self.pending_io_ops += 1;
+        self.loop.add(&self.proxy_completion);
+        return .disarm;
+    }
+
+    fn onProxySend(
+        userdata: ?*anyopaque,
+        loop: *xev.Loop,
+        completion: *xev.Completion,
+        result: xev.Result,
+    ) xev.CallbackAction {
+        _ = loop;
+        _ = completion;
+        const self = castUserdata(Connection, userdata);
+        self.pending_io_ops -= 1;
+
+        if (self.state == .closing) { self.maybeFinishClose(); return .disarm; }
+
+        const bytes_sent = result.send catch {
+            self.proxyError(502, "proxy upstream send failed");
+            return .disarm;
+        };
+
+        const ps = &self.proxy_state.?;
+        ps.send_offset += bytes_sent;
+
+        if (ps.send_offset < ps.request_buf.len) {
+            // Partial send — continue sending remainder
+            const remaining = ps.request_buf[ps.send_offset..];
+            self.proxy_completion = .{
+                .op = .{ .send = .{ .fd = ps.upstream_fd, .buffer = .{ .slice = remaining } } },
+                .userdata = self,
+                .callback = onProxySend,
+            };
+            self.pending_io_ops += 1;
+            self.loop.add(&self.proxy_completion);
+            return .disarm;
         }
 
-        self.logAccess(200);
-        self.sendRawResponse(upstream_response);
+        // Full request sent — switch to receiving
+        ps.phase = .receiving;
+        self.proxy_completion = .{
+            .op = .{ .recv = .{ .fd = ps.upstream_fd, .buffer = .{ .slice = ps.recv_buf } } },
+            .userdata = self,
+            .callback = onProxyRecv,
+        };
+        self.pending_io_ops += 1;
+        self.loop.add(&self.proxy_completion);
+        return .disarm;
+    }
+
+    fn onProxyRecv(
+        userdata: ?*anyopaque,
+        loop: *xev.Loop,
+        completion: *xev.Completion,
+        result: xev.Result,
+    ) xev.CallbackAction {
+        _ = loop;
+        _ = completion;
+        const self = castUserdata(Connection, userdata);
+        self.pending_io_ops -= 1;
+
+        if (self.state == .closing) { self.maybeFinishClose(); return .disarm; }
+
+        const bytes_read = result.recv catch {
+            self.proxyError(502, "proxy upstream recv failed");
+            return .disarm;
+        };
+
+        const ps = &self.proxy_state.?;
+
+        if (bytes_read == 0) {
+            // EOF — upstream closed. Send accumulated response to client.
+            if (ps.response_buf.items.len == 0) {
+                self.proxyError(502, "proxy upstream empty response");
+                return .disarm;
+            }
+
+            // Close upstream fd before sending (we're done with it)
+            std.posix.close(ps.upstream_fd);
+            const response = ps.response_buf.items;
+
+            // Transfer ownership: we need response data to survive until send completes.
+            // Arena-dupe the response so sendRawResponse can use it, then free proxy state.
+            const alloc = self.arena.allocator();
+            const response_dupe = alloc.dupe(u8, response) catch {
+                // Can't dupe — free proxy state manually (fd already closed)
+                ps.response_buf.deinit(self.base_allocator);
+                self.base_allocator.free(ps.recv_buf);
+                self.proxy_state = null;
+                self.send500InternalError();
+                return .disarm;
+            };
+
+            // Free proxy buffers (fd already closed above)
+            ps.response_buf.deinit(self.base_allocator);
+            self.base_allocator.free(ps.recv_buf);
+            self.proxy_state = null;
+
+            self.logAccess(200);
+            self.state = .writing;
+            self.sendRawResponse(response_dupe);
+            return .disarm;
+        }
+
+        // Accumulate received data and recv more
+        ps.response_buf.appendSlice(self.base_allocator, ps.recv_buf[0..bytes_read]) catch {
+            self.proxyError(502, "proxy response buffer overflow");
+            return .disarm;
+        };
+
+        self.proxy_completion = .{
+            .op = .{ .recv = .{ .fd = ps.upstream_fd, .buffer = .{ .slice = ps.recv_buf } } },
+            .userdata = self,
+            .callback = onProxyRecv,
+        };
+        self.pending_io_ops += 1;
+        self.loop.add(&self.proxy_completion);
+        return .disarm;
     }
 
     fn onWrite(
@@ -1012,7 +1217,11 @@ pub const Connection = struct {
     /// Post-write handler for WebSocket upgrade: reset arena, consume HTTP bytes,
     /// enter WS frame read loop.
     fn handleWsPostWrite(self: *Connection, bytes_written: usize) void {
-        std.debug.assert(self.ws_state != null);
+        if (self.ws_state == null) {
+            log.err().string("msg", "handleWsPostWrite: ws_state is null").log();
+            self.close();
+            return;
+        }
         log.debug().string("msg", "ws 101 sent, entering WS mode").int("bytes_written", bytes_written).int("raw_len", self.http_state.request_raw_len).int("buf_avail_read", self.read_buffer.availableRead()).int("buf_avail_write", self.read_buffer.availableWrite()).log();
         _ = self.arena.reset(.retain_capacity);
         if (self.http_state.request_raw_len > 0) {
@@ -1033,7 +1242,11 @@ pub const Connection = struct {
 
     /// Post-write handler for SSE upgrade: start watching for client disconnect.
     fn handleSsePostWrite(self: *Connection) void {
-        std.debug.assert(self.sse_state != null);
+        if (self.sse_state == null) {
+            log.err().string("msg", "handleSsePostWrite: sse_state is null").log();
+            self.close();
+            return;
+        }
         conn_sse.startSseDisconnectWatch(self);
     }
 
@@ -1042,11 +1255,12 @@ pub const Connection = struct {
     pub fn handleHttpPostWrite(self: *Connection, bytes_written: usize) void {
         // Cancel the per-request deadline timer on successful response completion
         self.cancelRequestTimer();
+        if (self.cs.suspended) |*s| s.cleanupTls(self.base_allocator);
         self.cs.suspended = null;
         self.cs.sq.reset();
         self.cs.cq.reset();
         self.cs.pending_completions = 0;
-        self.cs.single_shot_mode = false;
+        self.cs.mode = .batch;
         // Shrink arena if response was large to prevent unbounded growth
         // on keep-alive connections that occasionally serve large responses.
         if (bytes_written > LARGE_RESPONSE_THRESHOLD) {

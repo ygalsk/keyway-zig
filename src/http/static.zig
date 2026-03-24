@@ -1,8 +1,9 @@
-//! Static file serving — pread into arena + send, with ETag/Last-Modified caching.
+//! Static file serving — async pread via xev + send, with ETag/Last-Modified caching.
 //!
 //! Zig-native, no Lua involvement. Route configuration via keyway.static.
-//! Small files (< STATIC_READ_SIZE) are served in a single read+send.
-//! Large files are served via pread+send loop using Content-Length (size known from stat).
+//! Small files (< STATIC_READ_SIZE) are served in a single async pread+send.
+//! Large files are served via async pread+send loop using Content-Length (size known from stat).
+//! All file reads go through io_uring/libxev — no blocking I/O.
 //!
 //! Path safety: std.fs.path.resolve + verify result starts with configured root.
 
@@ -17,15 +18,22 @@ const error_response = @import("error_response.zig");
 const router_mod = @import("router.zig");
 
 /// State for in-progress static file serving.
+/// Two modes:
+///   - Small file: combined_buf holds headers + body slot. Single pread → single send.
+///   - Large file: read_buf is a reusable chunk buffer. Headers sent first, then pread+send loop.
 pub const StaticState = struct {
     fd: std.posix.fd_t,
     file_size: u64,
     bytes_sent: u64,
-    read_buf: []u8,
+    read_buf: []u8, // large-file: reusable chunk buffer (base_allocator)
+    // Small-file fields (only used when combined_buf is non-null)
+    combined_buf: ?[]u8 = null, // arena-allocated headers+body buffer
+    headers_len: usize = 0, // length of headers portion in combined_buf
 
     pub fn deinit(self: *StaticState, allocator: std.mem.Allocator) void {
         std.posix.close(self.fd);
-        allocator.free(self.read_buf);
+        if (self.read_buf.len > 0) allocator.free(self.read_buf);
+        // combined_buf is arena-allocated, freed on arena reset
     }
 };
 
@@ -238,21 +246,34 @@ pub fn serveStaticFile(
         return;
     }
 
-    // Small file fast path: single allocation, pread directly into combined buffer
+    // Small file fast path: single allocation, async pread into combined buffer
     if (file_size <= config.STATIC_READ_SIZE) {
-        const combined = alloc.alloc(u8, headers_text.len + @as(usize, @intCast(file_size))) catch {
+        const file_len = @as(usize, @intCast(file_size));
+        const combined = alloc.alloc(u8, headers_text.len + file_len) catch {
             std.posix.close(fd);
             self.send500InternalError();
             return;
         };
         @memcpy(combined[0..headers_text.len], headers_text);
-        const bytes_read = std.posix.pread(fd, combined[headers_text.len..], 0) catch {
-            std.posix.close(fd);
-            self.send500InternalError();
-            return;
+
+        self.static_state = .{
+            .fd = fd,
+            .file_size = file_size,
+            .bytes_sent = 0,
+            .read_buf = &.{}, // unused for small-file path (not allocator-owned)
+            .combined_buf = combined,
+            .headers_len = headers_text.len,
         };
-        std.posix.close(fd);
-        self.sendRawResponse(combined[0 .. headers_text.len + bytes_read]);
+        self.state = .static_file;
+
+        // Submit async pread into the body portion of the combined buffer
+        self.read_completion = .{
+            .op = .{ .pread = .{ .fd = fd, .buffer = .{ .slice = combined[headers_text.len..] }, .offset = 0 } },
+            .userdata = self,
+            .callback = onSmallFilePread,
+        };
+        self.pending_io_ops += 1;
+        self.loop.add(&self.read_completion);
         return;
     }
 
@@ -273,6 +294,40 @@ pub fn serveStaticFile(
     self.submitSend(headers_text, onStaticHeadersSent, false);
 }
 
+/// Callback after small-file async pread completes — close fd, send combined buffer.
+fn onSmallFilePread(
+    userdata: ?*anyopaque,
+    loop: *xev.Loop,
+    completion: *xev.Completion,
+    result: xev.Result,
+) xev.CallbackAction {
+    _ = loop;
+    _ = completion;
+    const self = castUserdata(Connection, userdata);
+    self.pending_io_ops -= 1;
+
+    if (self.state == .closing) { self.maybeFinishClose(); return .disarm; }
+
+    const bytes_read = result.pread catch {
+        finishStaticFile(self);
+        return .disarm;
+    };
+
+    const ss = &self.static_state.?;
+    const combined = ss.combined_buf.?;
+    const headers_len = ss.headers_len;
+
+    // Close fd — we have the data now
+    std.posix.close(ss.fd);
+    // read_buf is empty slice for small files — free is a no-op
+    // combined_buf is arena-allocated — freed on arena reset
+    self.static_state = null;
+
+    // Send combined headers + body
+    self.sendRawResponse(combined[0 .. headers_len + bytes_read]);
+    return .disarm;
+}
+
 /// Callback after headers are sent — start pread+send loop.
 fn onStaticHeadersSent(
     userdata: ?*anyopaque,
@@ -288,7 +343,7 @@ fn onStaticHeadersSent(
     return .disarm;
 }
 
-/// Read the next chunk from file and send it.
+/// Submit async pread for the next chunk from file.
 fn sendNextChunk(self: *Connection) void {
     const ss = &self.static_state.?;
 
@@ -301,22 +356,48 @@ fn sendNextChunk(self: *Connection) void {
     const remaining = ss.file_size - ss.bytes_sent;
     const to_read = @min(remaining, ss.read_buf.len);
 
-    const bytes_read = std.posix.pread(ss.fd, ss.read_buf[0..to_read], ss.bytes_sent) catch {
+    // Submit async pread via read_completion (free — we're not reading from client socket)
+    self.read_completion = .{
+        .op = .{ .pread = .{ .fd = ss.fd, .buffer = .{ .slice = ss.read_buf[0..to_read] }, .offset = ss.bytes_sent } },
+        .userdata = self,
+        .callback = onChunkPread,
+    };
+    self.pending_io_ops += 1;
+    self.loop.add(&self.read_completion);
+}
+
+/// Callback after chunk pread completes — send the read data to client.
+fn onChunkPread(
+    userdata: ?*anyopaque,
+    loop: *xev.Loop,
+    completion: *xev.Completion,
+    result: xev.Result,
+) xev.CallbackAction {
+    _ = loop;
+    _ = completion;
+    const self = castUserdata(Connection, userdata);
+    self.pending_io_ops -= 1;
+
+    if (self.state == .closing) { self.maybeFinishClose(); return .disarm; }
+
+    const bytes_read = result.pread catch {
         self.close();
-        return;
+        return .disarm;
     };
 
     if (bytes_read == 0) {
         // EOF before expected — file truncated
         finishStaticFile(self);
-        return;
+        return .disarm;
     }
 
+    const ss = &self.static_state.?;
     ss.bytes_sent += bytes_read;
 
     // read_buf is stable during async send — pread overwrites it only in sendNextChunk,
     // which runs after onStaticChunkSent fires. No dupe needed.
     self.submitSend(ss.read_buf[0..bytes_read], onStaticChunkSent, false);
+    return .disarm;
 }
 
 /// Callback after a static file chunk is sent — continue or finish.

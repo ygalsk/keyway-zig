@@ -23,9 +23,10 @@ pub const LinearBuffer = struct {
         self.allocator.free(self.data);
     }
 
-    /// Get slice available for writing.
-    /// Auto-compacts when write space is low but consumed space is available,
-    /// preventing false "buffer full" on long-lived connections (WS, SSE).
+    /// Return a writable slice starting at the current write position.
+    /// **Side-effect:** may compact the buffer (memmove unread data to front)
+    /// when write space is low and consumed space is reclaimable. This prevents
+    /// false "buffer full" on long-lived connections (WS, SSE).
     pub inline fn writeSlice(self: *LinearBuffer) []u8 {
         // Proactive compaction: if less than 25% write space remains and
         // at least 25% of the buffer has been consumed, compact to reclaim.

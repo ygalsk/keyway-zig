@@ -13,7 +13,7 @@
 //! Unified I/O path:
 //!   All I/O flows through drainSubmissionRing -> xev -> onBatchComplete -> CQEntry.
 //!   Legacy single-shot cosocket ops (connect/send/recv/close) are converted to
-//!   degenerate SQ entries in dispatchIo with single_shot_mode=true, so completions
+//!   degenerate SQ entries in dispatchIo with mode=.single_shot, so completions
 //!   push results to the Lua stack instead of leaving them in the CQ.
 //!
 //! After kTLS: all send/recv are plaintext — the kernel handles crypto transparently.
@@ -60,7 +60,7 @@ pub fn classifyOpError(op_tag: anytype) struct { category: ErrorCategory, msg: [
 
 /// Dispatch I/O after a Lua yield. All I/O flows through drainSubmissionRing.
 /// When Lua yields without SQ entries (legacy single-shot cosocket API), the
-/// pending_io is converted to a degenerate SQ entry with single_shot_mode=true
+/// pending_io is converted to a degenerate SQ entry with mode=.single_shot
 /// so completions push results to the Lua stack instead of CQ.
 pub fn dispatchIo(conn: *Connection) void {
     if (conn.cs.sq.len() == 0) {
@@ -71,11 +71,11 @@ pub fn dispatchIo(conn: *Connection) void {
         };
         conn.lua_state.pending_io = null;
         conn.cs.sq.push(pending) catch unreachable; // SQ was empty, can't be full
-        conn.cs.single_shot_mode = true;
+        conn.cs.mode = .single_shot;
         const s = &conn.cs.suspended.?;
         s.pending_op = std.meta.activeTag(pending);
     } else {
-        conn.cs.single_shot_mode = false;
+        conn.cs.mode = .batch;
     }
     drainSubmissionRing(conn);
 }
@@ -386,16 +386,7 @@ fn batchCompletionCheck(self: *Connection) void {
         if (self.cs.pending_completions == 0) {
             // All completions drained — clean up suspended state and free connection
             if (self.cs.suspended) |*s| {
-                if (s.coroutine_ref != 0) {
-                    self.lua_state.lua.unref(Lua.PseudoIndex.Registry, s.coroutine_ref);
-                    s.coroutine_ref = 0;
-                }
-                if (s.outbound_fd != -1) {
-                    std.posix.close(s.outbound_fd);
-                    s.outbound_fd = -1;
-                }
-                s.recv_buf = null;
-                s.cleanupTls(self.base_allocator);
+                s.cleanup(self.lua_state.lua, self.base_allocator);
                 self.cs.suspended = null;
             }
         }
@@ -405,8 +396,8 @@ fn batchCompletionCheck(self: *Connection) void {
     if (self.cs.pending_completions == 0) {
         const s = &self.cs.suspended.?;
         const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
-        if (self.cs.single_shot_mode) {
-            self.cs.single_shot_mode = false;
+        if (self.cs.mode == .single_shot) {
+            self.cs.mode = .batch;
             resumeSingleShot(self, s, thread);
         } else {
             thread.pushInteger(@intCast(self.cs.cq.tail));

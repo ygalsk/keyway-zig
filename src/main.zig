@@ -45,14 +45,15 @@ pub fn main() !void {
     defer prom.deinit();
 
     // Convert CLI config to Server.Config
-    // TLS paths: cli.Config has ?[]const u8, Server.Config needs ?[*:0]const u8
+    // TLS paths: cli.Config has ?[:0]const u8 (sentinel-terminated slices),
+    // Server.Config needs ?[*:0]const u8 (sentinel-terminated pointers).
     const tls_cert: ?[*:0]const u8 = if (cli_config.tls_cert_path) |p|
-        @ptrCast(p.ptr)
+        p.ptr
     else
         null;
 
     const tls_key: ?[*:0]const u8 = if (cli_config.tls_key_path) |p|
-        @ptrCast(p.ptr)
+        p.ptr
     else
         null;
 

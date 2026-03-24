@@ -24,6 +24,7 @@ const castUserdata = @import("../util/helpers.zig").castUserdata;
 const TlsManager = tls.TlsManager;
 const SseRegistry = @import("../protocol/sse.zig").SseRegistry;
 const prom = @import("../observability/prom.zig");
+const lua_file_io = @import("lua_file_io.zig");
 
 // zig-luajit marks resumeCoroutine as private — call C API directly.
 // Lua is an opaque type that maps 1:1 to lua_State*, so @ptrCast is safe.
@@ -74,7 +75,7 @@ pub const LuaState = struct {
 
     // Current connection being served (set during handler call/resume, cleared on completion)
     // Used by ring C bridge functions to access the Connection's SQ/CQ.
-    current_connection: ?*anyopaque = null,
+    current_connection: ?*Connection = null,
 
     // Lua script timing: start timestamp for duration histogram
     coroutine_start_us: ?i64 = null,
@@ -196,14 +197,14 @@ pub const LuaState = struct {
 
     /// Process keyway.static declarative table after script load.
     /// Registers static file serving routes with the router.
-    pub fn processStaticTable(self: *LuaState, router: *Router) !void {
-        try @import("../http/route_loader.zig").processStaticTable(self.lua, router);
+    pub fn processStaticTable(self: *LuaState, router: *Router) void {
+        @import("../http/route_loader.zig").processStaticTable(self.lua, router);
     }
 
     /// Process keyway.proxy declarative table after script load.
     /// Registers reverse proxy routes with the router.
-    pub fn processProxyTable(self: *LuaState, router: *Router) !void {
-        try @import("../http/route_loader.zig").processProxyTable(self.lua, router);
+    pub fn processProxyTable(self: *LuaState, router: *Router) void {
+        @import("../http/route_loader.zig").processProxyTable(self.lua, router);
     }
 
     /// Call a Lua function by name
@@ -261,8 +262,7 @@ pub const LuaState = struct {
         prom.luaCoroutineStarted();
         self.coroutine_start_us = std.time.microTimestamp();
         // Capture route for duration labeling from Connection's http_state
-        if (self.current_connection) |conn_ptr| {
-            const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        if (self.current_connection) |conn| {
             self.coroutine_route = conn.http_state.route_pattern;
         } else {
             self.coroutine_route = "";
@@ -316,6 +316,9 @@ pub const LuaState = struct {
                         thread.pop(1); // pop non-table
                     }
                     log.err().string("msg", "coroutine error").int("ref", lua_ref).string("error", std.mem.span(err_msg)).log();
+                } else {
+                    // Non-string error (e.g. table, userdata, nil) — still log something useful
+                    log.err().string("msg", "coroutine error (non-string)").int("ref", lua_ref).string("type", @tagName(thread.getType(-1))).log();
                 }
                 if (self.cached_thread_ref == 0) self.lua.pop(1);
                 return error.Runtime;
@@ -403,138 +406,7 @@ pub const LuaState = struct {
     /// Register file I/O C functions as Lua globals.
     /// Admin-only operations — used by dashboard routes behind localhost_guard.
     pub fn registerFileApi(self: *LuaState) void {
-        const file_funcs = .{
-            .{ "__keyway_file_read", keyway_file_read },
-            .{ "__keyway_file_write", keyway_file_write },
-            .{ "__keyway_file_delete", keyway_file_delete },
-            .{ "__keyway_file_list", keyway_file_list },
-            .{ "__keyway_file_rename", keyway_file_rename },
-        };
-        inline for (file_funcs) |entry| {
-            self.lua.pushLightUserdata(self);
-            self.lua.pushCClosure(entry[1], 1);
-            self.lua.setGlobal(entry[0]);
-        }
-    }
-
-    /// __keyway_file_read(path) -> string or nil, error
-    fn keyway_file_read(lua: *Lua) callconv(.c) c_int {
-        const state = getLuaState(lua) orelse return 0;
-        const path_c = lua.toString(1) catch return luaError(lua, "path argument required");
-        const path = std.mem.span(path_c);
-
-        const file = std.fs.cwd().openFile(path, .{}) catch return luaError(lua, "file not found");
-        defer file.close();
-
-        const content = file.readToEndAlloc(state.allocator, 10 * 1024 * 1024) catch return luaError(lua, "read error");
-        defer state.allocator.free(content);
-
-        lua.pushLString(content);
-        return 1;
-    }
-
-    /// __keyway_file_write(path, content) -> true or nil, error
-    fn keyway_file_write(lua: *Lua) callconv(.c) c_int {
-        const path_c = lua.toString(1) catch return luaError(lua, "path argument required");
-        const content_c = lua.toString(2) catch return luaError(lua, "content argument required");
-        const path = std.mem.span(path_c);
-        const content = std.mem.span(content_c);
-
-        // Atomic write: write to tmp file, then rename
-        const state = getLuaState(lua) orelse return 0;
-        const dir_path = std.fs.path.dirname(path) orelse ".";
-
-        // Ensure parent directory exists
-        std.fs.cwd().makePath(dir_path) catch {};
-
-        // Write tmp file and rename
-        const tmp_path = std.fmt.allocPrint(state.allocator, "{s}.tmp", .{path}) catch return luaError(lua, "allocation failed");
-        defer state.allocator.free(tmp_path);
-
-        const file = std.fs.cwd().createFile(tmp_path, .{}) catch return luaError(lua, "failed to create tmp file");
-        file.writeAll(content) catch {
-            file.close();
-            return luaError(lua, "write error");
-        };
-        file.close();
-
-        // Rename tmp -> target (atomic on same filesystem)
-        std.fs.cwd().rename(tmp_path, path) catch return luaError(lua, "rename failed");
-
-        lua.pushBoolean(true);
-        return 1;
-    }
-
-    /// __keyway_file_delete(path) -> true or nil, error
-    fn keyway_file_delete(lua: *Lua) callconv(.c) c_int {
-        const path_c = lua.toString(1) catch return luaError(lua, "path argument required");
-        const path = std.mem.span(path_c);
-
-        std.fs.cwd().deleteFile(path) catch return luaError(lua, "delete failed");
-
-        lua.pushBoolean(true);
-        return 1;
-    }
-
-    /// __keyway_file_rename(old_path, new_path) -> true or nil, error
-    fn keyway_file_rename(lua: *Lua) callconv(.c) c_int {
-        const old_c = lua.toString(1) catch return luaError(lua, "old_path argument required");
-        const new_c = lua.toString(2) catch return luaError(lua, "new_path argument required");
-        const old_path = std.mem.span(old_c);
-        const new_path = std.mem.span(new_c);
-
-        std.fs.cwd().rename(old_path, new_path) catch return luaError(lua, "rename failed");
-
-        lua.pushBoolean(true);
-        return 1;
-    }
-
-    /// __keyway_file_list(dir) -> table of {path, name} or nil, error
-    fn keyway_file_list(lua: *Lua) callconv(.c) c_int {
-        const state = getLuaState(lua) orelse return 0;
-        const dir_c = lua.toString(1) catch return luaError(lua, "dir argument required");
-        const dir_path = std.mem.span(dir_c);
-
-        lua.createTable(0, 0);
-        var idx: i32 = 1;
-
-        listLuaFilesRecursive(lua, state.allocator, dir_path, dir_path, &idx);
-
-        return 1;
-    }
-
-    fn listLuaFilesRecursive(lua: *Lua, alloc: std.mem.Allocator, base: []const u8, dir_path: []const u8, idx: *i32) void {
-        var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
-        defer dir.close();
-        var iter = dir.iterate();
-        while (iter.next() catch null) |entry| {
-            if (entry.kind == .directory) {
-                const sub = std.fs.path.join(alloc, &.{ dir_path, entry.name }) catch continue;
-                defer alloc.free(sub);
-                listLuaFilesRecursive(lua, alloc, base, sub, idx);
-            } else if (entry.kind == .file and (std.mem.endsWith(u8, entry.name, ".lua") or std.mem.endsWith(u8, entry.name, ".lua.disabled"))) {
-                const full = std.fs.path.join(alloc, &.{ dir_path, entry.name }) catch continue;
-                defer alloc.free(full);
-
-                // Compute relative path from base
-                const rel = if (std.mem.startsWith(u8, full, base))
-                    if (full.len > base.len and full[base.len] == '/') full[base.len + 1 ..] else full[base.len..]
-                else
-                    full;
-
-                const enabled = std.mem.endsWith(u8, entry.name, ".lua");
-
-                lua.createTable(0, 3);
-                lua.pushLString(rel);
-                lua.setField(-2, "path");
-                lua.pushLString(entry.name);
-                lua.setField(-2, "name");
-                lua.pushBoolean(enabled);
-                lua.setField(-2, "enabled");
-                lua.setTableIndexRaw(-2, idx.*);
-                idx.* += 1;
-            }
-        }
+        lua_file_io.registerFileApi(self);
     }
 
     /// Register cosocket C functions as Lua globals with *LuaState as upvalue.
@@ -611,10 +483,9 @@ pub const LuaState = struct {
         return conn.cs.cq.tail;
     }
 
-    /// Cast current_connection to *Connection. Internal helper.
+    /// Get current_connection as *Connection. Internal helper.
     inline fn currentConnection(self: *LuaState) ?*Connection {
-        const ptr = self.current_connection orelse return null;
-        return @ptrCast(@alignCast(ptr));
+        return self.current_connection;
     }
 
     /// Register embedded stdlib modules as package.preload entries.
@@ -683,14 +554,8 @@ pub const LuaState = struct {
             log.err().string("msg", "reload: processRouteTable failed").err(err).log();
             return;
         };
-        self.processStaticTable(router) catch |err| {
-            log.err().string("msg", "reload: processStaticTable failed").err(err).log();
-            return;
-        };
-        self.processProxyTable(router) catch |err| {
-            log.err().string("msg", "reload: processProxyTable failed").err(err).log();
-            return;
-        };
+        self.processStaticTable(router);
+        self.processProxyTable(router);
 
         log.info().string("msg", "reload complete").string("script", script_path).log();
     }

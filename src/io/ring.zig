@@ -94,7 +94,9 @@ pub const CompletionRing = struct {
 
     pub inline fn push(self: *CompletionRing, entry: CQEntry) void {
         if (self.tail >= MAX_DEPTH) {
-            log.err().string("msg", "CompletionRing overflow").int("tail", self.tail).int("max", MAX_DEPTH).log();
+            log.err().string("msg", "CompletionRing overflow — entry dropped").int("tail", self.tail).int("max", MAX_DEPTH).log();
+            // Overwrite the last slot with an error so Lua sees a failure instead of stale data.
+            self.entries[MAX_DEPTH - 1] = .{ .result = -1, .err_msg = "CQ overflow: too many I/O ops", .err_category = .server_error };
             return;
         }
         self.entries[self.tail] = entry;
@@ -102,7 +104,10 @@ pub const CompletionRing = struct {
     }
 
     pub inline fn get(self: *const CompletionRing, index: u8) CQEntry {
-        std.debug.assert(index < self.tail);
+        if (index >= self.tail) {
+            log.err().string("msg", "CompletionRing.get out of bounds").int("index", index).int("tail", self.tail).log();
+            return .{ .result = -1, .err_msg = "CQ index out of bounds", .err_category = .server_error };
+        }
         return self.entries[index];
     }
 

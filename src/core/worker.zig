@@ -165,8 +165,8 @@ pub const Worker = struct {
         // Load Lua handlers and process declarative route table
         try lua_state.loadScript(ctx.script_path);
         try lua_state.processRouteTable(&router);
-        try lua_state.processStaticTable(&router);
-        try lua_state.processProxyTable(&router);
+        lua_state.processStaticTable(&router);
+        lua_state.processProxyTable(&router);
 
         if (router.isEmpty()) {
             log.warn().string("msg", "no routes registered — all requests will 404").log();

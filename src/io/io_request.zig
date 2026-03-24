@@ -1,5 +1,6 @@
 const std = @import("std");
 const Lua = @import("luajit").Lua;
+const log = @import("../observability/log.zig");
 const LuaState = @import("../lua/lua_state.zig").LuaState;
 const castUserdata = @import("../util/helpers.zig").castUserdata;
 const IoEntry = @import("ring.zig").IoEntry;
@@ -25,6 +26,8 @@ pub fn parseTlsMode(lua: *Lua, arg_index: i32) TlsMode {
         const mode_str = std.mem.span(lua.toString(arg_index) catch return TlsMode.verify);
         if (std.mem.eql(u8, mode_str, "custom")) return TlsMode.custom;
         if (std.mem.eql(u8, mode_str, "insecure")) return TlsMode.insecure;
+        if (std.mem.eql(u8, mode_str, "verify")) return TlsMode.verify;
+        log.warn().string("msg", "unknown TLS mode, defaulting to verify").string("mode", mode_str).log();
         return TlsMode.verify;
     } else if (lua.isBoolean(arg_index) and lua.toBoolean(arg_index)) {
         return TlsMode.insecure;

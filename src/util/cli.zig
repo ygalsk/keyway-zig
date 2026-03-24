@@ -9,8 +9,8 @@ pub const Config = struct {
     port: u16 = 8080,
     workers: u16 = 0,
     script: []const u8 = "keyway.lua",
-    tls_cert_path: ?[]const u8 = null,
-    tls_key_path: ?[]const u8 = null,
+    tls_cert_path: ?[:0]const u8 = null,
+    tls_key_path: ?[:0]const u8 = null,
     log_level: std.log.Level = .info,
     log_format: LogFormat = .logfmt,
     enable_bpf: bool = false,
@@ -197,8 +197,8 @@ test "default config values" {
     try std.testing.expectEqual(@as(u16, 8080), c.port);
     try std.testing.expectEqual(@as(u16, 0), c.workers);
     try std.testing.expectEqualStrings("keyway.lua", c.script);
-    try std.testing.expectEqual(@as(?[]const u8, null), c.tls_cert_path);
-    try std.testing.expectEqual(@as(?[]const u8, null), c.tls_key_path);
+    try std.testing.expectEqual(@as(?[:0]const u8, null), c.tls_cert_path);
+    try std.testing.expectEqual(@as(?[:0]const u8, null), c.tls_key_path);
     try std.testing.expectEqual(std.log.Level.info, c.log_level);
     try std.testing.expect(!c.enable_bpf);
     try std.testing.expect(!c.show_help);

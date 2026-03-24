@@ -142,8 +142,11 @@ fn onWsRead(
     // into ciphertext_buffer and need userspace decrypt — not yet supported for WS.
     if (self.tls_state.ciphertext_buffer) |*cb| {
         cb.commitWrite(bytes_read);
-        // TODO: userspace TLS decrypt path for WS (pre-kTLS connections)
-        log.err().string("msg", "ws ciphertext_buffer recv not supported (need decrypt path)").log();
+        // Userspace TLS decrypt without kTLS is not implemented for WebSocket.
+        // In practice this path should be unreachable: conn_tls.completeHandshake()
+        // either succeeds at setupKtls (freeing ciphertext_buffer) or closes the
+        // connection. If we reach here, something unexpected happened.
+        log.err().string("msg", "ws: ciphertext_buffer present but kTLS expected — closing connection").log();
         self.close();
         return .disarm;
     } else {

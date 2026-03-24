@@ -596,69 +596,11 @@ pub const TlsConn = struct {
             return error.KtlsSetupFailed;
         }
 
-        // Set TX and RX crypto info
+        // Set TX and RX crypto info via generic helper
         switch (params.kind) {
-            .aes_gcm_128 => {
-                var tx_info = c.tls12_crypto_info_aes_gcm_128{
-                    .info = .{ .version = tls_version, .cipher_type = c.TLS_CIPHER_AES_GCM_128 },
-                    .iv = .{0} ** 8,
-                    .key = undefined,
-                    .salt = undefined,
-                    .rec_seq = tx_rec_seq,
-                };
-                @memcpy(&tx_info.key, tx_key[0..16]);
-                @memcpy(&tx_info.salt, tx_iv[0..4]);
-                @memcpy(&tx_info.iv, tx_iv[4..12]);
-
-                var rx_info = tx_info;
-                rx_info.rec_seq = rx_rec_seq;
-                @memcpy(&rx_info.key, rx_key[0..16]);
-                @memcpy(&rx_info.salt, rx_iv[0..4]);
-                @memcpy(&rx_info.iv, rx_iv[4..12]);
-
-                try setsockoptTls(fd, c.TLS_TX, std.mem.asBytes(&tx_info));
-                try setsockoptTls(fd, c.TLS_RX, std.mem.asBytes(&rx_info));
-            },
-            .aes_gcm_256 => {
-                var tx_info = c.tls12_crypto_info_aes_gcm_256{
-                    .info = .{ .version = tls_version, .cipher_type = c.TLS_CIPHER_AES_GCM_256 },
-                    .iv = .{0} ** 8,
-                    .key = undefined,
-                    .salt = undefined,
-                    .rec_seq = tx_rec_seq,
-                };
-                @memcpy(&tx_info.key, tx_key[0..32]);
-                @memcpy(&tx_info.salt, tx_iv[0..4]);
-                @memcpy(&tx_info.iv, tx_iv[4..12]);
-
-                var rx_info = tx_info;
-                rx_info.rec_seq = rx_rec_seq;
-                @memcpy(&rx_info.key, rx_key[0..32]);
-                @memcpy(&rx_info.salt, rx_iv[0..4]);
-                @memcpy(&rx_info.iv, rx_iv[4..12]);
-
-                try setsockoptTls(fd, c.TLS_TX, std.mem.asBytes(&tx_info));
-                try setsockoptTls(fd, c.TLS_RX, std.mem.asBytes(&rx_info));
-            },
-            .chacha20_poly1305 => {
-                var tx_info = c.tls12_crypto_info_chacha20_poly1305{
-                    .info = .{ .version = tls_version, .cipher_type = c.TLS_CIPHER_CHACHA20_POLY1305 },
-                    .iv = undefined,
-                    .key = undefined,
-                    .salt = .{},
-                    .rec_seq = tx_rec_seq,
-                };
-                @memcpy(&tx_info.key, tx_key[0..32]);
-                @memcpy(&tx_info.iv, tx_iv[0..12]);
-
-                var rx_info = tx_info;
-                rx_info.rec_seq = rx_rec_seq;
-                @memcpy(&rx_info.key, rx_key[0..32]);
-                @memcpy(&rx_info.iv, rx_iv[0..12]);
-
-                try setsockoptTls(fd, c.TLS_TX, std.mem.asBytes(&tx_info));
-                try setsockoptTls(fd, c.TLS_RX, std.mem.asBytes(&rx_info));
-            },
+            .aes_gcm_128 => try setupKtlsCipher(c.tls12_crypto_info_aes_gcm_128, c.TLS_CIPHER_AES_GCM_128, fd, tls_version, tx_key[0..16], &tx_iv, rx_key[0..16], &rx_iv, tx_rec_seq, rx_rec_seq),
+            .aes_gcm_256 => try setupKtlsCipher(c.tls12_crypto_info_aes_gcm_256, c.TLS_CIPHER_AES_GCM_256, fd, tls_version, tx_key[0..32], &tx_iv, rx_key[0..32], &rx_iv, tx_rec_seq, rx_rec_seq),
+            .chacha20_poly1305 => try setupKtlsCipher(c.tls12_crypto_info_chacha20_poly1305, c.TLS_CIPHER_CHACHA20_POLY1305, fd, tls_version, tx_key[0..32], &tx_iv, rx_key[0..32], &rx_iv, tx_rec_seq, rx_rec_seq),
         }
 
         // Scrub keys from memory
@@ -670,6 +612,50 @@ pub const TlsConn = struct {
         @memset(&self.ktls_secrets.server_secret, 0);
 
         log.info().string("msg", "ktls enabled").int("fd", fd).fmt("cipher", "0x{x}", .{cipher_id & 0xFFFF}).fmt("version", "0x{x}", .{tls_version}).log();
+    }
+
+    /// Generic kTLS cipher setup: fills a crypto_info struct for TX and RX, then
+    /// applies both via setsockopt. Works for any kTLS crypto_info struct that has
+    /// `.info`, `.key`, `.iv`, `.salt`, and `.rec_seq` fields.
+    fn setupKtlsCipher(
+        comptime CryptoInfo: type,
+        comptime cipher_type: c_int,
+        fd: std.posix.socket_t,
+        tls_version: u16,
+        tx_key: []const u8,
+        tx_iv: *const [12]u8,
+        rx_key: []const u8,
+        rx_iv: *const [12]u8,
+        tx_rec_seq: [8]u8,
+        rx_rec_seq: [8]u8,
+    ) !void {
+        var tx_info: CryptoInfo = undefined;
+        tx_info.info = .{ .version = tls_version, .cipher_type = cipher_type };
+        tx_info.rec_seq = tx_rec_seq;
+        @memcpy(&tx_info.key, tx_key);
+
+        // Salt/IV split: AES-GCM uses 4-byte salt + 8-byte IV from the 12-byte nonce.
+        // ChaCha20-Poly1305 has a 0-byte salt and 12-byte IV (the full nonce).
+        const salt_len = tx_info.salt.len;
+        if (salt_len > 0) {
+            @memcpy(&tx_info.salt, tx_iv[0..salt_len]);
+            @memcpy(&tx_info.iv, tx_iv[salt_len..12]);
+        } else {
+            @memcpy(&tx_info.iv, tx_iv);
+        }
+
+        var rx_info = tx_info;
+        rx_info.rec_seq = rx_rec_seq;
+        @memcpy(&rx_info.key, rx_key);
+        if (salt_len > 0) {
+            @memcpy(&rx_info.salt, rx_iv[0..salt_len]);
+            @memcpy(&rx_info.iv, rx_iv[salt_len..12]);
+        } else {
+            @memcpy(&rx_info.iv, rx_iv);
+        }
+
+        try setsockoptTls(fd, c.TLS_TX, std.mem.asBytes(&tx_info));
+        try setsockoptTls(fd, c.TLS_RX, std.mem.asBytes(&rx_info));
     }
 
     fn setsockoptTls(fd: std.posix.socket_t, direction: u32, info_bytes: []const u8) !void {

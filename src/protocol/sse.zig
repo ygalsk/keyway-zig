@@ -1,6 +1,7 @@
 const std = @import("std");
 const xev = @import("xev");
 const config = @import("../util/config.zig");
+const log = @import("../observability/log.zig");
 const handler_mod = @import("../core/handler.zig");
 const Connection = handler_mod.Connection;
 const conn_sse = @import("conn_sse.zig");
@@ -172,9 +173,13 @@ pub const SseBroadcastBus = struct {
             if (!slot.ready) continue;
 
             // Dupe per-slot (each worker frees its own copy)
-            const room_dupe = self.allocator.dupe(u8, room) catch continue;
+            const room_dupe = self.allocator.dupe(u8, room) catch {
+                log.warn().string("msg", "SSE broadcast: room dupe alloc failed").log();
+                continue;
+            };
             const data_dupe = self.allocator.dupe(u8, data) catch {
                 self.allocator.free(room_dupe);
+                log.warn().string("msg", "SSE broadcast: data dupe alloc failed").log();
                 continue;
             };
 
@@ -183,18 +188,13 @@ pub const SseBroadcastBus = struct {
                 self.allocator.free(room_dupe);
                 self.allocator.free(data_dupe);
                 slot.mutex.unlock();
+                log.warn().string("msg", "SSE broadcast: inbox append failed").log();
                 continue;
             };
             slot.mutex.unlock();
 
             slot.notifier.notify() catch {};
         }
-    }
-
-    /// Return subscriber count for a room (used in tests).
-    pub fn subscriberCount(self: *SseRegistry, room: []const u8) usize {
-        const list = self.rooms.getPtr(room) orelse return 0;
-        return list.items.len;
     }
 
     /// xev.Async callback — fires on the worker's event loop thread.
