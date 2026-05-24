@@ -7,7 +7,6 @@
 //! Fixed-size (RING_DEPTH=16), per-connection, inline, reset per request.
 
 const std = @import("std");
-const log = @import("../observability/log.zig");
 const config = @import("../util/config.zig");
 const TlsMode = @import("io_request.zig").TlsMode;
 const ErrorCategory = @import("../http/error_response.zig").ErrorCategory;
@@ -93,9 +92,13 @@ pub const CompletionRing = struct {
     pub const MAX_DEPTH = config.RING_DEPTH;
 
     pub inline fn push(self: *CompletionRing, entry: CQEntry) void {
+        // Unreachable by construction: SubmissionRing.MAX_DEPTH == CompletionRing.MAX_DEPTH
+        // and each SQE yields exactly one CQE into a ring reset per batch, so the CQ can
+        // never exceed capacity. If this fires, the SQ/CQ symmetry invariant has been
+        // broken — fail loud rather than silently drop a completion (which would leave the
+        // waiting Lua coroutine hung or hand it an out-of-range result).
         if (self.tail >= MAX_DEPTH) {
-            log.err().string("msg", "CompletionRing overflow").int("tail", self.tail).int("max", MAX_DEPTH).log();
-            return;
+            std.debug.panic("CompletionRing overflow: tail={d} max={d}; SQ/CQ invariant violated", .{ self.tail, MAX_DEPTH });
         }
         self.entries[self.tail] = entry;
         self.tail += 1;
@@ -168,6 +171,21 @@ test "CompletionRing: push/get/reset" {
     try std.testing.expectEqual(@as(i32, 6), cq.get(1).result);
     try std.testing.expectEqualStrings("PONG\r\n", cq.get(1).buf.?);
     try std.testing.expect(cq.get(0).buf == null);
+
+    cq.reset();
+    try std.testing.expectEqual(@as(u8, 0), cq.tail);
+}
+
+test "CompletionRing: fills to capacity without overflow" {
+    var cq = CompletionRing{};
+
+    // Fill to exactly MAX_DEPTH — the boundary just below the overflow guard.
+    // One more push would panic (SQ/CQ invariant violation), which is the spec.
+    for (0..CompletionRing.MAX_DEPTH) |i| {
+        cq.push(.{ .result = @intCast(i) });
+    }
+    try std.testing.expectEqual(@as(u8, CompletionRing.MAX_DEPTH), cq.tail);
+    try std.testing.expectEqual(@as(i32, CompletionRing.MAX_DEPTH - 1), cq.get(CompletionRing.MAX_DEPTH - 1).result);
 
     cq.reset();
     try std.testing.expectEqual(@as(u8, 0), cq.tail);
