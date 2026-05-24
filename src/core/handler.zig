@@ -38,6 +38,7 @@ const WorkerMetrics = @import("../observability/metrics.zig").WorkerMetrics;
 const metrics_mod = @import("../observability/metrics.zig");
 const prom = @import("../observability/prom.zig");
 const static_mod = @import("../http/static.zig");
+const proxy_mod = @import("../http/proxy.zig");
 
 const ParamArray = params.ParamArray;
 const QueryArray = params.QueryArray;
@@ -127,7 +128,7 @@ pub const CosocketState = struct {
 
 /// Connection handler - manages HTTP request/response lifecycle
 pub const Connection = struct {
-    pub const State = enum { reading, processing, writing, websocket, sse, streaming, static_file, closing };
+    pub const State = enum { reading, processing, writing, websocket, sse, streaming, static_file, proxying, closing };
     pub const List = std.DoublyLinkedList;
 
     // Intrusive linked list node for Server.connections tracking.
@@ -177,6 +178,9 @@ pub const Connection = struct {
 
     // Static file: non-null when serving a static file
     static_state: ?static_mod.StaticState = null,
+
+    // Reverse proxy: non-null while an upstream exchange is in flight
+    proxy_state: ?proxy_mod.ProxyState = null,
 
     // Per-request timeout: timer fires after REQUEST_TIMEOUT_MS, sending 504
     // Completions initialized to .{} per xev requirements (Pitfall 3: never undefined)
@@ -308,6 +312,10 @@ pub const Connection = struct {
         if (self.sse_state) |*ss| ss.deinit(self);
         // Clean up static file state
         if (self.static_state) |*ss| ss.deinit(self.base_allocator);
+        // Clean up reverse-proxy state (closes upstream fd, frees buffers).
+        // pending_io_ops gates maybeFinishClose, so any in-flight upstream op
+        // has already fired before deinit runs.
+        if (self.proxy_state) |*ps| ps.deinit(self.base_allocator);
         // Clean up TLS resources
         self.tls_state.deinit(self.base_allocator);
         std.posix.close(self.socket);
@@ -707,7 +715,7 @@ pub const Connection = struct {
 
         // Reverse proxy routes: forward matching prefixes to upstream servers
         if (self.router.matchProxy(clean_path)) |proxy_match| {
-            self.proxyRequest(request, proxy_match, self.arena.allocator());
+            proxy_mod.serveProxy(self, request, proxy_match);
             return null;
         }
 
@@ -879,108 +887,6 @@ pub const Connection = struct {
         } else {
             self.sendJsonResponse(alloc, 503, "Service Unavailable", "{\"error\":\"reload not available\"}");
         }
-    }
-
-    /// Reverse proxy: connect to upstream, forward request, relay response.
-    fn proxyRequest(self: *Connection, request: *const http.Request, proxy_match: Router.ProxyMatch, alloc: std.mem.Allocator) void {
-        const prefix = proxy_match.route.prefix;
-
-        // Bare prefix with a configured redirect → 302
-        if (proxy_match.route.redirect) |redirect| {
-            if (proxy_match.suffix.len == 0 or std.mem.eql(u8, proxy_match.suffix, "/")) {
-                const resp = std.fmt.allocPrint(alloc, "HTTP/1.1 302 Found\r\nLocation: {s}\r\nContent-Length: 0\r\n\r\n", .{redirect}) catch {
-                    error_response.sendError(self, .server_error, "proxy redirect failed");
-                    return;
-                };
-                self.logAccess(302);
-                self.sendRawResponse(resp);
-                return;
-            }
-        }
-
-        // Build upstream path
-        const raw_path = request.path;
-        const upstream_path: []const u8 = if (proxy_match.route.strip_prefix)
-            (if (raw_path.len >= prefix.len and std.mem.startsWith(u8, raw_path, prefix))
-                (if (raw_path[prefix.len..].len == 0) "/" else raw_path[prefix.len..])
-            else
-                "/")
-        else
-            raw_path;
-
-        // Connect to upstream
-        const stream = std.net.tcpConnectToHost(alloc, proxy_match.route.upstream_host, proxy_match.route.upstream_port) catch {
-            error_response.sendErrorStatus(self, 502, "proxy upstream connect failed");
-            return;
-        };
-        defer stream.close();
-
-        // Build upstream HTTP request
-        var req_buf = std.ArrayList(u8).initCapacity(alloc, 1024) catch {
-            error_response.sendErrorStatus(self, 502, "proxy request alloc failed");
-            return;
-        };
-        const req_writer = req_buf.writer(alloc);
-        std.fmt.format(req_writer, "{s} {s} HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\n", .{
-            request.method,
-            upstream_path,
-            proxy_match.route.upstream_host,
-            proxy_match.route.upstream_port,
-        }) catch {
-            error_response.sendErrorStatus(self, 502, "proxy request build failed");
-            return;
-        };
-        for (request.headers) |h| {
-            if (std.ascii.eqlIgnoreCase(h.name, "host")) continue;
-            if (std.ascii.eqlIgnoreCase(h.name, "connection")) continue;
-            std.fmt.format(req_writer, "{s}: {s}\r\n", .{ h.name, h.value }) catch {
-                error_response.sendErrorStatus(self, 502, "proxy header build failed");
-                return;
-            };
-        }
-        req_writer.writeAll("\r\n") catch {
-            error_response.sendErrorStatus(self, 502, "proxy request build failed");
-            return;
-        };
-
-        // Send request + body
-        stream.writeAll(req_buf.items) catch {
-            error_response.sendErrorStatus(self, 502, "proxy upstream write failed");
-            return;
-        };
-        if (request.body.len > 0) {
-            stream.writeAll(request.body) catch {
-                error_response.sendErrorStatus(self, 502, "proxy upstream body write failed");
-                return;
-            };
-        }
-
-        // Read entire upstream response
-        var resp_buf = std.ArrayList(u8).initCapacity(alloc, 4096) catch {
-            error_response.sendErrorStatus(self, 502, "proxy response alloc failed");
-            return;
-        };
-        var read_buf: [8192]u8 = undefined;
-        while (true) {
-            const n = stream.read(&read_buf) catch {
-                error_response.sendErrorStatus(self, 502, "proxy upstream read failed");
-                return;
-            };
-            if (n == 0) break;
-            resp_buf.appendSlice(alloc, read_buf[0..n]) catch {
-                error_response.sendErrorStatus(self, 502, "proxy response buffer failed");
-                return;
-            };
-        }
-
-        const upstream_response = resp_buf.items;
-        if (upstream_response.len == 0) {
-            error_response.sendErrorStatus(self, 502, "proxy upstream empty response");
-            return;
-        }
-
-        self.logAccess(200);
-        self.sendRawResponse(upstream_response);
     }
 
     fn onWrite(

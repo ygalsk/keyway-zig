@@ -89,8 +89,9 @@ pub const StaticRoute = struct {
 /// Reverse proxy route configuration.
 pub const ProxyRoute = struct {
     prefix: []const u8, // e.g. "/__keyway/grafana"
-    upstream_host: []const u8, // e.g. "127.0.0.1"
+    upstream_host: []const u8, // e.g. "127.0.0.1" — kept for the upstream Host header
     upstream_port: u16, // e.g. 3000
+    upstream_addr: std.net.Address, // resolved once at registration (no per-request DNS)
     redirect: ?[]const u8 = null, // if set, bare prefix requests 302 to this URL
     strip_prefix: bool = true, // if false, forward the full path to upstream
 };
@@ -134,7 +135,13 @@ pub const Router = struct {
     }
 
     /// Register a reverse proxy route.
+    /// Resolves the upstream host to an address at registration time (blocking DNS
+    /// here is fine — it's config load, not the request hot path) so the proactor
+    /// data path never blocks on resolution. Mirrors nginx's resolve-at-config
+    /// default. Picks the first IPv4 result; errors if the host has none.
     pub fn addProxyRoute(self: *Router, prefix: []const u8, upstream_host: []const u8, upstream_port: u16, redirect: []const u8, strip_prefix: bool) !void {
+        const upstream_addr = try resolveUpstream(self.allocator, upstream_host, upstream_port);
+
         const prefix_copy = try self.allocator.dupe(u8, prefix);
         const host_copy = try self.allocator.dupe(u8, upstream_host);
         const redirect_copy: ?[]const u8 = if (redirect.len > 0) try self.allocator.dupe(u8, redirect) else null;
@@ -142,9 +149,22 @@ pub const Router = struct {
             .prefix = prefix_copy,
             .upstream_host = host_copy,
             .upstream_port = upstream_port,
+            .upstream_addr = upstream_addr,
             .redirect = redirect_copy,
             .strip_prefix = strip_prefix,
         });
+    }
+
+    /// Resolve an upstream host:port to the first available IPv4 address.
+    /// IPv6 / multiple upstream targets are intentionally out of scope for now.
+    fn resolveUpstream(allocator: std.mem.Allocator, host: []const u8, port: u16) !std.net.Address {
+        const list = try std.net.getAddressList(allocator, host, port);
+        defer list.deinit();
+        for (list.addrs) |addr| {
+            if (addr.any.family == std.posix.AF.INET) return addr;
+        }
+        log.err().string("msg", "proxy upstream has no IPv4 address").string("host", host).log();
+        return error.NoIpv4Address;
     }
 
     pub const ProxyMatch = PrefixMatch(ProxyRoute);
