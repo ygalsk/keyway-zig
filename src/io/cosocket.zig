@@ -420,7 +420,13 @@ fn batchCompletionCheck(self: *Connection) void {
 /// single-shot cosocket API (connect/send/recv/close yield and resume with
 /// result values on the stack, not a CQ count).
 fn resumeSingleShot(self: *Connection, s: *SuspendedState, thread: *Lua) void {
-    const cqe = self.cs.cq.get(0);
+    const cqe = self.cs.cq.get(0) orelse {
+        // single_shot_mode was set without a completion queued — resume with an
+        // error rather than reading uninitialized ring memory.
+        cosocket_ops.pushErrorTable(thread, .server_error, "internal: missing completion");
+        dispatchResume(self, thread, 2, s.exchange);
+        return;
+    };
 
     if (cqe.err_msg) |err_msg| {
         // Error: push nil, {category=, message=}
