@@ -16,19 +16,47 @@ fn isHttpMethod(key: []const u8) bool {
     return false;
 }
 
+/// Push keyway.<field> onto the stack when it's a table.
+/// On success: keyway table at -2, field table at -1; returns true.
+/// On failure (keyway or field missing / not a table): stack restored, returns false.
+fn pushKeywayTable(lua: *Lua, field: [:0]const u8) bool {
+    if (lua.getGlobal("keyway") != .table) {
+        lua.pop(1);
+        return false;
+    }
+    if (lua.getField(-1, field) != .table) {
+        lua.pop(2);
+        return false;
+    }
+    return true;
+}
+
+/// Advance a prefix-keyed sub-table iterator, skipping invalid entries.
+/// `table_idx` points at the sub-table; push a nil key before the first call.
+/// Returns a validated "/"-prefixed key with its value table at -1, or null when
+/// exhausted (the iterator key is already popped). Callers pop the value before continuing.
+fn nextPrefixEntry(lua: *Lua, table_idx: i32, table_name: []const u8) ?[]const u8 {
+    const abs_idx = if (table_idx > 0) table_idx else lua.getTop() + table_idx + 1;
+    while (lua.next(abs_idx)) {
+        const key_cstr = lua.toString(-2) catch {
+            lua.pop(1);
+            continue;
+        };
+        const prefix = std.mem.span(key_cstr);
+        if (!lua.isTable(-1) or prefix.len == 0 or prefix[0] != '/') {
+            log.warn().string("msg", "ignoring invalid entry").string("table", table_name).string("key", prefix).log();
+            lua.pop(1);
+            continue;
+        }
+        return prefix;
+    }
+    return null;
+}
+
 /// Process keyway.routes table after script load.
 /// Walks the declarative route table and registers routes with the radix router.
 pub fn processRouteTable(lua: *Lua, router: *Router, allocator: std.mem.Allocator) !void {
-    const keyway_type = lua.getGlobal("keyway");
-    if (keyway_type != .table) {
-        lua.pop(1);
-        log.err().string("msg", "keyway global is not a table").log();
-        return error.Runtime;
-    }
-
-    const routes_type = lua.getField(-1, "routes");
-    if (routes_type != .table) {
-        lua.pop(2);
+    if (!pushKeywayTable(lua, "routes")) {
         log.err().string("msg", "keyway.routes is not a table").log();
         return error.Runtime;
     }
@@ -224,33 +252,12 @@ fn registerRoute(
 /// Process keyway.static table after script load.
 /// Registers static file serving routes with the router.
 pub fn processStaticTable(lua: *Lua, router: *Router) !void {
-    const keyway_type = lua.getGlobal("keyway");
-    if (keyway_type != .table) {
-        lua.pop(1);
-        return; // no keyway table — not an error
-    }
-
-    const static_type = lua.getField(-1, "static");
-    if (static_type != .table) {
-        lua.pop(2);
-        return; // no keyway.static — not an error, static serving is optional
-    }
+    // static serving is optional — a missing table is not an error
+    if (!pushKeywayTable(lua, "static")) return;
 
     // Iterate keyway.static entries: { ["/prefix"] = { root = "...", index = "..." } }
     lua.pushNil();
-    while (lua.next(-2)) {
-        const key_cstr = lua.toString(-2) catch {
-            lua.pop(1);
-            continue;
-        };
-        const prefix = std.mem.span(key_cstr);
-
-        if (!lua.isTable(-1) or prefix.len == 0 or prefix[0] != '/') {
-            log.warn().string("msg", "keyway.static ignoring invalid entry").string("key", prefix).log();
-            lua.pop(1);
-            continue;
-        }
-
+    while (nextPrefixEntry(lua, -2, "keyway.static")) |prefix| {
         // Read root (required)
         const root_type = lua.getField(-1, "root");
         const root_str = if (root_type == .string) std.mem.span(lua.toString(-1) catch "") else "";
@@ -284,32 +291,11 @@ pub fn processStaticTable(lua: *Lua, router: *Router) !void {
 /// Registers reverse proxy routes with the router.
 /// Format: keyway.proxy = { ["/__keyway/grafana"] = { host = "127.0.0.1", port = 3000 } }
 pub fn processProxyTable(lua: *Lua, router: *Router) !void {
-    const keyway_type = lua.getGlobal("keyway");
-    if (keyway_type != .table) {
-        lua.pop(1);
-        return;
-    }
-
-    const proxy_type = lua.getField(-1, "proxy");
-    if (proxy_type != .table) {
-        lua.pop(2);
-        return;
-    }
+    // reverse proxy is optional — a missing table is not an error
+    if (!pushKeywayTable(lua, "proxy")) return;
 
     lua.pushNil();
-    while (lua.next(-2)) {
-        const key_cstr = lua.toString(-2) catch {
-            lua.pop(1);
-            continue;
-        };
-        const prefix = std.mem.span(key_cstr);
-
-        if (!lua.isTable(-1) or prefix.len == 0 or prefix[0] != '/') {
-            log.warn().string("msg", "keyway.proxy ignoring invalid entry").string("key", prefix).log();
-            lua.pop(1);
-            continue;
-        }
-
+    while (nextPrefixEntry(lua, -2, "keyway.proxy")) |prefix| {
         // Read host (required)
         const host_type = lua.getField(-1, "host");
         const host_str = if (host_type == .string) std.mem.span(lua.toString(-1) catch "") else "";
