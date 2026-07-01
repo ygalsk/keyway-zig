@@ -95,6 +95,22 @@ fn formatHttpDate(buf: *[29]u8, epoch_secs: i64) void {
     }) catch {};
 }
 
+/// Map a static-file I/O error to an HTTP response.
+/// A missing entry is the client's problem (404); permissions, I/O, fd
+/// exhaustion, etc. are the server failing to read its own files (500).
+fn sendStaticError(self: *Connection, err: anyerror, server_msg: []const u8) void {
+    switch (err) {
+        error.FileNotFound, error.NotDir => {
+            self.logAccess(404);
+            error_response.sendErrorStatus(self, 404, "static file not found");
+        },
+        else => {
+            self.logAccess(500);
+            error_response.sendErrorStatus(self, 500, server_msg);
+        },
+    }
+}
+
 /// Serve a static file. Called from handler.zig routeRequest.
 pub fn serveStaticFile(
     self: *Connection,
@@ -146,16 +162,10 @@ pub fn serveStaticFile(
     var resolve_io: std.Io.Threaded = .init(alloc, .{});
     defer resolve_io.deinit();
     const real_resolved = blk: {
-        var rh = std.Io.Dir.cwd().openDir(resolve_io.io(), resolved, .{}) catch {
-            self.logAccess(404);
-            self.send404NotFound();
-            return;
-        };
-        defer rh.close(resolve_io.io());
+        // realPathFile canonicalizes a file path (openDir would fail with NotDir on a regular file).
         var pbuf: [std.fs.max_path_bytes]u8 = undefined;
-        const n = rh.realPath(resolve_io.io(), &pbuf) catch {
-            self.logAccess(404);
-            self.send404NotFound();
+        const n = std.Io.Dir.cwd().realPathFile(resolve_io.io(), resolved, &pbuf) catch |err| {
+            sendStaticError(self, err, "static realpath failed");
             return;
         };
         break :blk alloc.dupe(u8, pbuf[0..n]) catch {
@@ -178,9 +188,8 @@ pub fn serveStaticFile(
     };
     var open_io: std.Io.Threaded = .init(alloc, .{});
     defer open_io.deinit();
-    const file = std.Io.Dir.openFileAbsolute(open_io.io(), resolved_z, .{}) catch {
-        self.logAccess(404);
-        self.send404NotFound();
+    const file = std.Io.Dir.openFileAbsolute(open_io.io(), resolved_z, .{}) catch |err| {
+        sendStaticError(self, err, "static file open failed");
         return;
     };
     const fd = file.handle;
