@@ -23,16 +23,10 @@ pub const LinearBuffer = struct {
         self.allocator.free(self.data);
     }
 
-    /// Get slice available for writing.
-    /// Auto-compacts when write space is low but consumed space is available,
-    /// preventing false "buffer full" on long-lived connections (WS, SSE).
+    /// Get slice available for writing (pure accessor, symmetric with readSlice).
+    /// Does not mutate: callers that need to reclaim consumed space must call
+    /// compact() explicitly before writing (see startRead / startWsRead).
     pub inline fn writeSlice(self: *LinearBuffer) []u8 {
-        // Proactive compaction: if less than 25% write space remains and
-        // at least 25% of the buffer has been consumed, compact to reclaim.
-        const quarter = self.data.len / 4;
-        if (self.availableWrite() <= quarter and self.read_pos >= quarter) {
-            self.compact();
-        }
         return self.data[self.write_pos..];
     }
 
@@ -173,26 +167,29 @@ test "linear buffer partial consume" {
     try std.testing.expectEqualStrings("World", buf.readSlice());
 }
 
-test "linear buffer auto-compaction on fragmentation" {
+test "linear buffer writeSlice is a pure accessor" {
     const allocator = std.testing.allocator;
 
     var buf = try LinearBuffer.init(allocator, 64);
     defer buf.deinit();
 
-    // Simulate fragmentation: write 48 bytes, consume 32, leaving
-    // read_pos=32 (50% consumed), write_pos=48, available_write=16 (25%).
+    // Fragment the buffer: write 48 bytes, consume 32, leaving
+    // read_pos=32, write_pos=48, available_write=16.
     const ws1 = buf.writeSlice();
     @memset(ws1[0..48], 'A');
     buf.commitWrite(48);
-    buf.consume(32); // read_pos=32, write_pos=48
+    buf.consume(32);
 
-    // Before writeSlice: available_write=16 (25%), read_pos=32 (50%)
-    // This should trigger auto-compaction.
-    try std.testing.expectEqual(@as(usize, 16), buf.availableWrite());
+    // writeSlice must not compact: positions stay put and it returns the
+    // tail from write_pos, never silently reclaiming consumed space.
     const ws2 = buf.writeSlice();
+    try std.testing.expectEqual(@as(usize, 32), buf.read_pos);
+    try std.testing.expectEqual(@as(usize, 48), buf.write_pos);
+    try std.testing.expectEqual(@as(usize, 16), ws2.len);
 
-    // After compaction: read_pos=0, write_pos=16, available_write=48
+    // Reclaiming is now an explicit, visible step.
+    buf.compact();
     try std.testing.expectEqual(@as(usize, 0), buf.read_pos);
     try std.testing.expectEqual(@as(usize, 16), buf.write_pos);
-    try std.testing.expectEqual(@as(usize, 48), ws2.len);
+    try std.testing.expectEqual(@as(usize, 48), buf.writeSlice().len);
 }
