@@ -199,12 +199,6 @@ pub const SseBroadcastBus = struct {
         }
     }
 
-    /// Return subscriber count for a room (used in tests).
-    pub fn subscriberCount(self: *SseRegistry, room: []const u8) usize {
-        const list = self.rooms.getPtr(room) orelse return 0;
-        return list.items.len;
-    }
-
     /// xev.Async callback — fires on the worker's event loop thread.
     fn onNotify(
         self_opt: ?*SseBroadcastBus,
