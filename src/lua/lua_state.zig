@@ -1,11 +1,11 @@
 //! Per-worker Lua state aggregation and initialization.
 //!
 //! Each worker thread owns one LuaState containing: the Lua VM, cached coroutine thread,
-//! the async-yield bridge (pending I/O + suspended coroutine state, shared by cosocket/WS/
+//! the async-yield bridge (pending WS send + suspended coroutine state, shared by WS/
 //! SSE/stream), an outbound TLS manager, and an SSE registry pointer.
 //!
 //! Init order: Lua VM → std libs → keyway module → embedded stdlib → cached thread → package paths → TLS manager.
-//! After init: registerCosocketApi → setWorkerGlobals → loadScript → processRouteTable.
+//! After init: registerAsyncApi → setWorkerGlobals → loadScript → processRouteTable.
 
 const std = @import("std");
 const Lua = @import("luajit").Lua;
@@ -14,9 +14,7 @@ const http = @import("../http/http.zig");
 const HttpExchange = @import("../http/http_exchange.zig").HttpExchange;
 const Router = @import("../http/router.zig").Router;
 const lua_api = @import("lua_api.zig");
-const IoEntry = @import("../io/ring.zig").IoEntry;
 const io_request = @import("../io/io_request.zig");
-const ring = @import("../io/ring.zig");
 const Connection = @import("../core/handler.zig").Connection;
 const tls = @import("../tls/tls.zig");
 const castUserdata = @import("../util/helpers.zig").castUserdata;
@@ -54,17 +52,17 @@ pub const LuaState = struct {
     cached_thread: *Lua = undefined,
     cached_thread_ref: i32 = 0,
 
-    // Cosocket: pending I/O intent written by C yield functions, read by Zig after LUA_YIELD.
-    // Safe because: written by C yield functions during lua_resume, read by dispatchIo
-    // in the same stack frame. libxev is single-threaded per worker — no concurrent access.
-    pending_io: ?IoEntry = null,
+    // WS send payload written by keyway_ws_send during lua_resume, read by
+    // conn_ws.submitWsSend after LUA_YIELD. libxev is single-threaded per
+    // worker — no concurrent access between write and read.
+    pending_ws_send: ?[]const u8 = null,
 
-    // Cosocket: temporary coroutine state (copied to Connection after yield)
+    // Temporary coroutine state (copied to Connection after yield)
     coroutine_ref: i32 = 0,
     coroutine_thread: ?*Lua = null,
 
     // Current connection being served (set during handler call/resume, cleared on completion)
-    // Used by ring C bridge functions to access the Connection's SQ/CQ.
+    // Used by the async C bridge functions (ws_send, sse_broadcast) to reach the Connection.
     current_connection: ?*Connection = null,
 
     // Lua script timing: duration + route label for the currently-running coroutine,
@@ -324,15 +322,13 @@ pub const LuaState = struct {
         return self.dispatchCoroutine(lua_ref, .{ .http = exchange });
     }
 
-    /// Resume a yielded handler coroutine after outbound I/O completes.
+    /// Resume a yielded handler coroutine after WS/SSE/stream flow control completes.
     /// Caller has already pushed result values onto the thread stack.
     /// Does NOT unref the coroutine — Connection.completeHandler handles that.
-    /// The exchange pointer comes from Connection.exchange (set during yield).
     pub fn resumeHandler(
         self: *LuaState,
         thread: *anyopaque,
         nresults: c_int,
-        _: *HttpExchange,
     ) !HandlerResult {
         const status = lua_resume(thread, nresults);
 
@@ -344,7 +340,7 @@ pub const LuaState = struct {
                 return .completed;
             },
             1 => {
-                // LUA_YIELD — handler wants more I/O (pending_io already populated)
+                // LUA_YIELD — handler suspended for WS/SSE/stream flow control
                 return .yielded;
             },
             else => {
@@ -545,9 +541,9 @@ pub const LuaState = struct {
         }
     }
 
-    /// Register cosocket C functions as Lua globals with *LuaState as upvalue.
-    /// Must be called after init (needs stable *LuaState pointer).
-    pub fn registerCosocketApi(self: *LuaState) void {
+    /// Register async-yield C functions (ws_send, sse_broadcast) as Lua globals
+    /// with *LuaState as upvalue. Must be called after init (needs stable *LuaState pointer).
+    pub fn registerAsyncApi(self: *LuaState) void {
         const funcs = .{
             .{ "__keyway_ws_send", io_request.keyway_ws_send },
             .{ "__keyway_sse_broadcast", keyway_sse_broadcast },

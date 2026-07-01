@@ -283,7 +283,7 @@ fn luaWsContextIndex(lua: *Lua) callconv(.c) c_int {
 }
 
 /// ws:send(data) — Lua wrapper calls __keyway_ws_send(data) which is a C closure with LuaState upvalue.
-/// This is registered via registerCosocketApi in lua_state.zig, same pattern as other cosocket ops.
+/// Registered via registerAsyncApi in lua_state.zig.
 
 // === Metatable Registration ===
 

@@ -102,7 +102,6 @@ comptime {
     _ = @import("io/bpf_reuseport.zig");
     _ = @import("util/buffer.zig");
     _ = @import("util/cli.zig");
-    _ = @import("io/cosocket.zig");
     _ = @import("http/error_response.zig");
     _ = @import("io/file_watcher.zig");
     _ = @import("core/handler.zig");
@@ -114,7 +113,6 @@ comptime {
     _ = @import("http/params.zig");
     _ = @import("observability/prom.zig");
     _ = @import("core/reload.zig");
-    _ = @import("io/ring.zig");
     _ = @import("http/router.zig");
     _ = @import("core/server.zig");
     _ = @import("core/shutdown.zig");

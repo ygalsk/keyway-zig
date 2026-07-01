@@ -93,7 +93,7 @@ src/
 ├── http/           # HTTP types, exchange, router, params, static
 ├── protocol/       # WebSocket, SSE, chunked streaming
 ├── tls/            # TLS primitives, inbound handshake, kTLS offload
-├── io/             # async-yield engine (WS/SSE/stream), rings, file watcher, BPF
+├── io/             # async-yield entry points (WS/SSE), file watcher, BPF
 ├── lua/            # LuaJIT state management, Lua API bindings
 ├── observability/  # logging, metrics, Prometheus
 └── util/           # buffer, helpers, config, CLI
@@ -178,11 +178,6 @@ Keyway exposes Prometheus metrics at `/metrics` (text exposition format).
 - `keyway_connections_accepted_total` — per-worker counter
 - `keyway_connections_active` — per-worker gauge
 - `keyway_connections_rejected_total` — per-worker counter
-
-**io_uring**
-- `keyway_ring_submissions_total` — SQE count per worker
-- `keyway_ring_completions_total` — CQE count per worker
-- `keyway_ring_batch_size` — submissions per batch histogram
 
 **Lua runtime**
 - `keyway_lua_coroutines_active` — per-worker gauge

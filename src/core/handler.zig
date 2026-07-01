@@ -1,11 +1,13 @@
 //! Connection lifecycle and proactor boundary.
 //!
 //! Each Connection owns a socket, read/write buffers, an arena allocator,
-//! and per-request state (params, query, I/O rings). The proactor contract:
-//! Lua sets state on HttpExchange, Zig submits all I/O via libxev.
+//! and per-request state (params, query, suspended coroutine). The proactor
+//! contract: Lua sets state on HttpExchange, Zig submits all I/O via libxev.
 //!
 //! Lifecycle: accept → startRead → onRead → handleRequest → onWrite → (keep-alive or close)
-//! Protocol upgrades (WS, SSE) and cosocket yields branch from dispatchRequest.
+//! Protocol upgrades (WS, SSE, stream) branch from dispatchRequest; the yield/resume
+//! bridge for WS/SSE/stream flow control lives on Connection (dispatchResume,
+//! resumeWithError, completeHandler).
 
 const std = @import("std");
 const xev = @import("xev");
@@ -15,7 +17,6 @@ const http = @import("../http/http.zig");
 const HttpExchange = @import("../http/http_exchange.zig").HttpExchange;
 const Router = @import("../http/router.zig").Router;
 const LuaState = @import("../lua/lua_state.zig").LuaState;
-const ring = @import("../io/ring.zig");
 const tls_mod = @import("../tls/tls.zig");
 const TlsContext = tls_mod.TlsContext;
 const Lua = @import("luajit").Lua;
@@ -30,8 +31,8 @@ const helpers = @import("../util/helpers.zig");
 const conn_sse = @import("../protocol/conn_sse.zig");
 const conn_ws = @import("../protocol/conn_ws.zig");
 const conn_stream = @import("../protocol/conn_stream.zig");
-const cosocket = @import("../io/cosocket.zig");
 const error_response = @import("../http/error_response.zig");
+const ErrorCategory = error_response.ErrorCategory;
 const Server = @import("server.zig").Server;
 const prom = @import("../observability/prom.zig");
 const static_mod = @import("../http/static.zig");
@@ -39,16 +40,12 @@ const static_mod = @import("../http/static.zig");
 const ParamArray = params.ParamArray;
 const QueryArray = params.QueryArray;
 const parseQueryString = params.parseQueryString;
-/// Cosocket suspend state — bundled so one `= null` replaces seven resets.
-/// Non-null means a handler is yielded waiting on outbound I/O.
+/// Suspend state for a coroutine yielded on WS/SSE/stream flow control.
+/// Non-null means a handler is yielded waiting to be resumed.
 pub const SuspendedState = struct {
-    completion: xev.Completion,
     exchange: *HttpExchange,
-    recv_buf: ?[]u8,
     coroutine_ref: i32,
     coroutine_thread: *anyopaque,
-    outbound_fd: std.posix.socket_t,
-    pending_op: ring.IoEntry.Op,
 };
 
 const READ_BUFFER_SIZE = config.READ_BUFFER_SIZE;
@@ -73,39 +70,6 @@ pub const TlsState = struct {
     pub fn deinit(self: *TlsState, alloc: std.mem.Allocator) void {
         if (self.tls_conn) |*tc| tc.deinit(alloc);
         if (self.ciphertext_buffer) |*cb| cb.deinit();
-    }
-};
-
-/// Outbound cosocket I/O state — submission/completion rings and batch buffers.
-/// batch_completions/batch_recv_bufs are lazy-allocated on first cosocket use
-/// via base_allocator (stable heap addresses for xev callbacks). Connections
-/// that never use cosocket I/O pay zero memory for these arrays.
-pub const CosocketState = struct {
-    sq: ring.SubmissionRing = .{},
-    cq: ring.CompletionRing = .{},
-    pending_completions: u8 = 0,
-    batch_completions: ?*[ring.SubmissionRing.MAX_DEPTH]xev.Completion = null,
-    batch_recv_bufs: ?*[ring.SubmissionRing.MAX_DEPTH]?[]u8 = null,
-    suspended: ?SuspendedState = null,
-
-    /// Ensure batch arrays are allocated. Called at the start of drainSubmissionRing.
-    /// Returns false on allocation failure.
-    pub fn ensureBatchArrays(self: *CosocketState, allocator: std.mem.Allocator) bool {
-        if (self.batch_completions == null) {
-            self.batch_completions = allocator.create([ring.SubmissionRing.MAX_DEPTH]xev.Completion) catch return false;
-        }
-        if (self.batch_recv_bufs == null) {
-            self.batch_recv_bufs = allocator.create([ring.SubmissionRing.MAX_DEPTH]?[]u8) catch return false;
-            self.batch_recv_bufs.?.* = .{null} ** ring.SubmissionRing.MAX_DEPTH;
-        }
-        return true;
-    }
-
-    pub fn deinitBatchArrays(self: *CosocketState, allocator: std.mem.Allocator) void {
-        if (self.batch_completions) |bc| allocator.destroy(bc);
-        if (self.batch_recv_bufs) |br| allocator.destroy(br);
-        self.batch_completions = null;
-        self.batch_recv_bufs = null;
     }
 };
 
@@ -145,8 +109,8 @@ pub const Connection = struct {
     // Sub-struct: per-request HTTP fields (reset on keep-alive)
     http_state: HttpState = .{},
 
-    // Sub-struct: outbound cosocket I/O (rings, batch buffers, suspended coroutine)
-    cs: CosocketState = .{},
+    // Non-null when a handler is yielded waiting for WS/SSE/stream flow control.
+    suspended: ?SuspendedState = null,
 
     // WebSocket: non-null when connection has been upgraded to WebSocket
     ws_state: ?conn_ws.WsState = null,
@@ -270,16 +234,12 @@ pub const Connection = struct {
         // Remove from server's connection tracking list
         self.server.connections.remove(&self.link);
         // Clean up suspended coroutine state if connection closes mid-I/O
-        if (self.cs.suspended) |*s| {
+        if (self.suspended) |*s| {
             // Unref pinned coroutine to prevent Lua registry leak
             if (s.coroutine_ref != 0) {
                 self.lua_state.lua.unref(Lua.PseudoIndex.Registry, s.coroutine_ref);
             }
-            // Close leaked outbound fd
-            if (s.outbound_fd != -1) helpers.closeFd(s.outbound_fd);
         }
-        // Clean up lazy-allocated cosocket batch arrays
-        self.cs.deinitBatchArrays(self.base_allocator);
         // Clean up WebSocket callback refs and reassembly buffer
         if (self.ws_state) |*wss| {
             if (wss.on_message_ref != 0) self.lua_state.lua.unref(Lua.PseudoIndex.Registry, wss.on_message_ref);
@@ -406,7 +366,7 @@ pub const Connection = struct {
     /// here — sendRawResponse sets state to .writing; onWrite detects timed_out
     /// and calls maybeFinishClose after the 504 write completes.
     /// Does NOT call deinit directly — deferred deinit ensures Connection outlives
-    /// all armed cosocket completions (pending_completions).
+    /// all armed timer/I/O completions (pending_timer_ops, pending_io_ops).
     fn onRequestTimeout(
         userdata: ?*anyopaque,
         loop: *xev.Loop,
@@ -624,20 +584,105 @@ pub const Connection = struct {
                     conn_stream.handleStreamUpgrade(self, exchange);
                     return;
                 }
-                self.cs.suspended = .{
-                    .completion = undefined,
+                self.suspended = .{
                     .exchange = exchange,
-                    .recv_buf = null,
                     .coroutine_ref = self.lua_state.coroutine_ref,
                     .coroutine_thread = @ptrCast(self.lua_state.coroutine_thread.?),
-                    .outbound_fd = -1,
-                    .pending_op = .none,
                 };
                 self.lua_state.coroutine_ref = 0;
                 self.lua_state.coroutine_thread = null;
-                cosocket.dispatchIo(self);
+                // A bare coroutine.yield() outside WS/SSE/stream flow control has
+                // nothing to wait on — resume immediately with an error.
+                self.resumeWithError(.server_error, "no pending I/O operation");
             },
         }
+    }
+
+    // =========================================================================
+    // WS/SSE/stream yield/resume bridge
+    // =========================================================================
+    // A yielded coroutine is resumed by pushing result values onto its thread
+    // stack, then dispatching on whether it completed or yielded again.
+
+    /// Resume a suspended coroutine and dispatch based on the result.
+    pub fn dispatchResume(self: *Connection, thread: *Lua, nresults: c_int) void {
+        self.lua_state.current_connection = self;
+        const resume_result = self.lua_state.resumeHandler(@ptrCast(thread), nresults) catch {
+            self.lua_state.current_connection = null;
+            // WebSocket: can't send HTTP 500 on a WS connection — return to read loop
+            if (self.state == .websocket) {
+                self.completeHandler();
+            } else {
+                self.send500InternalError();
+            }
+            return;
+        };
+
+        switch (resume_result) {
+            .completed => {
+                self.lua_state.current_connection = null;
+                self.completeHandler();
+            },
+            .yielded => {
+                if (self.state == .websocket) {
+                    conn_ws.routeWsYield(self);
+                } else {
+                    // Nothing left to wait on outside WS flow control.
+                    self.resumeWithError(.server_error, "no pending I/O operation");
+                }
+            },
+        }
+    }
+
+    /// Push nil, {category=..., message=...} error table onto the thread stack,
+    /// so Lua always sees a structured error table.
+    fn pushErrorTable(thread: *Lua, category: ErrorCategory, msg: [:0]const u8) void {
+        thread.pushNil();
+        thread.createTable(0, 2);
+        thread.pushString(@tagName(category));
+        thread.setField(-2, "category");
+        thread.pushString(msg);
+        thread.setField(-2, "message");
+    }
+
+    /// Resume the suspended coroutine with nil, {category, message} error table.
+    pub fn resumeWithError(self: *Connection, category: ErrorCategory, msg: [:0]const u8) void {
+        const s = &self.suspended.?;
+        const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
+        pushErrorTable(thread, category, msg);
+        self.dispatchResume(thread, 2);
+    }
+
+    /// Handler finished after one or more yield/resume cycles.
+    /// Return coroutine to cache, serialize response, submit write.
+    /// For WebSocket connections, returns to WS read loop instead of HTTP response.
+    pub fn completeHandler(self: *Connection) void {
+        const s = self.suspended orelse return;
+
+        // Return coroutine thread to cache for reuse
+        if (s.coroutine_ref != 0) {
+            if (self.lua_state.cached_thread_ref == 0) {
+                self.lua_state.cached_thread_ref = s.coroutine_ref;
+                self.lua_state.cached_thread = @ptrCast(@alignCast(s.coroutine_thread));
+            } else {
+                self.lua_state.lua.unref(Lua.PseudoIndex.Registry, s.coroutine_ref);
+            }
+        }
+
+        self.suspended = null;
+
+        // WebSocket: return to WS read loop instead of serializing HTTP response
+        if (self.state == .websocket) {
+            self.lua_state.current_connection = null;
+            conn_ws.startWsRead(self);
+            return;
+        }
+
+        const exchange = s.exchange;
+        self.logAccess(exchange.status);
+        self.writeResponse(exchange) catch {
+            self.send500InternalError();
+        };
     }
 
     pub fn send404NotFound(self: *Connection) void {
@@ -972,8 +1017,8 @@ pub const Connection = struct {
         const self = castUserdata(Connection, userdata);
         const bytes_written = self.handleSendCompletion(result) orelse return .disarm;
         // If this write was the 504 timeout response, close instead of recycling.
-        // pending_completions may still be non-zero (cosocket I/O in flight),
-        // so close() -> maybeFinishClose() defers deinit until all completions drain.
+        // pending_timer_ops/pending_io_ops may still be non-zero (in-flight
+        // completions), so close() -> maybeFinishClose() defers deinit until they drain.
         if (self.timed_out) {
             self.close();
             return .disarm;
@@ -1032,10 +1077,7 @@ pub const Connection = struct {
     pub fn handleHttpPostWrite(self: *Connection) void {
         // Cancel the per-request deadline timer on successful response completion
         self.cancelRequestTimer();
-        self.cs.suspended = null;
-        self.cs.sq.reset();
-        self.cs.cq.reset();
-        self.cs.pending_completions = 0;
+        self.suspended = null;
         // Free the arena if its retained capacity grew large; otherwise keep it
         // for reuse. Watermark on the arena's actual capacity, not the response
         // size — large intermediate allocations (and the static/streaming paths,
@@ -1097,15 +1139,15 @@ pub const Connection = struct {
         // in-flight timer_remove so maybeFinishClose can't free early.
         self.cancelHeaderTimer();
         self.cancelRequestTimer();
-        // Deferred deinit: only free when all armed cosocket completions have fired.
-        // Normal HTTP connections have pending_completions == 0 (no cosocket I/O),
+        // Deferred deinit: only free when all armed timer/I/O completions have fired.
+        // Normal HTTP connections have both counters at 0 by the time close() runs,
         // so maybeFinishClose is equivalent to deinit() in the common case.
         self.maybeFinishClose();
     }
 
-    /// Deferred deinit guard: only free Connection when all armed cosocket
-    /// completions have fired. Called at every point where pending_completions
-    /// is decremented to ensure Connection outlives in-flight xev callbacks.
+    /// Deferred deinit guard: only free Connection when all armed timer/I/O
+    /// completions have fired. Called at every point where pending_timer_ops or
+    /// pending_io_ops is decremented to ensure Connection outlives in-flight xev callbacks.
     /// Handle send completion boilerplate: decrement pending_io_ops, check for
     /// send errors, check closing state. Returns bytes sent on success, or null
     /// if the caller should return .disarm (error or closing).
@@ -1124,7 +1166,7 @@ pub const Connection = struct {
     }
 
     pub fn maybeFinishClose(self: *Connection) void {
-        if (self.state == .closing and self.cs.pending_completions == 0 and self.pending_timer_ops == 0 and self.pending_io_ops == 0) {
+        if (self.state == .closing and self.pending_timer_ops == 0 and self.pending_io_ops == 0) {
             self.deinit(self.base_allocator);
         }
     }
@@ -1133,40 +1175,45 @@ pub const Connection = struct {
     // Tests
     // =========================================================================
 
-    test "maybeFinishClose: does not deinit when pending_completions > 0" {
+    test "maybeFinishClose: does not deinit when pending_io_ops > 0" {
         // We can only test the guard logic without a real allocator/connection.
-        // Verify that the condition pending_completions > 0 prevents close.
         const conn = struct {
             state: State,
-            cs: struct { pending_completions: u8 },
+            pending_timer_ops: u8,
+            pending_io_ops: u8,
         }{
             .state = .closing,
-            .cs = .{ .pending_completions = 1 },
+            .pending_timer_ops = 0,
+            .pending_io_ops = 1,
         };
-        // Guard: closing with pending_completions == 1 must NOT deinit
-        try std.testing.expect(!(conn.state == .closing and conn.cs.pending_completions == 0));
+        // Guard: closing with pending_io_ops == 1 must NOT deinit
+        try std.testing.expect(!(conn.state == .closing and conn.pending_timer_ops == 0 and conn.pending_io_ops == 0));
     }
 
-    test "maybeFinishClose: condition met when closing and no pending_completions" {
+    test "maybeFinishClose: condition met when closing and no pending ops" {
         const conn = struct {
             state: State,
-            cs: struct { pending_completions: u8 },
+            pending_timer_ops: u8,
+            pending_io_ops: u8,
         }{
             .state = .closing,
-            .cs = .{ .pending_completions = 0 },
+            .pending_timer_ops = 0,
+            .pending_io_ops = 0,
         };
-        // Guard: closing with pending_completions == 0 SHOULD deinit
-        try std.testing.expect(conn.state == .closing and conn.cs.pending_completions == 0);
+        // Guard: closing with both counters at 0 SHOULD deinit
+        try std.testing.expect(conn.state == .closing and conn.pending_timer_ops == 0 and conn.pending_io_ops == 0);
     }
 
     test "maybeFinishClose: does not deinit when not closing" {
         const conn = struct {
             state: State,
-            cs: struct { pending_completions: u8 },
+            pending_timer_ops: u8,
+            pending_io_ops: u8,
         }{
             .state = .processing,
-            .cs = .{ .pending_completions = 0 },
+            .pending_timer_ops = 0,
+            .pending_io_ops = 0,
         };
-        try std.testing.expect(!(conn.state == .closing and conn.cs.pending_completions == 0));
+        try std.testing.expect(!(conn.state == .closing and conn.pending_timer_ops == 0 and conn.pending_io_ops == 0));
     }
 };
