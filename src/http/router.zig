@@ -168,8 +168,9 @@ pub const StaticRoute = struct {
 /// Reverse proxy route configuration.
 pub const ProxyRoute = struct {
     prefix: []const u8, // e.g. "/__keyway/grafana"
-    upstream_host: []const u8, // e.g. "127.0.0.1"
+    upstream_host: []const u8, // e.g. "127.0.0.1" — kept for the upstream Host header
     upstream_port: u16, // e.g. 3000
+    upstream_addr: std.Io.net.IpAddress, // resolved once at registration (no per-request DNS)
     redirect: ?[]const u8 = null, // if set, bare prefix requests 302 to this URL
     strip_prefix: bool = true, // if false, forward the full path to upstream
 };
@@ -225,7 +226,12 @@ pub const Router = struct {
     }
 
     /// Register a reverse proxy route.
+    /// Resolves the upstream host to an address at registration time (blocking here
+    /// is fine — it's config load, not the request hot path) so the proactor data
+    /// path never blocks on DNS. Mirrors nginx's resolve-at-config default.
     pub fn addProxyRoute(self: *Router, prefix: []const u8, upstream_host: []const u8, upstream_port: u16, redirect: []const u8, strip_prefix: bool) !void {
+        const upstream_addr = try resolveUpstream(self.allocator, upstream_host, upstream_port);
+
         const prefix_copy = try self.allocator.dupe(u8, prefix);
         const host_copy = try self.allocator.dupe(u8, upstream_host);
         const redirect_copy: ?[]const u8 = if (redirect.len > 0) try self.allocator.dupe(u8, redirect) else null;
@@ -233,10 +239,38 @@ pub const Router = struct {
             .prefix = prefix_copy,
             .upstream_host = host_copy,
             .upstream_port = upstream_port,
+            .upstream_addr = upstream_addr,
             .redirect = redirect_copy,
             .strip_prefix = strip_prefix,
         });
         try self.proxy_trie.insert(prefix, self.proxy_routes.items.len - 1);
+    }
+
+    /// Resolve an upstream host:port to an address once, at route registration.
+    /// Literal IPs parse without I/O; hostnames fall back to a blocking DNS
+    /// lookup (registration-time only — the request hot path never resolves).
+    fn resolveUpstream(allocator: std.mem.Allocator, host: []const u8, port: u16) !std.Io.net.IpAddress {
+        if (std.Io.net.IpAddress.parse(host, port)) |addr| return addr else |_| {}
+
+        const hostname = try std.Io.net.HostName.init(host);
+        var threaded: std.Io.Threaded = .init(allocator, .{});
+        defer threaded.deinit();
+        const io = threaded.io();
+
+        var lookup_buf: [8]std.Io.net.HostName.LookupResult = undefined;
+        var queue: std.Io.Queue(std.Io.net.HostName.LookupResult) = .init(&lookup_buf);
+        var lookup_future = io.async(std.Io.net.HostName.lookup, .{ hostname, io, &queue, .{ .port = port } });
+        defer lookup_future.cancel(io) catch {};
+
+        while (queue.getOne(io)) |result| {
+            switch (result) {
+                .address => |addr| return addr,
+                .canonical_name => {},
+            }
+        } else |_| {}
+
+        log.err().string("msg", "proxy upstream has no address").string("host", host).log();
+        return error.UnknownHostName;
     }
 
     pub const ProxyMatch = PrefixMatch(ProxyRoute);

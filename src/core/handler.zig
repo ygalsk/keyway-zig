@@ -36,6 +36,7 @@ const ErrorCategory = error_response.ErrorCategory;
 const Server = @import("server.zig").Server;
 const prom = @import("../observability/prom.zig");
 const static_mod = @import("../http/static.zig");
+const proxy_mod = @import("../http/proxy.zig");
 
 const ParamArray = params.ParamArray;
 const QueryArray = params.QueryArray;
@@ -125,6 +126,9 @@ pub const Connection = struct {
 
     // Static file: non-null when serving a static file
     static_state: ?static_mod.StaticState = null,
+
+    // Reverse proxy: non-null while an upstream exchange is in flight
+    proxy_state: ?proxy_mod.ProxyState = null,
 
     // Per-request timeout: timer fires after REQUEST_TIMEOUT_MS, sending 504
     // Completions initialized to .{} per xev requirements (Pitfall 3: never undefined)
@@ -250,6 +254,10 @@ pub const Connection = struct {
         if (self.sse_state) |*ss| ss.deinit(self);
         // Clean up static file state
         if (self.static_state) |*ss| ss.deinit(self.base_allocator);
+        // Clean up reverse-proxy state (closes upstream fd, frees buffers).
+        // pending_io_ops gates maybeFinishClose, so any in-flight upstream op
+        // has already fired before deinit runs.
+        if (self.proxy_state) |*ps| ps.deinit(self.base_allocator);
         // Clean up TLS resources
         self.tls_state.deinit(self.base_allocator);
         helpers.closeFd(self.socket);
@@ -735,7 +743,7 @@ pub const Connection = struct {
 
         // Reverse proxy routes: forward matching prefixes to upstream servers
         if (self.router.matchProxy(clean_path)) |proxy_match| {
-            self.proxyRequest(request, proxy_match, self.arena.allocator());
+            proxy_mod.serveProxy(self, request, proxy_match);
             return null;
         }
 
@@ -891,122 +899,10 @@ pub const Connection = struct {
         }
     }
 
-    /// Reverse proxy: connect to upstream, forward request, relay response.
-    fn proxyRequest(self: *Connection, request: *const http.Request, proxy_match: Router.ProxyMatch, alloc: std.mem.Allocator) void {
-        const prefix = proxy_match.route.prefix;
-
-        // Bare prefix with a configured redirect → 302
-        if (proxy_match.route.redirect) |redirect| {
-            if (proxy_match.suffix.len == 0 or std.mem.eql(u8, proxy_match.suffix, "/")) {
-                const resp = std.fmt.allocPrint(alloc, "HTTP/1.1 302 Found\r\nLocation: {s}\r\nContent-Length: 0\r\n\r\n", .{redirect}) catch {
-                    error_response.sendError(self, .server_error, "proxy redirect failed");
-                    return;
-                };
-                self.logAccess(302);
-                self.sendRawResponse(resp);
-                return;
-            }
-        }
-
-        // Build upstream path
-        const raw_path = request.path;
-        const upstream_path: []const u8 = if (proxy_match.route.strip_prefix)
-            (if (raw_path.len >= prefix.len and std.mem.startsWith(u8, raw_path, prefix))
-                (if (raw_path[prefix.len..].len == 0) "/" else raw_path[prefix.len..])
-            else
-                "/")
-        else
-            raw_path;
-
-        // Connect to upstream. std.net is gone in 0.16; this blocking client
-        // uses std.Io.net via a throwaway Threaded io. NOTE: this whole proxy
-        // path blocks the worker thread and should move to async libxev (#29).
-        var proxy_io: std.Io.Threaded = .init(alloc, .{});
-        defer proxy_io.deinit();
-        const pio = proxy_io.io();
-
-        const stream = blk: {
-            if (std.Io.net.IpAddress.parse(proxy_match.route.upstream_host, proxy_match.route.upstream_port)) |ipaddr| {
-                break :blk ipaddr.connect(pio, .{ .mode = .stream }) catch {
-                    error_response.sendErrorStatus(self, 502, "proxy upstream connect failed");
-                    return;
-                };
-            } else |_| {
-                const hostname = std.Io.net.HostName.init(proxy_match.route.upstream_host) catch {
-                    error_response.sendErrorStatus(self, 502, "proxy upstream connect failed");
-                    return;
-                };
-                break :blk hostname.connect(pio, proxy_match.route.upstream_port, .{ .mode = .stream }) catch {
-                    error_response.sendErrorStatus(self, 502, "proxy upstream connect failed");
-                    return;
-                };
-            }
-        };
-        defer stream.close(pio);
-
-        // Build upstream HTTP request
-        var req_buf: std.Io.Writer.Allocating = std.Io.Writer.Allocating.initCapacity(alloc, 1024) catch {
-            error_response.sendErrorStatus(self, 502, "proxy request alloc failed");
-            return;
-        };
-        const req_writer = &req_buf.writer;
-        req_writer.print("{s} {s} HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\n", .{
-            request.method,
-            upstream_path,
-            proxy_match.route.upstream_host,
-            proxy_match.route.upstream_port,
-        }) catch {
-            error_response.sendErrorStatus(self, 502, "proxy request build failed");
-            return;
-        };
-        for (request.headers) |h| {
-            if (std.ascii.eqlIgnoreCase(h.name, "host")) continue;
-            if (std.ascii.eqlIgnoreCase(h.name, "connection")) continue;
-            req_writer.print("{s}: {s}\r\n", .{ h.name, h.value }) catch {
-                error_response.sendErrorStatus(self, 502, "proxy header build failed");
-                return;
-            };
-        }
-        req_writer.writeAll("\r\n") catch {
-            error_response.sendErrorStatus(self, 502, "proxy request build failed");
-            return;
-        };
-
-        // Send request + body
-        var send_buf: [8192]u8 = undefined;
-        var upstream_writer = stream.writer(pio, &send_buf);
-        upstream_writer.interface.writeAll(req_buf.writer.buffered()) catch {
-            error_response.sendErrorStatus(self, 502, "proxy upstream write failed");
-            return;
-        };
-        if (request.body.len > 0) {
-            upstream_writer.interface.writeAll(request.body) catch {
-                error_response.sendErrorStatus(self, 502, "proxy upstream body write failed");
-                return;
-            };
-        }
-        upstream_writer.interface.flush() catch {
-            error_response.sendErrorStatus(self, 502, "proxy upstream write failed");
-            return;
-        };
-
-        // Read entire upstream response (blocks until upstream closes)
-        var recv_buf: [8192]u8 = undefined;
-        var upstream_reader = stream.reader(pio, &recv_buf);
-        const upstream_response = upstream_reader.interface.allocRemaining(alloc, .unlimited) catch {
-            error_response.sendErrorStatus(self, 502, "proxy upstream read failed");
-            return;
-        };
-        if (upstream_response.len == 0) {
-            error_response.sendErrorStatus(self, 502, "proxy upstream empty response");
-            return;
-        }
-
-        self.logAccess(200);
-        self.sendRawResponse(upstream_response);
-    }
-
-    fn onWrite(
+    /// pub: proxy.zig passes this directly as the completion callback for the
+    /// final proxy response send (submitSend with arena_dupe=false), so the
+    /// upstream buffers stay alive until the send actually completes.
+    pub fn onWrite(
         userdata: ?*anyopaque,
         loop: *xev.Loop,
         completion: *xev.Completion,
@@ -1016,6 +912,13 @@ pub const Connection = struct {
         _ = completion;
         const self = castUserdata(Connection, userdata);
         const bytes_written = self.handleSendCompletion(result) orelse return .disarm;
+        // Tear down proxy_state now that its response buffer's send has
+        // completed (safe: handleSendCompletion already returned on error/
+        // closing, so this doesn't run on a send that failed mid-flight —
+        // that path is cleaned up once by Connection.deinit instead).
+        if (self.proxy_state != null) {
+            proxy_mod.cleanupProxy(self);
+        }
         // If this write was the 504 timeout response, close instead of recycling.
         // pending_timer_ops/pending_io_ops may still be non-zero (in-flight
         // completions), so close() -> maybeFinishClose() defers deinit until they drain.
