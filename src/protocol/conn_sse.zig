@@ -46,7 +46,7 @@ pub fn handleSseUpgrade(self: *Connection, exchange: *HttpExchange) void {
     self.sse_state = .{
         .room = room_dupe,
         .registry = self.sse_registry,
-        .send_queue = .{},
+        .send_queue = .empty,
         .drain_index = 0,
         .writing = false,
         .disconnect_completion = undefined,

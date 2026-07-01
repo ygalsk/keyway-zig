@@ -34,7 +34,7 @@ pub const SseRegistry = struct {
         const gop = try self.rooms.getOrPut(self.allocator, room);
         if (!gop.found_existing) {
             gop.key_ptr.* = try self.allocator.dupe(u8, room);
-            gop.value_ptr.* = .{};
+            gop.value_ptr.* = .empty;
         }
         try gop.value_ptr.append(self.allocator, conn);
     }
@@ -97,8 +97,8 @@ pub const SseBroadcastBus = struct {
     };
 
     const WorkerSlot = struct {
-        inbox: std.ArrayListUnmanaged(Message) = .{},
-        mutex: std.Thread.Mutex = .{},
+        inbox: std.ArrayListUnmanaged(Message) = .empty,
+        mutex: std.Io.Mutex = .init,
         notifier: xev.Async = undefined,
         completion: xev.Completion = undefined,
         registry: ?*SseRegistry = null,
@@ -110,6 +110,10 @@ pub const SseBroadcastBus = struct {
     slots: []WorkerSlot,
     num_workers: usize,
     allocator: std.mem.Allocator,
+    /// Sync provider for per-slot `std.Io.Mutex` (0.16 removed io-free mutexes).
+    /// Used only as a mutex provider — no async work, so no threads are spawned.
+    threaded: std.Io.Threaded,
+    io: std.Io,
 
     pub fn init(allocator: std.mem.Allocator, num_workers: usize) !*SseBroadcastBus {
         const bus = try allocator.create(SseBroadcastBus);
@@ -125,22 +129,26 @@ pub const SseBroadcastBus = struct {
             .slots = slots,
             .num_workers = num_workers,
             .allocator = allocator,
+            .threaded = .init(allocator, .{}),
+            .io = undefined,
         };
+        bus.io = bus.threaded.io();
         return bus;
     }
 
     pub fn deinit(self: *SseBroadcastBus) void {
         for (self.slots) |*slot| {
-            slot.mutex.lock();
+            slot.mutex.lockUncancelable(self.io);
             for (slot.inbox.items) |msg| {
                 self.allocator.free(msg.room);
                 self.allocator.free(msg.data);
             }
             slot.inbox.deinit(self.allocator);
-            slot.mutex.unlock();
+            slot.mutex.unlock(self.io);
             slot.notifier.deinit();
         }
         self.allocator.free(self.slots);
+        self.threaded.deinit();
         self.allocator.destroy(self);
     }
 
@@ -178,14 +186,14 @@ pub const SseBroadcastBus = struct {
                 continue;
             };
 
-            slot.mutex.lock();
+            slot.mutex.lockUncancelable(self.io);
             slot.inbox.append(self.allocator, .{ .room = room_dupe, .data = data_dupe }) catch {
                 self.allocator.free(room_dupe);
                 self.allocator.free(data_dupe);
-                slot.mutex.unlock();
+                slot.mutex.unlock(self.io);
                 continue;
             };
-            slot.mutex.unlock();
+            slot.mutex.unlock(self.io);
 
             slot.notifier.notify() catch {};
         }
@@ -213,11 +221,11 @@ pub const SseBroadcastBus = struct {
                 const registry = slot.registry orelse continue;
 
                 // Drain inbox under lock
-                slot.mutex.lock();
+                slot.mutex.lockUncancelable(self.io);
                 // Swap out the inbox for a fresh one so we can release the lock quickly
                 var messages = slot.inbox;
-                slot.inbox = .{};
-                slot.mutex.unlock();
+                slot.inbox = .empty;
+                slot.mutex.unlock(self.io);
 
                 for (messages.items) |msg| {
                     registry.broadcastLocal(msg.room, msg.data);

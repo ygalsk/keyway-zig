@@ -1,4 +1,5 @@
 const std = @import("std");
+const helpers = @import("helpers.zig");
 
 /// CLI configuration for the Keyway server.
 /// Resolution order: CLI argument > environment variable > default value.
@@ -31,7 +32,7 @@ const ParseError = error{
 /// Parse CLI arguments with environment variable fallback.
 /// Caller owns no memory — all returned slices point into argv or env storage
 /// (both managed by the OS, valid for the process lifetime).
-pub fn parse(allocator: std.mem.Allocator) (ParseError || std.process.ArgIterator.InitError)!Config {
+pub fn parse(allocator: std.mem.Allocator, args_ctx: std.process.Args) (ParseError || std.process.Args.Iterator.InitError)!Config {
     var config = Config{};
 
     // Track which fields were set by CLI args (env vars only apply to unset fields)
@@ -47,7 +48,7 @@ pub fn parse(allocator: std.mem.Allocator) (ParseError || std.process.ArgIterato
     var cli_watch = false;
 
     // Parse CLI arguments
-    var args = try std.process.argsWithAllocator(allocator);
+    var args = try args_ctx.iterateAllocator(allocator);
     defer args.deinit();
 
     _ = args.skip(); // skip program name
@@ -100,44 +101,44 @@ pub fn parse(allocator: std.mem.Allocator) (ParseError || std.process.ArgIterato
 
     // Apply environment variable fallbacks for fields not set by CLI
     if (!cli_host) {
-        if (std.posix.getenv("KEYWAY_HOST")) |val| config.host = val;
+        if (helpers.getenv("KEYWAY_HOST")) |val| config.host = val;
     }
     if (!cli_port) {
-        if (std.posix.getenv("KEYWAY_PORT")) |val| {
+        if (helpers.getenv("KEYWAY_PORT")) |val| {
             config.port = std.fmt.parseInt(u16, val, 10) catch return ParseError.InvalidPort;
         }
     }
     if (!cli_workers) {
-        if (std.posix.getenv("KEYWAY_WORKERS")) |val| {
+        if (helpers.getenv("KEYWAY_WORKERS")) |val| {
             config.workers = std.fmt.parseInt(u16, val, 10) catch return ParseError.InvalidWorkers;
         }
     }
     if (!cli_script) {
-        if (std.posix.getenv("KEYWAY_SCRIPT")) |val| config.script = val;
+        if (helpers.getenv("KEYWAY_SCRIPT")) |val| config.script = val;
     }
     if (!cli_tls_cert) {
-        if (std.posix.getenv("KEYWAY_TLS_CERT")) |val| config.tls_cert_path = val;
+        if (helpers.getenv("KEYWAY_TLS_CERT")) |val| config.tls_cert_path = val;
     }
     if (!cli_tls_key) {
-        if (std.posix.getenv("KEYWAY_TLS_KEY")) |val| config.tls_key_path = val;
+        if (helpers.getenv("KEYWAY_TLS_KEY")) |val| config.tls_key_path = val;
     }
     if (!cli_log_level) {
-        if (std.posix.getenv("KEYWAY_LOG_LEVEL")) |val| {
+        if (helpers.getenv("KEYWAY_LOG_LEVEL")) |val| {
             config.log_level = parseLogLevel(val) orelse return ParseError.InvalidLogLevel;
         }
     }
     if (!cli_log_format) {
-        if (std.posix.getenv("KEYWAY_LOG_FORMAT")) |val| {
+        if (helpers.getenv("KEYWAY_LOG_FORMAT")) |val| {
             config.log_format = parseLogFormat(val) orelse return ParseError.InvalidLogFormat;
         }
     }
     if (!cli_enable_bpf) {
-        if (std.posix.getenv("KEYWAY_ENABLE_BPF")) |val| {
+        if (helpers.getenv("KEYWAY_ENABLE_BPF")) |val| {
             config.enable_bpf = std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
         }
     }
     if (!cli_watch) {
-        if (std.posix.getenv("KEYWAY_WATCH")) |val| {
+        if (helpers.getenv("KEYWAY_WATCH")) |val| {
             config.watch = std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
         }
     }
@@ -181,10 +182,7 @@ pub fn printHelp() void {
         \\  -v, --version       Show version information
         \\
     ;
-    var buf: [64]u8 = undefined;
-    const stderr = std.debug.lockStderrWriter(&buf);
-    defer std.debug.unlockStderrWriter();
-    stderr.writeAll(usage) catch {};
+    std.debug.print("{s}", .{usage});
 }
 
 // ---------------------------------------------------------------------------
@@ -229,7 +227,7 @@ test "parse returns defaults when no args or env vars" {
 
 test "env var fallback for KEYWAY_PORT" {
     // Verify the default port when KEYWAY_PORT is not set.
-    if (std.posix.getenv("KEYWAY_PORT") == null) {
+    if (helpers.getenv("KEYWAY_PORT") == null) {
         const c = Config{};
         try std.testing.expectEqual(@as(u16, 8080), c.port);
     }

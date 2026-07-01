@@ -25,7 +25,7 @@ pub fn jsonEncode(lua: *Lua) callconv(.c) c_int {
         lua.pushString("JSON encode: argument required");
         lua.raiseError();
     }
-    var buf: Buf = .{};
+    var buf: Buf = .empty;
 
     encodeValue(lua, 1, &buf, 0) catch |err| {
         buf.deinit(alloc);

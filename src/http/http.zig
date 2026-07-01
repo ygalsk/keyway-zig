@@ -298,13 +298,13 @@ test "response serialization" {
     response.status = 200;
     response.body = "Hello, World!";
 
-    var buf = std.ArrayList(u8).initCapacity(allocator, 0) catch unreachable;
-    defer buf.deinit(allocator);
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    defer buf.deinit();
 
-    try response.serialize(buf.writer(allocator));
+    try response.serialize(&buf.writer);
 
     const expected = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!";
-    try std.testing.expectEqualStrings(expected, buf.items);
+    try std.testing.expectEqualStrings(expected, buf.writer.buffered());
 }
 
 test "http parser - simple GET request" {
@@ -342,12 +342,12 @@ test "101 switching protocols serialization" {
     try resp.addHeader("Connection", "Upgrade");
     try resp.addHeader("Sec-WebSocket-Accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
 
-    var buf = std.ArrayList(u8).initCapacity(allocator, 0) catch unreachable;
-    defer buf.deinit(allocator);
-    try resp.serialize(buf.writer(allocator));
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    defer buf.deinit();
+    try resp.serialize(&buf.writer);
 
     const expected = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
-    try std.testing.expectEqualStrings(expected, buf.items);
+    try std.testing.expectEqualStrings(expected, buf.writer.buffered());
 }
 
 test "picohttpparser websocket upgrade headers" {
@@ -382,11 +382,10 @@ pub fn encodeChunk(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
     const hex_len = std.fmt.count("{x}", .{data.len});
     const total = hex_len + 2 + data.len + 2;
     const buf = try allocator.alloc(u8, total);
-    var fbs = std.io.fixedBufferStream(buf);
-    const writer = fbs.writer();
-    writer.print("{x}\r\n", .{data.len}) catch unreachable;
-    writer.writeAll(data) catch unreachable;
-    writer.writeAll("\r\n") catch unreachable;
+    var w = std.Io.Writer.fixed(buf);
+    w.print("{x}\r\n", .{data.len}) catch unreachable;
+    w.writeAll(data) catch unreachable;
+    w.writeAll("\r\n") catch unreachable;
     return buf;
 }
 
@@ -403,7 +402,7 @@ const ChunkedResult = struct {
 /// Returns the reassembled body (arena-allocated) and total bytes consumed.
 /// Returns error.Incomplete if the terminal chunk hasn't been received yet.
 fn decodeChunkedBody(data: []const u8, allocator: std.mem.Allocator) !ChunkedResult {
-    var body_buf = std.ArrayListUnmanaged(u8){};
+    var body_buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer body_buf.deinit(allocator);
     var pos: usize = 0;
 
@@ -552,11 +551,11 @@ test "serializeChunkedHeaders omits Content-Length" {
     response.status = 200;
     try response.addHeader("Content-Type", "application/x-ndjson");
 
-    var buf = std.ArrayList(u8).initCapacity(allocator, 0) catch unreachable;
-    defer buf.deinit(allocator);
-    try response.serializeChunkedHeaders(buf.writer(allocator));
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    defer buf.deinit();
+    try response.serializeChunkedHeaders(&buf.writer);
 
-    const result = buf.items;
+    const result = buf.writer.buffered();
     try std.testing.expect(std.mem.startsWith(u8, result, "HTTP/1.1 200 OK\r\n"));
     try std.testing.expect(std.mem.indexOf(u8, result, "Content-Type: application/x-ndjson") != null);
     try std.testing.expect(std.mem.indexOf(u8, result, "Transfer-Encoding: chunked") != null);

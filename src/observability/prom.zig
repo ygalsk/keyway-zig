@@ -15,6 +15,12 @@ pub threadlocal var worker_id: u16 = 0;
 /// Global metrics instance. Starts as noop, activated by `init()`.
 pub var global: Metrics = m.initializeNoop(Metrics);
 
+/// Backing I/O for the metrics library's internal RwLocks. The 0.16 metrics dep
+/// guards its label maps with `std.Io` locks instead of raw atomics; we use this
+/// only as a mutex provider (never async), so no threads are ever spawned.
+/// Lives for the process lifetime alongside `global`.
+var metrics_io: std.Io.Threaded = undefined;
+
 pub const Metrics = struct {
     // -- Request flow --
     http_requests_total: HttpRequestsTotal,
@@ -57,11 +63,13 @@ pub const Metrics = struct {
 
 /// Initialize the global metrics instance. Call once at startup before spawning workers.
 pub fn init(allocator: Allocator) !void {
+    metrics_io = .init(allocator, .{});
+    const io = metrics_io.io();
     global = .{
-        .http_requests_total = try Metrics.HttpRequestsTotal.init(allocator, "keyway_http_requests_total", .{
+        .http_requests_total = try Metrics.HttpRequestsTotal.init(allocator, io, "keyway_http_requests_total", .{
             .help = "Total HTTP requests handled",
         }, .{}),
-        .http_request_duration_seconds = try Metrics.HttpRequestDuration.init(allocator, "keyway_http_request_duration_seconds", .{
+        .http_request_duration_seconds = try Metrics.HttpRequestDuration.init(allocator, io, "keyway_http_request_duration_seconds", .{
             .help = "Request latency in seconds",
         }, .{}),
         .http_request_body_bytes = Metrics.BodySizeHist.init("keyway_http_request_body_bytes", .{
@@ -70,28 +78,28 @@ pub fn init(allocator: Allocator) !void {
         .http_response_body_bytes = Metrics.BodySizeHist.init("keyway_http_response_body_bytes", .{
             .help = "Response body size in bytes",
         }, .{}),
-        .connections_accepted_total = try Metrics.ConnectionCounter.init(allocator, "keyway_connections_accepted_total", .{
+        .connections_accepted_total = try Metrics.ConnectionCounter.init(allocator, io, "keyway_connections_accepted_total", .{
             .help = "Total accepted connections",
         }, .{}),
-        .connections_active = try Metrics.ConnectionGauge.init(allocator, "keyway_connections_active", .{
+        .connections_active = try Metrics.ConnectionGauge.init(allocator, io, "keyway_connections_active", .{
             .help = "Current active connections",
         }, .{}),
-        .connections_rejected_total = try Metrics.ConnectionCounter.init(allocator, "keyway_connections_rejected_total", .{
+        .connections_rejected_total = try Metrics.ConnectionCounter.init(allocator, io, "keyway_connections_rejected_total", .{
             .help = "Total rejected connections",
         }, .{}),
-        .ring_submissions_total = try Metrics.ConnectionCounter.init(allocator, "keyway_ring_submissions_total", .{
+        .ring_submissions_total = try Metrics.ConnectionCounter.init(allocator, io, "keyway_ring_submissions_total", .{
             .help = "Total ring buffer submissions",
         }, .{}),
-        .ring_completions_total = try Metrics.ConnectionCounter.init(allocator, "keyway_ring_completions_total", .{
+        .ring_completions_total = try Metrics.ConnectionCounter.init(allocator, io, "keyway_ring_completions_total", .{
             .help = "Total ring buffer completions",
         }, .{}),
-        .ring_batch_size = try Metrics.RingBatchSizeHist.init(allocator, "keyway_ring_batch_size", .{
+        .ring_batch_size = try Metrics.RingBatchSizeHist.init(allocator, io, "keyway_ring_batch_size", .{
             .help = "Submissions per batch drain",
         }, .{}),
-        .lua_coroutines_active = try Metrics.ConnectionGauge.init(allocator, "keyway_lua_coroutines_active", .{
+        .lua_coroutines_active = try Metrics.ConnectionGauge.init(allocator, io, "keyway_lua_coroutines_active", .{
             .help = "Active Lua coroutines",
         }, .{}),
-        .lua_script_duration_seconds = try Metrics.LuaScriptDuration.init(allocator, "keyway_lua_script_duration_seconds", .{
+        .lua_script_duration_seconds = try Metrics.LuaScriptDuration.init(allocator, io, "keyway_lua_script_duration_seconds", .{
             .help = "Lua script execution time in seconds",
         }, .{}),
     };
@@ -108,6 +116,7 @@ pub fn deinit() void {
     global.ring_batch_size.deinit();
     global.lua_coroutines_active.deinit();
     global.lua_script_duration_seconds.deinit();
+    metrics_io.deinit();
 }
 
 /// Write all metrics in Prometheus text exposition format.

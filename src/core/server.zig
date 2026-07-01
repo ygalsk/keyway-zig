@@ -7,6 +7,7 @@ const LuaState = @import("../lua/lua_state.zig").LuaState;
 const bpf_reuseport = @import("../io/bpf_reuseport.zig");
 const TlsContext = @import("../tls/tls.zig").TlsContext;
 const castUserdata = @import("../util/helpers.zig").castUserdata;
+const helpers = @import("../util/helpers.zig");
 const sse = @import("../protocol/sse.zig");
 const SseRegistry = sse.SseRegistry;
 const SseBroadcastBus = sse.SseBroadcastBus;
@@ -24,7 +25,7 @@ pub const Server = struct {
     allocator: std.mem.Allocator,
     loop: *xev.Loop,
     socket: std.posix.socket_t,
-    address: std.net.Address,
+    address: std.Io.net.IpAddress,
     accept_completion: xev.Completion,
     accept_cancel_completion: xev.Completion = .{},
     pool_sweep_completion: xev.Completion = undefined,
@@ -63,15 +64,16 @@ pub const Server = struct {
         metrics: *WorkerMetrics,
     ) !Server {
         // Parse address
-        const addr = try std.net.Address.parseIp(config.host, config.port);
+        const addr = try std.Io.net.IpAddress.parse(config.host, config.port);
 
         // Create socket
-        const socket = try std.posix.socket(
-            addr.any.family,
-            std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
-            std.posix.IPPROTO.TCP,
-        );
-        errdefer std.posix.close(socket);
+        // std.net + std.posix.socket are gone in 0.16; let libxev create the
+        // socket (STREAM|CLOEXEC, blocking on io_uring — same flags as before)
+        // and convert IpAddress -> sockaddr for bind(). We keep the raw fd for
+        // SO_REUSEPORT/BPF and the raw io_uring accept.
+        const tcp = try xev.TCP.init(addr);
+        const socket = tcp.fd;
+        errdefer helpers.closeFd(socket);
 
         // Set socket options
         try std.posix.setsockopt(
@@ -102,8 +104,8 @@ pub const Server = struct {
                 };
                 log.info().string("msg", "BPF connection affinity enabled").int("workers", num_workers).log();
 
-                try std.posix.bind(socket, &addr.any, addr.getOsSockLen());
-                try std.posix.listen(socket, DEFAULT_BACKLOG);
+                try tcp.bind(addr);
+                try tcp.listen(DEFAULT_BACKLOG);
 
                 if (bpf_ready) |ready| {
                     ready.store(true, .release);
@@ -115,13 +117,13 @@ pub const Server = struct {
                         std.atomic.spinLoopHint();
                     }
                 }
-                try std.posix.bind(socket, &addr.any, addr.getOsSockLen());
-                try std.posix.listen(socket, DEFAULT_BACKLOG);
+                try tcp.bind(addr);
+                try tcp.listen(DEFAULT_BACKLOG);
             }
         } else {
             // No BPF: all workers bind+listen independently (SO_REUSEPORT handles distribution)
-            try std.posix.bind(socket, &addr.any, addr.getOsSockLen());
-            try std.posix.listen(socket, DEFAULT_BACKLOG);
+            try tcp.bind(addr);
+            try tcp.listen(DEFAULT_BACKLOG);
         }
 
         // Initialize TLS context if cert+key are configured
@@ -207,13 +209,13 @@ pub const Server = struct {
 
         // If draining, reject new connections
         if (self.draining) {
-            std.posix.close(client_socket);
+            helpers.closeFd(client_socket);
             return .disarm;
         }
 
         // Connection limit: reject when over MAX_CONNECTIONS_PER_WORKER
         if (self.metrics.active_connections.load(.monotonic) >= tuning.MAX_CONNECTIONS_PER_WORKER) {
-            std.posix.close(client_socket);
+            helpers.closeFd(client_socket);
             self.metrics.incrementRejectedConnections();
             prom.connectionRejected();
             self.acceptNext();
@@ -245,7 +247,7 @@ pub const Server = struct {
             self,
         ) catch |err| {
             log.err().string("msg", "connection init failed").err(err).log();
-            std.posix.close(client_socket);
+            helpers.closeFd(client_socket);
             self.acceptNext();
             return .disarm;
         };
@@ -298,7 +300,7 @@ pub const Server = struct {
                 coord.getAsync(self.worker_id).notify() catch {};
             }
 
-            std.posix.close(self.socket);
+            helpers.closeFd(self.socket);
             self.socket = -1;
         }
         // Force-close every tracked connection.
@@ -320,7 +322,7 @@ pub const Server = struct {
         while (it) |node| {
             it = node.next;
             const conn: *Connection = @alignCast(@fieldParentPtr("link", node));
-            std.posix.shutdown(conn.socket, .both) catch {};
+            helpers.shutdownBoth(conn.socket);
         }
     }
 
@@ -331,7 +333,7 @@ pub const Server = struct {
     /// Clean up server resources
     pub fn deinit(self: *Server) void {
         if (self.tls_ctx) |*tc| tc.deinit();
-        if (self.socket != -1) std.posix.close(self.socket);
+        if (self.socket != -1) helpers.closeFd(self.socket);
     }
 };
 

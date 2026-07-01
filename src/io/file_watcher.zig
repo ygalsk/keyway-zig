@@ -8,6 +8,7 @@
 //! The kernel delivers events to all watchers independently.
 
 const std = @import("std");
+const helpers = @import("../util/helpers.zig");
 const xev = @import("xev");
 const log = @import("../observability/log.zig");
 const LuaState = @import("../lua/lua_state.zig").LuaState;
@@ -48,8 +49,8 @@ pub const FileWatcher = struct {
         lua_state: *LuaState,
         router: *Router,
     ) !FileWatcher {
-        const fd = try std.posix.inotify_init1(std.os.linux.IN.NONBLOCK | std.os.linux.IN.CLOEXEC);
-        errdefer std.posix.close(fd);
+        const fd = try helpers.inotifyInit1(std.os.linux.IN.NONBLOCK | std.os.linux.IN.CLOEXEC);
+        errdefer helpers.closeFd(fd);
 
         var watcher = FileWatcher{
             .inotify_fd = fd,
@@ -73,7 +74,7 @@ pub const FileWatcher = struct {
             self.allocator.free(entry.value_ptr.*);
         }
         self.watch_dirs.deinit();
-        std.posix.close(self.inotify_fd);
+        helpers.closeFd(self.inotify_fd);
     }
 
     /// Add a watch on a directory and recurse into subdirectories.
@@ -81,7 +82,7 @@ pub const FileWatcher = struct {
         const dir_path_z = try self.allocator.dupeZ(u8, dir_path);
         defer self.allocator.free(dir_path_z);
 
-        const wd = std.posix.inotify_add_watch(self.inotify_fd, dir_path_z, WATCH_MASK) catch |err| {
+        const wd = helpers.inotifyAddWatch(self.inotify_fd, dir_path_z, WATCH_MASK) catch |err| {
             log.warn().string("msg", "inotify_add_watch failed").string("path", dir_path).err(err).log();
             return;
         };
@@ -90,10 +91,13 @@ pub const FileWatcher = struct {
         try self.watch_dirs.put(wd, owned_path);
 
         // Recurse into subdirectories
-        var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
-        defer dir.close();
+        var walk_io: std.Io.Threaded = .init(self.allocator, .{});
+        defer walk_io.deinit();
+        const io = walk_io.io();
+        var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return;
+        defer dir.close(io);
         var iter = dir.iterate();
-        while (try iter.next()) |entry| {
+        while (try iter.next(io)) |entry| {
             if (entry.kind == .directory) {
                 const sub_path = try std.fs.path.join(self.allocator, &.{ dir_path, entry.name });
                 defer self.allocator.free(sub_path);

@@ -21,6 +21,7 @@ const ConnectionPool = @import("../io/connection_pool.zig").ConnectionPool;
 const Connection = @import("../core/handler.zig").Connection;
 const tls = @import("../tls/tls.zig");
 const castUserdata = @import("../util/helpers.zig").castUserdata;
+const helpers = @import("../util/helpers.zig");
 const TlsManager = tls.TlsManager;
 const SseRegistry = @import("../protocol/sse.zig").SseRegistry;
 const prom = @import("../observability/prom.zig");
@@ -259,7 +260,7 @@ pub const LuaState = struct {
 
         // Resume the coroutine: thread stack has [handler_fn, userdata]
         prom.luaCoroutineStarted();
-        self.coroutine_start_us = std.time.microTimestamp();
+        self.coroutine_start_us = @divTrunc(helpers.monotonicNanos(), std.time.ns_per_us);
         // Capture route for duration labeling from Connection's http_state
         if (self.current_connection) |conn_ptr| {
             const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
@@ -381,7 +382,7 @@ pub const LuaState = struct {
     /// Record coroutine execution duration for Prometheus metrics.
     fn recordCoroutineDuration(self: *LuaState) void {
         if (self.coroutine_start_us) |start| {
-            const elapsed = std.time.microTimestamp() - start;
+            const elapsed = @divTrunc(helpers.monotonicNanos(), std.time.ns_per_us) - start;
             prom.luaScriptDuration(self.coroutine_route, elapsed);
             self.coroutine_start_us = null;
         }
@@ -423,10 +424,10 @@ pub const LuaState = struct {
         const path_c = lua.toString(1) catch return luaError(lua, "path argument required");
         const path = std.mem.span(path_c);
 
-        const file = std.fs.cwd().openFile(path, .{}) catch return luaError(lua, "file not found");
-        defer file.close();
+        var file_io: std.Io.Threaded = .init(state.allocator, .{});
+        defer file_io.deinit();
 
-        const content = file.readToEndAlloc(state.allocator, 10 * 1024 * 1024) catch return luaError(lua, "read error");
+        const content = std.Io.Dir.cwd().readFileAlloc(file_io.io(), path, state.allocator, .limited(10 * 1024 * 1024)) catch return luaError(lua, "file not found");
         defer state.allocator.free(content);
 
         lua.pushLString(content);
@@ -444,22 +445,27 @@ pub const LuaState = struct {
         const state = getLuaState(lua) orelse return 0;
         const dir_path = std.fs.path.dirname(path) orelse ".";
 
+        var file_io: std.Io.Threaded = .init(state.allocator, .{});
+        defer file_io.deinit();
+        const io = file_io.io();
+        const cwd = std.Io.Dir.cwd();
+
         // Ensure parent directory exists
-        std.fs.cwd().makePath(dir_path) catch {};
+        cwd.createDirPath(io, dir_path) catch {};
 
         // Write tmp file and rename
         const tmp_path = std.fmt.allocPrint(state.allocator, "{s}.tmp", .{path}) catch return luaError(lua, "allocation failed");
         defer state.allocator.free(tmp_path);
 
-        const file = std.fs.cwd().createFile(tmp_path, .{}) catch return luaError(lua, "failed to create tmp file");
-        file.writeAll(content) catch {
-            file.close();
+        const file = cwd.createFile(io, tmp_path, .{}) catch return luaError(lua, "failed to create tmp file");
+        file.writeStreamingAll(io, content) catch {
+            file.close(io);
             return luaError(lua, "write error");
         };
-        file.close();
+        file.close(io);
 
         // Rename tmp -> target (atomic on same filesystem)
-        std.fs.cwd().rename(tmp_path, path) catch return luaError(lua, "rename failed");
+        cwd.rename(tmp_path, cwd, path, io) catch return luaError(lua, "rename failed");
 
         lua.pushBoolean(true);
         return 1;
@@ -467,10 +473,14 @@ pub const LuaState = struct {
 
     /// __keyway_file_delete(path) -> true or nil, error
     fn keyway_file_delete(lua: *Lua) callconv(.c) c_int {
+        const state = getLuaState(lua) orelse return 0;
         const path_c = lua.toString(1) catch return luaError(lua, "path argument required");
         const path = std.mem.span(path_c);
 
-        std.fs.cwd().deleteFile(path) catch return luaError(lua, "delete failed");
+        var file_io: std.Io.Threaded = .init(state.allocator, .{});
+        defer file_io.deinit();
+
+        std.Io.Dir.cwd().deleteFile(file_io.io(), path) catch return luaError(lua, "delete failed");
 
         lua.pushBoolean(true);
         return 1;
@@ -478,12 +488,17 @@ pub const LuaState = struct {
 
     /// __keyway_file_rename(old_path, new_path) -> true or nil, error
     fn keyway_file_rename(lua: *Lua) callconv(.c) c_int {
+        const state = getLuaState(lua) orelse return 0;
         const old_c = lua.toString(1) catch return luaError(lua, "old_path argument required");
         const new_c = lua.toString(2) catch return luaError(lua, "new_path argument required");
         const old_path = std.mem.span(old_c);
         const new_path = std.mem.span(new_c);
 
-        std.fs.cwd().rename(old_path, new_path) catch return luaError(lua, "rename failed");
+        var file_io: std.Io.Threaded = .init(state.allocator, .{});
+        defer file_io.deinit();
+        const cwd = std.Io.Dir.cwd();
+
+        cwd.rename(old_path, cwd, new_path, file_io.io()) catch return luaError(lua, "rename failed");
 
         lua.pushBoolean(true);
         return 1;
@@ -495,23 +510,26 @@ pub const LuaState = struct {
         const dir_c = lua.toString(1) catch return luaError(lua, "dir argument required");
         const dir_path = std.mem.span(dir_c);
 
+        var file_io: std.Io.Threaded = .init(state.allocator, .{});
+        defer file_io.deinit();
+
         lua.createTable(0, 0);
         var idx: i32 = 1;
 
-        listLuaFilesRecursive(lua, state.allocator, dir_path, dir_path, &idx);
+        listLuaFilesRecursive(lua, file_io.io(), state.allocator, dir_path, dir_path, &idx);
 
         return 1;
     }
 
-    fn listLuaFilesRecursive(lua: *Lua, alloc: std.mem.Allocator, base: []const u8, dir_path: []const u8, idx: *i32) void {
-        var dir = std.fs.cwd().openDir(dir_path, .{ .iterate = true }) catch return;
-        defer dir.close();
+    fn listLuaFilesRecursive(lua: *Lua, io: std.Io, alloc: std.mem.Allocator, base: []const u8, dir_path: []const u8, idx: *i32) void {
+        var dir = std.Io.Dir.cwd().openDir(io, dir_path, .{ .iterate = true }) catch return;
+        defer dir.close(io);
         var iter = dir.iterate();
-        while (iter.next() catch null) |entry| {
+        while (iter.next(io) catch null) |entry| {
             if (entry.kind == .directory) {
                 const sub = std.fs.path.join(alloc, &.{ dir_path, entry.name }) catch continue;
                 defer alloc.free(sub);
-                listLuaFilesRecursive(lua, alloc, base, sub, idx);
+                listLuaFilesRecursive(lua, io, alloc, base, sub, idx);
             } else if (entry.kind == .file and (std.mem.endsWith(u8, entry.name, ".lua") or std.mem.endsWith(u8, entry.name, ".lua.disabled"))) {
                 const full = std.fs.path.join(alloc, &.{ dir_path, entry.name }) catch continue;
                 defer alloc.free(full);
@@ -639,7 +657,7 @@ pub const LuaState = struct {
     /// On script error: logs the error and leaves the router empty (all requests 404).
     pub fn reload(self: *LuaState, router: *Router, script_path: []const u8) void {
         // 1. Collect old lua_refs from router and unref each
-        var refs: std.ArrayListUnmanaged(i32) = .{};
+        var refs: std.ArrayListUnmanaged(i32) = .empty;
         defer refs.deinit(self.allocator);
         router.collectLuaRefs(self.allocator, &refs) catch {};
         for (refs.items) |ref| {

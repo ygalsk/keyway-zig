@@ -1,25 +1,25 @@
 .{
     .name = .keyway,
     .version = "0.1.0",
-    .minimum_zig_version = "0.15.0",
+    .minimum_zig_version = "0.16.0",
     .fingerprint = 0x9095a4ba39ca44a8,
 
     .dependencies = .{
         .libxev = .{
-            .url = "https://github.com/mitchellh/libxev/archive/refs/heads/main.tar.gz",
-            .hash = "libxev-0.0.0-86vtc689EwAjQWysidPm9NKkAwwUNByiE3kZTg_xu0Hp",
+            .url = "https://github.com/mitchellh/libxev/archive/9ce8e8e6ff89e583258a7f8e7adeeeaeae8611bf.tar.gz",
+            .hash = "libxev-0.0.0-86vtcwIRFADbH4hk-EjROXxlrKIRPQdA41XiTSytYO-F",
         },
         .luajit = .{
-            .url = "https://github.com/sackosoft/zig-luajit/archive/refs/heads/main.tar.gz",
-            .hash = "luajit-2.1.0-nMGF0kPDAwCHuZVz5A5rFIuxewhLyhCBaar1YJbtICyi",
+            .url = "https://github.com/sackosoft/zig-luajit/archive/11887ffa5b03788c05d23e64f2aafb20b645570a.tar.gz",
+            .hash = "luajit-3.0.0-nMGF0vfCAwBfUsknnnrxFWEDZ4G6sOgppH6DGzWgn7fV",
         },
         .metrics = .{
-            .url = "https://github.com/karlseguin/metrics.zig/archive/28cf547974144d827b5f85c07af7f9ec72c302dc.tar.gz",
-            .hash = "metrics-0.0.0-W7G4ePy_AQBozb1s8-avLxHOd4thMO92zKXDW84tmAhf",
+            .url = "https://github.com/karlseguin/metrics.zig/archive/1621f82e7ecf2b3dddf5730bf52761af354a7080.tar.gz",
+            .hash = "metrics-0.0.0-W7G4eJOgAQDBacPAeqGCaY8gV7zuddUQyikGNq7nDPds",
         },
         .logz = .{
-            .url = "https://github.com/karlseguin/log.zig/archive/b4a0b6b38d8fad1b94649046a967a700df5ce576.tar.gz",
-            .hash = "logz-0.0.0-O9YWXraFAgBQxWV4eh_4wp9axpoLhrzTIpYws4oxMLYh",
+            .url = "https://github.com/karlseguin/log.zig/archive/7fa8de39ad4d4adc54fce4d9bb0b6bc6c0076592.tar.gz",
+            .hash = "logz-0.0.0-O9YWXsllAgBq-S0z6q8AInWjei8h7polkVVRzJIGE-jW",
         },
     },
 
