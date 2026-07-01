@@ -1,7 +1,8 @@
 //! Per-worker Lua state aggregation and initialization.
 //!
 //! Each worker thread owns one LuaState containing: the Lua VM, cached coroutine thread,
-//! cosocket pending I/O staging, connection pool, TLS manager, and SSE registry pointer.
+//! the async-yield bridge (pending I/O + suspended coroutine state, shared by cosocket/WS/
+//! SSE/stream), an outbound TLS manager, and an SSE registry pointer.
 //!
 //! Init order: Lua VM → std libs → keyway module → embedded stdlib → cached thread → package paths → TLS manager.
 //! After init: registerCosocketApi → setWorkerGlobals → loadScript → processRouteTable.
@@ -66,10 +67,12 @@ pub const LuaState = struct {
     // Used by ring C bridge functions to access the Connection's SQ/CQ.
     current_connection: ?*Connection = null,
 
-    // Lua script timing: start timestamp for duration histogram
-    coroutine_start_us: ?i64 = null,
-    // Route pattern for the current coroutine (for Prometheus labels)
-    coroutine_route: []const u8 = "",
+    // Lua script timing: duration + route label for the currently-running coroutine,
+    // consumed by recordCoroutineDuration() for the Prometheus histogram.
+    timing: struct {
+        start_us: ?i64 = null,
+        route: []const u8 = "",
+    } = .{},
 
     // SSE: per-worker registry for broadcast (set by worker.zig)
     sse_registry: ?*SseRegistry = null,
@@ -248,12 +251,12 @@ pub const LuaState = struct {
 
         // Resume the coroutine: thread stack has [handler_fn, userdata]
         prom.luaCoroutineStarted();
-        self.coroutine_start_us = @divTrunc(helpers.monotonicNanos(), std.time.ns_per_us);
+        self.timing.start_us = @divTrunc(helpers.monotonicNanos(), std.time.ns_per_us);
         // Capture route for duration labeling from Connection's http_state
         if (self.current_connection) |conn| {
-            self.coroutine_route = conn.http_state.route_pattern;
+            self.timing.route = conn.http_state.route_pattern;
         } else {
-            self.coroutine_route = "";
+            self.timing.route = "";
         }
         const status = lua_resume(@ptrCast(thread), 1);
 
@@ -368,10 +371,10 @@ pub const LuaState = struct {
 
     /// Record coroutine execution duration for Prometheus metrics.
     fn recordCoroutineDuration(self: *LuaState) void {
-        if (self.coroutine_start_us) |start| {
+        if (self.timing.start_us) |start| {
             const elapsed = @divTrunc(helpers.monotonicNanos(), std.time.ns_per_us) - start;
-            prom.luaScriptDuration(self.coroutine_route, elapsed);
-            self.coroutine_start_us = null;
+            prom.luaScriptDuration(self.timing.route, elapsed);
+            self.timing.start_us = null;
         }
     }
 
