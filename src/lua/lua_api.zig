@@ -39,14 +39,21 @@ inline fn getProxy(lua: *Lua, index: i32) ?*HeadersProxy {
     return castUserdata(HeadersProxy, @as(?*anyopaque, ud));
 }
 
+/// Helper: convert the value at `index` to a string span, or raise a Lua error.
+/// Metamethod keys/values must be string-convertible; a non-convertible value is
+/// a caller bug, so surface it instead of silently returning nil/0 (issue #56).
+fn checkString(lua: *Lua, index: i32, what: [*:0]const u8) [:0]const u8 {
+    const s = lua.toString(index) catch {
+        lua.pushString(what);
+        lua.raiseError();
+    };
+    return std.mem.span(s);
+}
+
 /// Lua metamethod: __index for reading ctx.field
 fn luaExchangeIndex(lua: *Lua) callconv(.c) c_int {
     const ex = getExchange(lua, 1);
-    const key = lua.toString(2) catch {
-        lua.pushNil();
-        return 1;
-    };
-    const key_str = std.mem.span(key);
+    const key_str = checkString(lua, 2, "ctx index: key must be a string");
 
     if (std.mem.eql(u8, key_str, "method")) {
         lua.pushLString(ex.method);
@@ -75,15 +82,13 @@ fn luaExchangeIndex(lua: *Lua) callconv(.c) c_int {
 /// Lua metamethod: __newindex for writing ctx.field = value
 fn luaExchangeNewIndex(lua: *Lua) callconv(.c) c_int {
     const ex = getExchange(lua, 1);
-    const key = lua.toString(2) catch return 0;
-    const key_str = std.mem.span(key);
+    const key_str = checkString(lua, 2, "ctx newindex: key must be a string");
 
     if (std.mem.eql(u8, key_str, "status")) {
         const status = lua.toInteger(3);
         ex.status = @intCast(status);
     } else if (std.mem.eql(u8, key_str, "body")) {
-        const body = lua.toString(3) catch return 0;
-        const body_span = std.mem.span(body);
+        const body_span = checkString(lua, 3, "ctx.body: value must be a string");
         // Arena-dupe immediately — Lua string lifetime is unpredictable across yields.
         // This eliminates the use-after-free class entirely.
         // Free previous body if any (no-op on arena allocator, needed for test allocator)
@@ -96,8 +101,7 @@ fn luaExchangeNewIndex(lua: *Lua) callconv(.c) c_int {
             return 0;
         };
     } else if (std.mem.eql(u8, key_str, "upgrade")) {
-        const val = lua.toString(3) catch return 0;
-        const val_str = std.mem.span(val);
+        const val_str = checkString(lua, 3, "ctx.upgrade: value must be a string");
         if (std.mem.eql(u8, val_str, "websocket")) {
             ex.upgrade_websocket = true;
         } else if (std.mem.eql(u8, val_str, "sse")) {
@@ -106,9 +110,11 @@ fn luaExchangeNewIndex(lua: *Lua) callconv(.c) c_int {
             ex.upgrade_stream = true;
         }
     } else if (std.mem.eql(u8, key_str, "sse_room")) {
-        const val = lua.toString(3) catch return 0;
-        const val_str = std.mem.span(val);
-        ex.sse_room = ex.allocator.dupe(u8, val_str) catch return 0;
+        const val_str = checkString(lua, 3, "ctx.sse_room: value must be a string");
+        ex.sse_room = ex.allocator.dupe(u8, val_str) catch {
+            lua.pushString("ctx.sse_room: arena alloc failed");
+            lua.raiseError();
+        };
     } else if (std.mem.eql(u8, key_str, "on_message")) {
         if (lua.isFunction(3)) {
             lua.pushValue(3);
