@@ -9,39 +9,22 @@
 const std = @import("std");
 const log = @import("../observability/log.zig");
 const config = @import("../util/config.zig");
-const TlsMode = @import("io_request.zig").TlsMode;
 const ErrorCategory = @import("../http/error_response.zig").ErrorCategory;
 
 /// Tagged union describing a single outbound I/O intent.
 /// Each variant carries only the fields relevant to that operation.
-/// ~48 bytes vs ~112 for a flat struct; exhaustive switch in drain loop.
+/// Exhaustive switch in the drain loop.
 pub const IoEntry = union(Op) {
-    connect: ConnectInfo,
-    pool_connect: PoolConnectInfo,
-    udp_connect: UdpConnectInfo,
     send: SendInfo,
     recv: RecvInfo,
     close: CloseInfo,
-    setkeepalive: KeepaliveInfo,
-    tls_handshake: TlsHandshakeInfo,
     none: void,
 
-    pub const Op = enum { connect, pool_connect, udp_connect, send, recv, close, setkeepalive, tls_handshake, none };
+    pub const Op = enum { send, recv, close, none };
 
-    pub const ConnectInfo = struct { host: []const u8, port: u16 };
-    pub const PoolConnectInfo = struct { host: []const u8, port: u16, pool_name: []const u8 };
-    pub const UdpConnectInfo = struct { host: []const u8, port: u16, timeout_ms: u32 };
     pub const SendInfo = struct { fd: std.posix.socket_t, data: []const u8 };
     pub const RecvInfo = struct { fd: std.posix.socket_t, max_len: usize };
     pub const CloseInfo = struct { fd: std.posix.socket_t };
-    pub const KeepaliveInfo = struct {
-        fd: std.posix.socket_t,
-        pool_name: []const u8,
-        timeout_ms: u32,
-        pool_size: u32,
-        reuse_count: u32,
-    };
-    pub const TlsHandshakeInfo = struct { fd: std.posix.socket_t, sni_host: ?[]const u8, tls_mode: TlsMode = .verify };
 };
 
 /// Completion queue entry — result of one I/O operation.
@@ -120,8 +103,8 @@ test "SubmissionRing: push/pop/len/reset" {
     var sq = SubmissionRing{};
     try std.testing.expectEqual(@as(u8, 0), sq.len());
 
-    // Push a connect entry
-    try sq.push(.{ .connect = .{ .host = "127.0.0.1", .port = 6379 } });
+    // Push a recv entry
+    try sq.push(.{ .recv = .{ .fd = 5, .max_len = 4096 } });
     try std.testing.expectEqual(@as(u8, 1), sq.len());
 
     // Push a send entry
@@ -130,7 +113,7 @@ test "SubmissionRing: push/pop/len/reset" {
 
     // Pop in FIFO order
     const e1 = sq.pop().?;
-    try std.testing.expectEqual(IoEntry.Op.connect, std.meta.activeTag(e1.*));
+    try std.testing.expectEqual(IoEntry.Op.recv, std.meta.activeTag(e1.*));
     try std.testing.expectEqual(@as(u8, 1), sq.len());
 
     const e2 = sq.pop().?;
@@ -199,16 +182,12 @@ test "CQEntry: err_category round-trips correctly" {
 }
 
 test "IoEntry: tagged union active field" {
-    const entry: IoEntry = .{ .pool_connect = .{
-        .host = "10.0.0.1",
-        .port = 5432,
-        .pool_name = "postgres",
-    } };
+    const entry: IoEntry = .{ .send = .{ .fd = 5, .data = "PING\r\n" } };
 
     switch (entry) {
-        .pool_connect => |pc| {
-            try std.testing.expectEqualStrings("postgres", pc.pool_name);
-            try std.testing.expectEqual(@as(u16, 5432), pc.port);
+        .send => |s| {
+            try std.testing.expectEqualStrings("PING\r\n", s.data);
+            try std.testing.expectEqual(@as(std.posix.socket_t, 5), s.fd);
         },
         else => try std.testing.expect(false),
     }
