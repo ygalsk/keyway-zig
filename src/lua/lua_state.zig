@@ -64,7 +64,7 @@ pub const LuaState = struct {
 
     // Current connection being served (set during handler call/resume, cleared on completion)
     // Used by ring C bridge functions to access the Connection's SQ/CQ.
-    current_connection: ?*anyopaque = null,
+    current_connection: ?*Connection = null,
 
     // Lua script timing: start timestamp for duration histogram
     coroutine_start_us: ?i64 = null,
@@ -250,8 +250,7 @@ pub const LuaState = struct {
         prom.luaCoroutineStarted();
         self.coroutine_start_us = @divTrunc(helpers.monotonicNanos(), std.time.ns_per_us);
         // Capture route for duration labeling from Connection's http_state
-        if (self.current_connection) |conn_ptr| {
-            const conn: *Connection = @ptrCast(@alignCast(conn_ptr));
+        if (self.current_connection) |conn| {
             self.coroutine_route = conn.http_state.route_pattern;
         } else {
             self.coroutine_route = "";
@@ -572,12 +571,6 @@ pub const LuaState = struct {
 
         registry.broadcast(std.mem.span(room), std.mem.span(data));
         return 0;
-    }
-
-    /// Cast current_connection to *Connection. Internal helper.
-    inline fn currentConnection(self: *LuaState) ?*Connection {
-        const ptr = self.current_connection orelse return null;
-        return @ptrCast(@alignCast(ptr));
     }
 
     /// Register embedded stdlib modules as package.preload entries.
