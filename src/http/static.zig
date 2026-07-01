@@ -113,15 +113,25 @@ fn sendStaticError(self: *Connection, err: anyerror, server_msg: []const u8) voi
     }
 }
 
-/// Serve a static file. Called from handler.zig routeRequest.
-pub fn serveStaticFile(
+/// Result of resolving a requested suffix to a file on disk.
+const StaticPath = struct {
+    /// Route-root + suffix, traversal-checked, NOT symlink-resolved. Content-type
+    /// is derived from this — a symlink's target extension (e.g. a `.css` route
+    /// pointing at a `.txt` file) shouldn't override what the client requested.
+    requested: []const u8,
+    /// Symlink-resolved absolute path — used to open the file.
+    real: []const u8,
+};
+
+/// Resolve `suffix` against `route` to an absolute, symlink-resolved path
+/// verified to stay within the route root. Returns null after sending an
+/// error response (400/403/500) if resolution fails.
+fn resolveStaticPath(
     self: *Connection,
-    request: *const http.Request,
+    alloc: std.mem.Allocator,
     route: router_mod.StaticRoute,
     suffix: []const u8,
-) void {
-    const alloc = self.arena.allocator();
-
+) ?StaticPath {
     // Determine the file path within root
     const rel_path = if (suffix.len == 0 or std.mem.eql(u8, suffix, "/"))
         route.index
@@ -135,7 +145,7 @@ pub fn serveStaticFile(
         if (ch == 0) {
             self.logAccess(400);
             error_response.sendErrorStatus(self, 400, "null byte in path");
-            return;
+            return null;
         }
     }
 
@@ -144,19 +154,19 @@ pub fn serveStaticFile(
     const resolved = std.fs.path.resolve(alloc, &components) catch {
         self.logAccess(500);
         self.send500InternalError();
-        return;
+        return null;
     };
 
     // Verify resolved path starts with root (prevent traversal)
     const root_resolved = std.fs.path.resolve(alloc, &[_][]const u8{route.root}) catch {
         self.logAccess(500);
         self.send500InternalError();
-        return;
+        return null;
     };
     if (!std.mem.startsWith(u8, resolved, root_resolved)) {
         self.logAccess(403);
         error_response.sendErrorStatus(self, 403, "path traversal blocked");
-        return;
+        return null;
     }
 
     // Resolve symlinks and verify the real path is still within root.
@@ -168,22 +178,56 @@ pub fn serveStaticFile(
         var pbuf: [std.fs.max_path_bytes]u8 = undefined;
         const n = std.Io.Dir.cwd().realPathFile(resolve_io.io(), resolved, &pbuf) catch |err| {
             sendStaticError(self, err, "static realpath failed");
-            return;
+            return null;
         };
         break :blk alloc.dupe(u8, pbuf[0..n]) catch {
             self.logAccess(500);
             self.send500InternalError();
-            return;
+            return null;
         };
     };
     if (!std.mem.startsWith(u8, real_resolved, route.real_root)) {
         self.logAccess(403);
         error_response.sendErrorStatus(self, 403, "symlink traversal blocked");
-        return;
+        return null;
     }
 
-    // Open the file (use real_resolved — it's always absolute after realpathAlloc)
-    const resolved_z = alloc.dupeZ(u8, real_resolved) catch {
+    return .{ .requested = resolved, .real = real_resolved };
+}
+
+/// Build the response headers text: status line, content-type, length, ETag,
+/// Last-Modified, cache-control. Pure formatting — no I/O, no error response.
+fn buildStaticHeaders(
+    alloc: std.mem.Allocator,
+    content_type: []const u8,
+    file_size: u64,
+    etag: []const u8,
+    mtime_sec: i64,
+) ![]const u8 {
+    var last_modified_buf: [29]u8 = undefined;
+    formatHttpDate(&last_modified_buf, mtime_sec);
+
+    return std.fmt.allocPrint(alloc, "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nETag: {s}\r\nLast-Modified: {s}\r\nCache-Control: public, max-age=3600\r\n\r\n", .{
+        content_type,
+        file_size,
+        etag,
+        &last_modified_buf,
+    });
+}
+
+/// Serve a static file. Called from handler.zig routeRequest.
+pub fn serveStaticFile(
+    self: *Connection,
+    request: *const http.Request,
+    route: router_mod.StaticRoute,
+    suffix: []const u8,
+) void {
+    const alloc = self.arena.allocator();
+
+    const path = resolveStaticPath(self, alloc, route, suffix) orelse return;
+
+    // Open the file (use path.real — it's always absolute after realpathAlloc)
+    const resolved_z = alloc.dupeZ(u8, path.real) catch {
         self.logAccess(500);
         self.send500InternalError();
         return;
@@ -242,18 +286,8 @@ pub fn serveStaticFile(
         }
     }
 
-    const content_type = getContentType(resolved);
-
-    // Build response headers
-    var last_modified_buf: [29]u8 = undefined;
-    formatHttpDate(&last_modified_buf, mtime_sec);
-
-    const headers_text = std.fmt.allocPrint(alloc, "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nETag: {s}\r\nLast-Modified: {s}\r\nCache-Control: public, max-age=3600\r\n\r\n", .{
-        content_type,
-        file_size,
-        etag,
-        &last_modified_buf,
-    }) catch {
+    const content_type = getContentType(path.requested);
+    const headers_text = buildStaticHeaders(alloc, content_type, file_size, etag, mtime_sec) catch {
         helpers.closeFd(fd);
         self.logAccess(500);
         self.send500InternalError();
@@ -271,7 +305,9 @@ pub fn serveStaticFile(
 
     // Send headers first, then drive an async pread+send loop. Files up to
     // STATIC_READ_SIZE complete in a single chunk; larger files span several.
-    const read_buf = self.base_allocator.alloc(u8, config.STATIC_READ_SIZE) catch {
+    // read_buf is sized to the smaller of the two so small files don't pay
+    // for a full 64 KB allocation.
+    const read_buf = self.base_allocator.alloc(u8, @min(file_size, config.STATIC_READ_SIZE)) catch {
         helpers.closeFd(fd);
         self.send500InternalError();
         return;
@@ -414,4 +450,15 @@ test "formatHttpDate produces valid format" {
     // Unix epoch: Thu, 01 Jan 1970 00:00:00 GMT
     formatHttpDate(&buf, 0);
     try std.testing.expectEqualStrings("Thu, 01 Jan 1970 00:00:00 GMT", &buf);
+}
+
+test "buildStaticHeaders formats status line and cache headers" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+    const headers = try buildStaticHeaders(arena.allocator(), "text/plain; charset=utf-8", 42, "\"abc\"", 0);
+    try std.testing.expect(std.mem.startsWith(u8, headers, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, headers, "Content-Type: text/plain; charset=utf-8\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, headers, "Content-Length: 42\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, headers, "ETag: \"abc\"\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, headers, "Last-Modified: Thu, 01 Jan 1970 00:00:00 GMT\r\n") != null);
 }
