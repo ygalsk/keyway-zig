@@ -2,8 +2,8 @@
 
 import { createSignal, createEffect, For, Show, onMount, onCleanup } from "solid-js";
 import {
-  type TrafficEntry, type ScriptMeta, api, sendWS, fetchEffectiveConfig, startStream,
-  classifyInvocation, INVOCATION_LABELS, formatTime,
+  type MetricsSnapshot, api, sendWS, fetchEffectiveConfig, startStream,
+  classifyStatus, INVOCATION_LABELS, formatTime,
 } from "../main";
 
 interface LogEntry { type: "cmd" | "response" | "error"; text: string; ts: number; }
@@ -78,8 +78,7 @@ function JsonHighlight(props: { text: string }) {
 function isJson(text: string): boolean { try { JSON.parse(text); return true; } catch { return false; } }
 
 export function ConsoleCore(props: {
-  traffic: () => TrafficEntry[];
-  scripts: () => ScriptMeta[];
+  metrics: () => MetricsSnapshot | null;
   wsMessages: () => Record<string, unknown>[];
   pendingCmd: () => string | null;
   setPendingCmd: (v: string | null) => void;
@@ -144,16 +143,15 @@ export function ConsoleCore(props: {
       try { reply(JSON.stringify(await fetchEffectiveConfig())); } catch (e) { err(String(e)); }
     },
     taxonomy:         () => {
+      const m = props.metrics();
+      if (!m || m.total === 0) { reply("No traffic yet — send some requests and check back"); return; }
       const counts: Record<string, number> = {};
-      for (const e of props.traffic()) {
-        if (e.path.startsWith("/__keyway/")) continue;
-        const label = INVOCATION_LABELS[classifyInvocation(e)] || "unknown";
-        counts[label] = (counts[label] || 0) + 1;
+      for (const [status, n] of m.byStatus) {
+        const label = INVOCATION_LABELS[classifyStatus(status)] || "unknown";
+        counts[label] = (counts[label] || 0) + n;
       }
-      const total = Object.values(counts).reduce((a, b) => a + b, 0);
-      if (!total) { reply("No traffic yet — send some requests and check back"); return; }
-      reply(`Traffic breakdown (${total} requests):\n` +
-        Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([l, c]) => `${l}: ${c} (${((c / total) * 100).toFixed(1)}%)`).join("\n"));
+      reply(`Traffic breakdown (${m.total} requests, since server start):\n` +
+        Object.entries(counts).sort((a, b) => b[1] - a[1]).map(([l, c]) => `${l}: ${c} (${((c / m.total) * 100).toFixed(1)}%)`).join("\n"));
     },
   };
 
@@ -205,7 +203,6 @@ export function ConsoleCore(props: {
   onCleanup(() => { if (activeStreamCancel) activeStreamCancel(); });
 
   const hasEntries = () => entries().length > 0;
-  const scriptCount = () => props.scripts().length;
 
   return (
     <div class="flex flex-col h-full">
@@ -215,16 +212,6 @@ export function ConsoleCore(props: {
           <div class="px-3 py-4 space-y-3">
             <div class="text-base-content/60 text-sm font-medium">{timeGreeting()} — ready when you are</div>
             <div class="space-y-1.5 text-detail">
-              <Show when={scriptCount() > 0}>
-                <div class="flex items-center gap-2 text-base-content/60">
-                  <span class="text-primary/60">{">"}</span>
-                  <span>You have <span class="text-primary font-semibold">{scriptCount()}</span> scripts — try</span>
-                  <button
-                    class="text-primary cursor-pointer hover:underline bg-transparent border-none p-0 font-inherit text-inherit focus-visible:ring-1 focus-visible:ring-primary rounded"
-                    onClick={() => { input.value = "scripts"; input.focus(); }}
-                  >scripts</button>
-                </div>
-              </Show>
               <div class="flex items-center gap-2 text-base-content/60">
                 <span class="text-primary/60">{">"}</span>
                 <span>Run Lua on the server:</span>

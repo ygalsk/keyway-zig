@@ -1,5 +1,5 @@
 // Keyway Dashboard — app shell
-// PaaS scripting engine experience: Scripts, Routes, Console
+// PaaS scripting engine experience: Engine, Routes, Files, Console
 
 import { render } from "solid-js/web";
 import { createSignal, createEffect, onCleanup, For, Show, Switch, Match } from "solid-js";
@@ -8,47 +8,30 @@ import { createSignal, createEffect, onCleanup, For, Show, Switch, Match } from 
 
 export type ConnStatus = "connected" | "connecting" | "disconnected";
 
-export interface TrafficEntry {
-  method: string; path: string; status: number; latency: string; latency_us: number;
-  worker_id: string; content_type: string; header_count: number;
-  scripts?: { id: string; name: string }[]; error_message?: string; ts: number;
-}
-
-export interface ScriptMeta {
-  id: string; name: string; type: "middleware" | "handler"; pattern: string;
-  priority: number; enabled: boolean; code: string; middleware?: string[];
-  created_at: string; updated_at: string;
-}
-
 export interface Route {
   method: string; pattern: string; handler: string; middleware: string[]; type?: string;
 }
 
-export interface MiddlewareInfo {
-  name: string; source: string; line: number;
-}
-
 // ─── Utilities ──────────────────────────────────────────
 
-export function classifyInvocation(e: TrafficEntry): string {
-  if (e.status >= 200 && e.status < 400) return "success";
-  if (e.status === 499) return "client_disconnect";
-  if (e.status >= 400 && e.status < 500) return "client_error";
-  if (e.status === 504) return "timeout";
-  if (e.status === 503) return "resource_exceeded";
-  if (e.status >= 500) return "internal_error";
+export function classifyStatus(status: number): string {
+  if (status >= 200 && status < 400) return "success";
+  if (status === 499) return "client_disconnect";
+  if (status >= 400 && status < 500) return "client_error";
+  if (status === 504) return "timeout";
+  if (status === 503) return "resource_exceeded";
+  if (status >= 500) return "internal_error";
   return "success";
 }
 
 export const INVOCATION_LABELS: Record<string, string> = {
   success: "Success", client_error: "Client Error", client_disconnect: "Client Disconnect",
-  script_error: "Script Error", timeout: "Timeout", resource_exceeded: "Resource Exceeded",
-  internal_error: "Internal Error",
+  timeout: "Timeout", resource_exceeded: "Resource Exceeded", internal_error: "Internal Error",
 };
 
 export function formatLatency(us: number): string {
   if (!us || us === 0) return "-";
-  if (us < 1000) return us + "us";
+  if (us < 1000) return Math.round(us) + "us";
   if (us < 1000000) return (us / 1000).toFixed(1) + "ms";
   return (us / 1000000).toFixed(2) + "s";
 }
@@ -115,16 +98,89 @@ export function sendWS(data: object): void {
   if (_ws?.readyState === WebSocket.OPEN) _ws.send(JSON.stringify(data));
 }
 
+// ─── Metrics ────────────────────────────────────────────
+// Polls GET /metrics (Prometheus text format) and reduces it into a snapshot
+// the views can read without re-parsing.
+
+export interface MetricsSnapshot {
+  ts: number; total: number;
+  byWorker: Map<string, number>;
+  byStatus: Map<number, number>;
+  byRoute: Map<string, { hits: number; errors: number }>;
+  byMethodRoute: Map<string, { hits: number; errors: number }>;
+  latencyByRoute: Map<string, { sum: number; count: number }>;
+  activeConnections: number; activeCoroutines: number; rejected: number;
+}
+
+function parseMetrics(text: string): MetricsSnapshot {
+  const snap: MetricsSnapshot = {
+    ts: Date.now(), total: 0,
+    byWorker: new Map(), byStatus: new Map(), byRoute: new Map(),
+    byMethodRoute: new Map(), latencyByRoute: new Map(),
+    activeConnections: 0, activeCoroutines: 0, rejected: 0,
+  };
+  for (const line of text.split("\n")) {
+    if (!line || line[0] === "#") continue;
+    const brace = line.indexOf("{");
+    const lastSpace = line.lastIndexOf(" ");
+    const name = line.slice(0, brace === -1 ? lastSpace : brace);
+    const value = Number(line.slice(lastSpace + 1));
+    if (Number.isNaN(value)) continue;
+    const labels: Record<string, string> = {};
+    if (brace !== -1) {
+      // route patterns like "/test/status/{code}" embed a closing brace in the
+      // label value itself, so the label block's terminator must be found by
+      // scanning backward from the value separator, not forward from the start.
+      const closeBrace = line.lastIndexOf("}", lastSpace);
+      const re = /(\w+)="([^"]*)"/g;
+      let m;
+      while ((m = re.exec(line.slice(brace, closeBrace)))) labels[m[1]] = m[2];
+    }
+    if (name === "keyway_http_requests_total") {
+      snap.total += value;
+      const status = Number(labels.status);
+      const worker = labels.worker_id || "";
+      const route = labels.route || "";
+      const err = status >= 400;
+      snap.byStatus.set(status, (snap.byStatus.get(status) || 0) + value);
+      snap.byWorker.set(worker, (snap.byWorker.get(worker) || 0) + value);
+      const r = snap.byRoute.get(route) || { hits: 0, errors: 0 };
+      r.hits += value; if (err) r.errors += value;
+      snap.byRoute.set(route, r);
+      const key = `${labels.method} ${route}`;
+      const mr = snap.byMethodRoute.get(key) || { hits: 0, errors: 0 };
+      mr.hits += value; if (err) mr.errors += value;
+      snap.byMethodRoute.set(key, mr);
+    } else if (name === "keyway_http_request_duration_seconds_sum") {
+      const l = snap.latencyByRoute.get(labels.route || "") || { sum: 0, count: 0 };
+      l.sum += value;
+      snap.latencyByRoute.set(labels.route || "", l);
+    } else if (name === "keyway_http_request_duration_seconds_count") {
+      const l = snap.latencyByRoute.get(labels.route || "") || { sum: 0, count: 0 };
+      l.count += value;
+      snap.latencyByRoute.set(labels.route || "", l);
+    } else if (name === "keyway_connections_active") {
+      snap.activeConnections += value;
+    } else if (name === "keyway_lua_coroutines_active") {
+      snap.activeCoroutines += value;
+    } else if (name === "keyway_connections_rejected_total") {
+      snap.rejected += value;
+    }
+  }
+  return snap;
+}
+
 // ─── Views ──────────────────────────────────────────────
 
+import { EngineView } from "./views/engine";
 import { RoutesView, FilesView } from "./views/manage";
 import { ConsoleCore } from "./views/console";
 
 // ─── App ────────────────────────────────────────────────
 
-const TRAFFIC_MAX = 500;
 const WS_MESSAGE_MAX = 200;
 const ERROR_MAX = 10;
+const METRICS_POLL_MS = 2000;
 const MAC = typeof navigator !== "undefined" && /Mac/.test(navigator.userAgent);
 const CONSOLE_MIN_H = 120;
 const CONSOLE_MAX_VH = 70;
@@ -132,8 +188,9 @@ const CONSOLE_DEFAULT_H = 300;
 const CONSOLE_STORAGE_KEY = "kw_console_height";
 
 const NAV = [
-  { path: "/files",  label: "Files" },
+  { path: "/engine", label: "Engine" },
   { path: "/routes", label: "Routes" },
+  { path: "/files",  label: "Files" },
 ];
 
 function getClientY(e: MouseEvent | TouchEvent): number {
@@ -144,14 +201,12 @@ interface ToastError { message: string; ts: number; }
 
 function App() {
   // ── State ──
-  const [sseStatus, setSseStatus] = createSignal<ConnStatus>("disconnected");
   const [wsStatus, setWsStatus] = createSignal<ConnStatus>("disconnected");
-  const [traffic, setTraffic] = createSignal<TrafficEntry[]>([]);
   const [wsMessages, setWsMessages] = createSignal<Record<string, unknown>[]>([]);
-  const [scripts] = createSignal<ScriptMeta[]>([]);
+  const [metrics, setMetrics] = createSignal<MetricsSnapshot | null>(null);
+  const [prevMetrics, setPrevMetrics] = createSignal<MetricsSnapshot | null>(null);
   const [drawerOpen, setDrawerOpen] = createSignal(false);
   const [pendingCmd, setPendingCmd] = createSignal<string | null>(null);
-  const [dataStartTime, setDataStartTime] = createSignal<number | null>(null);
   const [errors, setErrors] = createSignal<ToastError[]>([]);
   const [currentPath, setCurrentPath] = createSignal(parseHash(location.hash));
   const [consoleMounted, setConsoleMounted] = createSignal(false);
@@ -195,10 +250,6 @@ function App() {
     localStorage.setItem(CONSOLE_STORAGE_KEY, String(consoleHeight()));
   }
 
-  function pushTraffic(entry: TrafficEntry) {
-    if (dataStartTime() === null) setDataStartTime(Date.now());
-    setTraffic(prev => { const n = [entry, ...prev]; if (n.length > TRAFFIC_MAX) n.length = TRAFFIC_MAX; return n; });
-  }
   function pushWsMessage(msg: Record<string, unknown>) {
     setWsMessages(prev => [...(prev.length >= WS_MESSAGE_MAX ? prev.slice(1) : prev), { ...msg, _ts: Date.now() }]);
   }
@@ -235,32 +286,19 @@ function App() {
     }
   });
 
-  // ── SSE ──
-  let sse: EventSource | null = null;
-  let sseRetry: ReturnType<typeof setTimeout> | null = null;
-  function connectSSE() {
-    if (sse) return;
-    setSseStatus("connecting");
-    sse = new EventSource("/__keyway/events");
-    sse.onopen = () => setSseStatus("connected");
-    sse.addEventListener("message", (e) => {
-      try {
-        const d = JSON.parse(e.data);
-        if (d.method && d.path && d.status !== undefined) {
-          pushTraffic({
-            method: d.method, path: d.path, status: d.status, latency: d.latency || "",
-            latency_us: d.latency_us || 0, worker_id: d.worker_id || "", content_type: d.content_type || "",
-            header_count: d.header_count || 0, scripts: d.scripts,
-            error_message: d.error_message, ts: Date.now(),
-          });
-        }
-      } catch {}
-    });
-    sse.onerror = () => {
-      setSseStatus("disconnected"); sse?.close(); sse = null;
-      sseRetry = setTimeout(connectSSE, 3000);
-    };
+  // ── Metrics polling ──
+  async function pollMetrics() {
+    try {
+      const res = await fetch("/metrics");
+      if (!res.ok) return;
+      const text = await res.text();
+      setPrevMetrics(metrics());
+      setMetrics(parseMetrics(text));
+    } catch { /* server-down is already signaled by the WS dot */ }
   }
+  pollMetrics();
+  const metricsTimer = setInterval(pollMetrics, METRICS_POLL_MS);
+  onCleanup(() => clearInterval(metricsTimer));
 
   // ── WebSocket ──
   function connectWS() {
@@ -274,7 +312,6 @@ function App() {
     _ws.onerror = () => _ws?.close();
   }
 
-  connectSSE();
   connectWS();
 
   // ── Keyboard shortcuts ──
@@ -285,8 +322,6 @@ function App() {
   onCleanup(() => document.removeEventListener("keydown", onKeydown));
   onCleanup(() => {
     if (_wsRetryTimer) clearTimeout(_wsRetryTimer);
-    if (sseRetry) clearTimeout(sseRetry);
-    if (sse) { sse.close(); sse = null; }
     if (_ws) { _ws.close(); _ws = null; }
   });
 
@@ -298,19 +333,11 @@ function App() {
     onCleanup(() => timers.forEach(clearTimeout));
   });
 
-  const bothDown = () => sseStatus() === "disconnected" && wsStatus() === "disconnected";
-
-  const connStatus = (): ConnStatus => {
-    const sse = sseStatus();
-    const ws = wsStatus();
-    if (sse === "connected" || ws === "connected") return "connected";
-    if (sse === "connecting" || ws === "connecting") return "connecting";
-    return "disconnected";
-  };
+  const serverDown = () => wsStatus() === "disconnected";
 
   const [wasConnected, setWasConnected] = createSignal(false);
   createEffect(() => {
-    if (connStatus() === "connected" && !wasConnected()) setWasConnected(true);
+    if (wsStatus() === "connected" && !wasConnected()) setWasConnected(true);
   });
 
   function statusDot(status: ConnStatus) {
@@ -326,7 +353,7 @@ function App() {
         <nav class="flex items-center gap-0.5 h-full">
           <For each={NAV}>
             {(route) => {
-              const active = () => currentPath() === route.path || (currentPath() === "/" && route.path === "/files");
+              const active = () => currentPath() === route.path || (currentPath() === "/" && route.path === "/engine");
               return (
                 <a
                   href={`#${route.path}`}
@@ -342,8 +369,8 @@ function App() {
           </For>
         </nav>
         <div class="flex-1" />
-        <span class={`inline-block w-2 h-2 rounded-full mr-3 ${statusDot(connStatus())} ${connStatus() === "connected" ? "status-live" : ""}`}
-              title={`Event stream: ${sseStatus()} | WebSocket: ${wsStatus()}`} />
+        <span class={`inline-block w-2 h-2 rounded-full mr-3 ${statusDot(wsStatus())} ${wsStatus() === "connected" ? "status-live" : ""}`}
+              title={`WebSocket: ${wsStatus()}`} />
         <button
           class="console-btn px-2 py-1 text-body rounded text-base-content/50 hover:text-primary hover:bg-primary/10 bg-transparent border-none font-inherit cursor-pointer font-semibold"
           onClick={() => setDrawerOpen(!drawerOpen())}
@@ -360,14 +387,14 @@ function App() {
 
             <div class="flex gap-3 mb-6 max-sm:flex-col">
               <div class="flex-1 border border-base-300 rounded-lg p-4 text-center">
+                <div class="text-primary/20 text-2xl mb-2">{"▁▄█"}</div>
+                <div class="text-sm font-semibold text-base-content mb-1">Engine</div>
+                <div class="text-detail text-base-content/50">Live engine state &mdash; workers, traffic, latency</div>
+              </div>
+              <div class="flex-1 border border-base-300 rounded-lg p-4 text-center">
                 <div class="text-primary/20 text-2xl mb-2">{"{..}"}</div>
                 <div class="text-sm font-semibold text-base-content mb-1">Files</div>
                 <div class="text-detail text-base-content/50">Lua scripts, handlers & middleware</div>
-              </div>
-              <div class="flex-1 border border-base-300 rounded-lg p-4 text-center">
-                <div class="text-primary/20 text-2xl mb-2">/api</div>
-                <div class="text-sm font-semibold text-base-content mb-1">Routes</div>
-                <div class="text-detail text-base-content/50">Auto-created from scripts</div>
               </div>
               <div class="flex-1 border border-base-300 rounded-lg p-4 text-center">
                 <div class="text-primary/20 text-2xl mb-2">{">_"}</div>
@@ -377,7 +404,7 @@ function App() {
             </div>
 
             <div class="flex items-center gap-3">
-              <button class="btn btn-sm btn-primary flex-1" onClick={() => { dismissWelcome(); navigate("/files"); }}>Browse files</button>
+              <button class="btn btn-sm btn-primary flex-1" onClick={() => { dismissWelcome(); navigate("/engine"); }}>View engine</button>
               <button class="btn btn-sm btn-ghost border border-base-300 flex-1" onClick={() => { dismissWelcome(); setDrawerOpen(true); }}>Open console</button>
               <button class="btn btn-sm btn-ghost text-base-content/40" onClick={dismissWelcome}>Skip</button>
             </div>
@@ -385,7 +412,7 @@ function App() {
         </div>
       </Show>
 
-      <Show when={bothDown()}>
+      <Show when={serverDown()}>
         <div class="bg-warning/10 border-b border-warning/30 text-warning text-detail px-4 py-1.5 text-center toast-enter">
           Lost the server — hanging tight, reconnecting...
         </div>
@@ -400,9 +427,10 @@ function App() {
       </For>
 
       <div ref={viewRef} class="flex-1 overflow-auto view-enter">
-        <Switch fallback={<FilesView onNavigate={navigate} />}>
+        <Switch fallback={<EngineView metrics={metrics} prev={prevMetrics} onNavigate={navigate} />}>
+          <Match when={currentPath() === "/engine"}><EngineView metrics={metrics} prev={prevMetrics} onNavigate={navigate} /></Match>
+          <Match when={currentPath() === "/routes"}><RoutesView metrics={metrics} onNavigate={navigate} /></Match>
           <Match when={currentPath() === "/files"}><FilesView onNavigate={navigate} /></Match>
-          <Match when={currentPath() === "/routes"}><RoutesView traffic={traffic} onNavigate={navigate} /></Match>
         </Switch>
       </div>
 
@@ -419,8 +447,7 @@ function App() {
         >
           <Show when={consoleMounted() || drawerOpen()}>
             <ConsoleCore
-              traffic={traffic}
-              scripts={scripts}
+              metrics={metrics}
               wsMessages={wsMessages}
               pendingCmd={pendingCmd}
               setPendingCmd={setPendingCmd}

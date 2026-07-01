@@ -2,7 +2,7 @@
 
 import { createSignal, createMemo, For, Show, onMount, onCleanup } from "solid-js";
 import {
-  type TrafficEntry, type Route, type MiddlewareInfo,
+  type MetricsSnapshot, type Route,
   api, getHashParams,
 } from "../main";
 import { EditorView, basicSetup } from "codemirror";
@@ -79,63 +79,19 @@ const onKeyActivate = (fn: () => void) => (e: KeyboardEvent) => {
 
 // ─── Traffic stats helpers ───────────────────────────────
 
-interface RouteStats {
-  hits: number;
-  errors: number;
-  lastHit: number | null;
-}
+interface RouteStats { hits: number; errors: number; }
 
-function buildRouteStats(traffic: TrafficEntry[]): Map<string, RouteStats> {
-  const stats = new Map<string, RouteStats>();
-  for (const t of traffic) {
-    if (t.path.startsWith("/__keyway/")) continue;
-    const key = `${t.method} ${t.path}`;
-    let s = stats.get(key);
-    if (!s) { s = { hits: 0, errors: 0, lastHit: null }; stats.set(key, s); }
-    s.hits++;
-    if (t.status >= 400) s.errors++;
-    if (s.lastHit === null || t.ts > s.lastHit) s.lastHit = t.ts;
+function lookupRouteStats(m: MetricsSnapshot | null, route: Route): RouteStats {
+  if (!m) return { hits: 0, errors: 0 };
+  if (route.method !== "*") {
+    return m.byMethodRoute.get(`${route.method} ${route.pattern}`) || { hits: 0, errors: 0 };
   }
-  return stats;
-}
-
-function matchRouteToStats(route: Route, stats: Map<string, RouteStats>): RouteStats {
-  // Exact match first, then aggregate by pattern matching
-  const agg: RouteStats = { hits: 0, errors: 0, lastHit: null };
-  const patternRegex = routePatternToRegex(route.pattern);
-  for (const [key, s] of stats) {
-    const [method, ...pathParts] = key.split(" ");
-    const path = pathParts.join(" ");
-    if (route.method !== "*" && method !== route.method) continue;
-    if (patternRegex.test(path)) {
-      agg.hits += s.hits;
-      agg.errors += s.errors;
-      if (s.lastHit !== null && (agg.lastHit === null || s.lastHit > agg.lastHit)) agg.lastHit = s.lastHit;
-    }
+  const agg = { hits: 0, errors: 0 };
+  const suffix = ` ${route.pattern}`;
+  for (const [key, s] of m.byMethodRoute) {
+    if (key.endsWith(suffix)) { agg.hits += s.hits; agg.errors += s.errors; }
   }
   return agg;
-}
-
-const _regexCache = new Map<string, RegExp>();
-function routePatternToRegex(pattern: string): RegExp {
-  let cached = _regexCache.get(pattern);
-  if (cached) return cached;
-  const escaped = pattern.replace(/[.*+?^${}()|[\]\\]/g, (m) => {
-    if (m === "{" || m === "}") return m;
-    return "\\" + m;
-  });
-  const withParams = escaped.replace(/\{[^}]+\}/g, "[^/]+");
-  cached = new RegExp("^" + withParams + "$");
-  _regexCache.set(pattern, cached);
-  return cached;
-}
-
-function relativeTime(ts: number): string {
-  const diff = Math.floor((Date.now() - ts) / 1000);
-  if (diff < 2) return "just now";
-  if (diff < 60) return diff + "s ago";
-  if (diff < 3600) return Math.floor(diff / 60) + "m ago";
-  return Math.floor(diff / 3600) + "h ago";
 }
 
 function statusDotClass(stats: RouteStats): string {
@@ -177,7 +133,7 @@ function renderPatternHighlighted(pattern: string, query: string): any[] {
 interface GlobalMW { name: string; index: number; }
 
 export function RoutesView(props: {
-  traffic: () => TrafficEntry[];
+  metrics: () => MetricsSnapshot | null;
   onNavigate: (path: string, ctx?: Record<string, unknown>) => void;
 }) {
   const [routes, setRoutes] = createSignal<Route[] | null>(null);
@@ -192,13 +148,6 @@ export function RoutesView(props: {
   const [pendingMw, setPendingMw] = createSignal<Map<string, string[]>>(new Map());
   const [saving, setSaving] = createSignal<string | null>(null);
   const [mwFeedback, setMwFeedback] = createSignal<{ key: string; msg: string; err: boolean } | null>(null);
-
-  // Tick every 10s to refresh relative timestamps
-  const [tick, setTick] = createSignal(0);
-  const tickTimer = setInterval(() => setTick(t => t + 1), 10_000);
-  onCleanup(() => clearInterval(tickTimer));
-
-  const trafficStats = createMemo(() => buildRouteStats(props.traffic()));
 
   const filtered = createMemo(() => {
     let list = routes() || [];
@@ -422,7 +371,7 @@ export function RoutesView(props: {
   function TreeRow(treeProps: {
     node: TreeNode; depth: number;
     onNavigate: (path: string, ctx?: Record<string, unknown>) => void;
-    stats: Map<string, RouteStats>;
+    stats: MetricsSnapshot | null;
     filterQuery: string;
     globalMw: GlobalMW[];
   }) {
@@ -458,7 +407,7 @@ export function RoutesView(props: {
         {/* Route rows */}
         <For each={treeProps.node.routes}>
           {(r) => {
-            const stats = matchRouteToStats(r, treeProps.stats);
+            const stats = () => lookupRouteStats(treeProps.stats, r);
             const routeMw = () => Array.isArray(r.middleware) ? r.middleware : [];
             const hasRouteMw = () => routeMw().length > 0;
             const routeKey = () => `${r.method} ${r.pattern}`;
@@ -474,13 +423,10 @@ export function RoutesView(props: {
                       <span class={`method-${r.method} font-semibold min-w-[52px] w-fit text-center shrink-0`}>{r.method}</span>
                       <span class="text-base-content/80">{renderPatternHighlighted(r.pattern, treeProps.filterQuery)}</span>
                       {/* Inline traffic indicators */}
-                      <Show when={stats.hits > 0}>
+                      <Show when={stats().hits > 0}>
                         <span class="flex items-center gap-1.5 ml-auto mr-2 shrink-0 max-sm:hidden">
-                          <span class={`inline-block w-1.5 h-1.5 rounded-full ${statusDotClass(stats)}`} title={`${stats.errors} errors / ${stats.hits} total`} aria-label={`${stats.hits} requests, ${stats.errors} errors`} />
-                          <span class="text-base-content/40 text-detail">{stats.hits}</span>
-                          <Show when={stats.lastHit}>
-                            <span class="text-base-content/30 text-detail">{(tick(), relativeTime(stats.lastHit!))}</span>
-                          </Show>
+                          <span class={`inline-block w-1.5 h-1.5 rounded-full ${statusDotClass(stats())}`} title={`${stats().errors} errors / ${stats().hits} total`} aria-label={`${stats().hits} requests, ${stats().errors} errors`} />
+                          <span class="text-base-content/40 text-detail">{stats().hits}</span>
                         </span>
                       </Show>
                     </div>
@@ -724,7 +670,7 @@ export function RoutesView(props: {
             <table class="table table-xs w-full">
               <tbody>
                 <For each={tree()}>
-                  {(node) => <TreeRow node={node} depth={0} onNavigate={props.onNavigate} stats={trafficStats()} filterQuery={filter()} globalMw={globalMw()} />}
+                  {(node) => <TreeRow node={node} depth={0} onNavigate={props.onNavigate} stats={props.metrics()} filterQuery={filter()} globalMw={globalMw()} />}
                 </For>
               </tbody>
             </table>
