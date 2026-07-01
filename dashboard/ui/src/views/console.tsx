@@ -24,7 +24,6 @@ const COMMANDS: { label: string; cmds: { name: string; desc: string }[] }[] = [
     { name: "config", desc: "Show running config" }, { name: "taxonomy", desc: "Traffic by status category" },
   ]},
   { label: "test", cmds: [
-    { name: "probe <url>", desc: "Fetch a URL and show response" }, { name: "dns <domain>", desc: "DNS lookup" },
     { name: "lua <code>", desc: "Run Lua on the server" }, { name: "stream", desc: "Test SSE streaming" },
   ]},
   { label: "control", cmds: [
@@ -133,8 +132,6 @@ export function ConsoleCore(props: {
     lua:              (a) => { if (a) sendWS({ cmd: "lua", code: a }); else err("Usage: lua <code>  —  e.g. lua print('hello')"); },
     "scripts:toggle": (a) => { if (a) apiCmd(`/__keyway/api/scripts/${a}/toggle`, { method: "POST" }); else err("Usage: scripts:toggle <id>"); },
     "scripts:test":   (a) => { if (a) apiCmd(`/__keyway/api/scripts/${a}/test`, { method: "POST", body: JSON.stringify({ method: "GET", path: "/test", headers: {}, body: "" }) }); else err("Usage: scripts:test <id>"); },
-    probe:            (a) => { if (a) apiCmd("/__keyway/api/probe", { method: "POST", body: JSON.stringify({ url: a }) }); else err("Usage: probe <url>"); },
-    dns:              (a) => { if (a) apiCmd("/__keyway/api/dns", { method: "POST", body: JSON.stringify({ domain: a }) }); else err("Usage: dns <domain>"); },
     stream:           () => {
       if (activeStreamCancel) { activeStreamCancel(); activeStreamCancel = null; reply("Stream cancelled."); return; }
       reply("Streaming...");
@@ -235,14 +232,6 @@ export function ConsoleCore(props: {
                   class="text-primary cursor-pointer hover:underline font-mono bg-transparent border-none p-0 font-inherit focus-visible:ring-1 focus-visible:ring-primary rounded"
                   onClick={() => { input.value = "lua print('hello')"; input.focus(); }}
                 >lua print('hello')</button>
-              </div>
-              <div class="flex items-center gap-2 text-base-content/60">
-                <span class="text-primary/60">{">"}</span>
-                <span>Probe an endpoint:</span>
-                <button
-                  class="text-primary cursor-pointer hover:underline font-mono bg-transparent border-none p-0 font-inherit focus-visible:ring-1 focus-visible:ring-primary rounded"
-                  onClick={() => { input.value = "probe http://localhost:8080/test/json"; input.focus(); }}
-                >probe http://localhost:8080/test/json</button>
               </div>
               <div class="flex items-center gap-2 text-base-content/60">
                 <span class="text-primary/60">{">"}</span>

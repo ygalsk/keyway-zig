@@ -3,8 +3,6 @@
 
 local response = require("keyway.response")
 local json = require("keyway.json")
-local dns = require("keyway.dns")
-local http = require("keyway.http")
 
 -- ─── Middleware Registry ──────────────────────────────────────────────
 
@@ -235,58 +233,6 @@ keyway.routes = {
 
     -- ─── Dashboard API Endpoints ─────────────────────────────────
 
-    -- HTTP Probe
-    ["/__keyway/api/probe"] = {
-        POST = function(ctx)
-            local ok, body = pcall(json.decode, ctx.body)
-            if not ok or not body.url then
-                response.json_response(ctx, 400, { error = "JSON body with 'url' field required" })
-                return
-            end
-            local result, err = http.probe(body.url)
-            if not result then
-                response.json_response(ctx, 200, { error = err })
-                return
-            end
-            local timing_us = (result.timing_ms or 0) * 1000
-            pcall(response.broadcast_event, "keyway:access", {
-                method = "PROBE",
-                path = body.url,
-                status = result.status,
-                latency_us = timing_us,
-                latency = format_latency(timing_us),
-                worker_id = keyway.worker_id ~= nil and tostring(keyway.worker_id) or "-",
-                content_type = "",
-                header_count = #result.headers,
-            })
-            response.json_response(ctx, 200, {
-                status       = result.status,
-                headers      = result.headers,
-                timing_ms    = result.timing_ms,
-                body_preview = (result.body or ""):sub(1, 500),
-            })
-        end,
-    },
-
-    -- DNS Lookup
-    ["/__keyway/api/dns"] = {
-        POST = function(ctx)
-            local ok, body = pcall(json.decode, ctx.body)
-            if not ok or not body.domain then
-                response.json_response(ctx, 400, { error = "JSON body with 'domain' field required" })
-                return
-            end
-            local t0 = response.now_us()
-            local records, err = dns.lookup(body.domain)
-            local timing = math.floor(response.now_us() - t0)
-            if not records then
-                response.json_response(ctx, 200, { error = err, timing_us = timing })
-                return
-            end
-            response.json_response(ctx, 200, { records = records, timing_us = timing })
-        end,
-    },
-
     -- Stream Test
     ["/__keyway/api/stream"] = {
         GET = function(ctx)
@@ -407,30 +353,6 @@ keyway.routes = {
             -- Clear mw_name cache so names re-resolve on next API call
             _mw_name_cache = setmetatable({}, { __mode = "k" })
 
-            -- Best-effort Redis persistence (inside coroutine, so yields work)
-            pcall(function()
-                local redis = require("keyway.redis_ring")
-                -- Build full overrides map from current route state
-                local overrides = {}
-                each_static_route(function(p, methods, _, _)
-                    if methods.middleware and #methods.middleware > 0 then
-                        local names = {}
-                        for j, mw in ipairs(methods.middleware) do
-                            names[#names + 1] = mw_name(mw, j, "mw_")
-                        end
-                        overrides[p] = names
-                    end
-                end)
-                if keyway.routes.middleware then
-                    local global_names = {}
-                    for j, mw in ipairs(keyway.routes.middleware) do
-                        global_names[#global_names + 1] = mw_name(mw, j, "global_mw_")
-                    end
-                    overrides["__global"] = global_names
-                end
-                redis.set("keyway:mw:overrides", json.encode(overrides))
-            end)
-
             response.json_response(ctx, 200, { ok = true, pattern = pattern })
         end,
     },
@@ -463,74 +385,6 @@ keyway.routes = {
             _mw_name_cache = setmetatable({}, { __mode = "k" })
 
             response.json_response(ctx, 200, { ok = true })
-        end,
-    },
-
-    -- Sync: load overrides from Redis and apply to in-memory routes
-    ["/__keyway/api/middleware/sync"] = {
-        POST = function(ctx)
-            local ok_redis, redis = pcall(require, "keyway.redis_ring")
-            if not ok_redis then
-                response.json_response(ctx, 200, { synced = false, reason = "redis not available" })
-                return
-            end
-
-            local data, err = redis.get("keyway:mw:overrides")
-            if not data then
-                response.json_response(ctx, 200, { synced = false, reason = err or "no overrides saved" })
-                return
-            end
-
-            local ok_json, overrides = pcall(json.decode, data)
-            if not ok_json then
-                response.json_response(ctx, 200, { synced = false, reason = "invalid json in redis" })
-                return
-            end
-
-            local applied = 0
-
-            -- Apply global middleware
-            if overrides["__global"] then
-                local resolved = {}
-                local all_ok = true
-                for _, name in ipairs(overrides["__global"]) do
-                    local fn = keyway.middleware._registry[name]
-                    if fn then
-                        resolved[#resolved + 1] = fn
-                    else
-                        all_ok = false
-                    end
-                end
-                if all_ok and #resolved > 0 then
-                    keyway.routes.middleware = resolved
-                    applied = applied + 1
-                end
-            end
-
-            -- Apply per-route overrides
-            for pattern, names in pairs(overrides) do
-                if pattern ~= "__global" and keyway.routes[pattern] then
-                    local resolved = {}
-                    local all_ok = true
-                    for _, name in ipairs(names) do
-                        local fn = keyway.middleware._registry[name]
-                        if fn then
-                            resolved[#resolved + 1] = fn
-                        else
-                            all_ok = false
-                        end
-                    end
-                    if all_ok then
-                        keyway.routes[pattern].middleware = resolved
-                        applied = applied + 1
-                    end
-                end
-            end
-
-            -- Clear mw_name cache
-            _mw_name_cache = setmetatable({}, { __mode = "k" })
-
-            response.json_response(ctx, 200, { synced = true, applied = applied })
         end,
     },
 
