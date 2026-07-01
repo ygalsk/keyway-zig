@@ -22,18 +22,18 @@ pub fn main(init: std.process.Init.Minimal) !void {
 
     // Parse CLI arguments (falls back to env vars, then defaults)
     const cli_config = cli.parse(allocator, init.args) catch |err| {
-        cli.printHelp();
-        std.log.err("CLI parse error: {}", .{err});
+        cli.printStderr("keyway: error parsing arguments: {}\n", .{err}) catch {};
+        cli.printHelp() catch {}; // best-effort: already exiting non-zero
         std.process.exit(1);
     };
 
     if (cli_config.show_help) {
-        cli.printHelp();
+        try cli.printHelp();
         return;
     }
 
     if (cli_config.show_version) {
-        std.debug.print("keyway {s}\n", .{version});
+        try cli.printStderr("keyway {s}\n", .{version});
         return;
     }
 

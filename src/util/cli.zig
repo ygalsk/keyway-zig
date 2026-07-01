@@ -160,8 +160,21 @@ fn parseLogLevel(val: []const u8) ?std.log.Level {
     return null;
 }
 
+/// Write formatted output to stderr, propagating write errors instead of
+/// silently discarding them the way `std.debug.print` does. Used for CLI
+/// diagnostics (help, version) that must not vanish. Bypasses the `Io`
+/// interface, which is not yet set up during argument parsing.
+pub fn printStderr(comptime fmt: []const u8, args: anytype) !void {
+    var buffer: [256]u8 = undefined;
+    const stderr = std.debug.lockStderr(&buffer);
+    defer std.debug.unlockStderr();
+    const w = &stderr.file_writer.interface;
+    try w.print(fmt, args);
+    try w.flush();
+}
+
 /// Print usage information to stderr.
-pub fn printHelp() void {
+pub fn printHelp() !void {
     const usage =
         \\Usage: keyway [OPTIONS]
         \\
@@ -182,7 +195,7 @@ pub fn printHelp() void {
         \\  -v, --version       Show version information
         \\
     ;
-    std.debug.print("{s}", .{usage});
+    try printStderr("{s}", .{usage});
 }
 
 // ---------------------------------------------------------------------------
