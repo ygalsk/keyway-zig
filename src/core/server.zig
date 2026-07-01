@@ -37,7 +37,6 @@ pub const Server = struct {
     tls_ctx: ?TlsContext,
     sse_registry: ?*SseRegistry,
     metrics: *WorkerMetrics,
-    all_worker_metrics: []const *WorkerMetrics = &.{},
     draining: bool = false,
     connections: Connection.List = .{},
 
@@ -216,7 +215,6 @@ pub const Server = struct {
         // Connection limit: reject when over MAX_CONNECTIONS_PER_WORKER
         if (self.metrics.active_connections.load(.monotonic) >= tuning.MAX_CONNECTIONS_PER_WORKER) {
             helpers.closeFd(client_socket);
-            self.metrics.incrementRejectedConnections();
             prom.connectionRejected();
             self.acceptNext();
             return .disarm;

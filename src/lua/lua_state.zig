@@ -39,10 +39,8 @@ const embedded_modules = .{
     .{ "keyway.socket", stdlib.socket },
     .{ "keyway.ring", stdlib.ring },
     .{ "keyway.dns", stdlib.dns },
-    .{ "keyway.db_socket", stdlib.db_socket },
     .{ "keyway.form", stdlib.form },
     .{ "keyway.response", stdlib.response },
-    .{ "keyway.crypto", stdlib.crypto },
     .{ "keyway.http", stdlib.http },
     .{ "keyway.json", stdlib.json },
 };
@@ -674,8 +672,8 @@ pub const LuaState = struct {
         self.lua.doString(
             \\local keep = {
             \\    ["keyway"] = true, ["keyway.socket"] = true, ["keyway.ring"] = true,
-            \\    ["keyway.dns"] = true, ["keyway.db_socket"] = true, ["keyway.form"] = true,
-            \\    ["keyway.response"] = true, ["keyway.crypto"] = true, ["keyway.http"] = true,
+            \\    ["keyway.dns"] = true, ["keyway.form"] = true,
+            \\    ["keyway.response"] = true, ["keyway.http"] = true,
             \\    ["string"] = true, ["table"] = true, ["math"] = true, ["io"] = true,
             \\    ["os"] = true, ["debug"] = true, ["coroutine"] = true, ["package"] = true,
             \\    ["bit"] = true, ["ffi"] = true, ["jit"] = true, ["jit.opt"] = true,
@@ -855,10 +853,8 @@ test "embedded stdlib modules are preloaded" {
     try state.loadString("assert(type(package.preload['keyway.socket']) == 'function')");
     try state.loadString("assert(type(package.preload['keyway.ring']) == 'function')");
     try state.loadString("assert(type(package.preload['keyway.dns']) == 'function')");
-    try state.loadString("assert(type(package.preload['keyway.db_socket']) == 'function')");
     try state.loadString("assert(type(package.preload['keyway.form']) == 'function')");
     try state.loadString("assert(type(package.preload['keyway.response']) == 'function')");
-    try state.loadString("assert(type(package.preload['keyway.crypto']) == 'function')");
     try state.loadString("assert(type(package.preload['keyway.http']) == 'function')");
     try state.loadString("assert(type(package.preload['keyway.json']) == 'function')");
 }
