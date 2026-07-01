@@ -1,6 +1,7 @@
 const std = @import("std");
 const log = @import("../observability/log.zig");
 const config = @import("../util/config.zig");
+const helpers = @import("../util/helpers.zig");
 const c = @cImport({
     @cInclude("openssl/ssl.h");
     @cInclude("openssl/err.h");
@@ -813,9 +814,9 @@ pub const TlsManager = struct {
 
         // Custom mTLS context from env vars (for any mTLS target)
         const custom_tls_ctx: ?ClientTlsContext = blk: {
-            const ca = std.posix.getenv("KEYWAY_MTLS_CA") orelse break :blk null;
-            const cert = std.posix.getenv("KEYWAY_MTLS_CERT") orelse break :blk null;
-            const key = std.posix.getenv("KEYWAY_MTLS_KEY") orelse break :blk null;
+            const ca = helpers.getenv("KEYWAY_MTLS_CA") orelse break :blk null;
+            const cert = helpers.getenv("KEYWAY_MTLS_CERT") orelse break :blk null;
+            const key = helpers.getenv("KEYWAY_MTLS_KEY") orelse break :blk null;
             const ctx = ClientTlsContext.init(.{
                 .verify = true,
                 .ca_path = @ptrCast(ca.ptr),

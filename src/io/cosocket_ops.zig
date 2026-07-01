@@ -11,6 +11,7 @@
 //! After kTLS: send/recv are plaintext — the kernel handles crypto transparently.
 
 const std = @import("std");
+const helpers = @import("../util/helpers.zig");
 const xev = @import("xev");
 const Lua = @import("luajit").Lua;
 
@@ -29,6 +30,11 @@ const TlsMode = io_request_mod.TlsMode;
 const LuaState = @import("../lua/lua_state.zig").LuaState;
 
 const cosocket = @import("cosocket.zig");
+
+/// libxev's connect-op address type (its internal sockaddr union) isn't exported
+/// at the `xev` root; pull it off the Completion op so we can convert an
+/// `std.Io.net.IpAddress` into what the raw connect op expects.
+const XevConnectAddr = @FieldType(@FieldType(@FieldType(xev.Completion, "op"), "connect"), "addr");
 
 const error_response = @import("../http/error_response.zig");
 const ErrorCategory = error_response.ErrorCategory;
@@ -68,7 +74,7 @@ pub fn selectClientTlsCtx(lua_state: *LuaState, mode: TlsMode) @TypeOf(lua_state
     return switch (mode) {
         .verify => lua_state.tls_manager.client_tls_ctx.ctx,
         .insecure => blk: {
-            if (std.posix.getenv("KEYWAY_ALLOW_INSECURE_TLS")) |v| {
+            if (helpers.getenv("KEYWAY_ALLOW_INSECURE_TLS")) |v| {
                 if (std.mem.eql(u8, v, "1")) break :blk lua_state.tls_manager.insecure_tls_ctx.ctx;
             }
             const log = @import("../observability/log.zig");
@@ -85,7 +91,7 @@ pub fn selectClientTlsCtx(lua_state: *LuaState, mode: TlsMode) @TypeOf(lua_state
 
 /// Helper: create TCP socket and submit connect for batched I/O
 pub fn submitBatchConnect(self: *Connection, host: []const u8, port: u16, io_index: u8, _: IoEntry.Op) void {
-    const sock = std.posix.socket(
+    const sock = helpers.socket(
         std.posix.AF.INET,
         std.posix.SOCK.STREAM | std.posix.SOCK.CLOEXEC,
         0,
@@ -94,14 +100,14 @@ pub fn submitBatchConnect(self: *Connection, host: []const u8, port: u16, io_ind
         return;
     };
 
-    const addr = std.net.Address.parseIp4(host, port) catch {
-        std.posix.close(sock);
+    const addr = std.Io.net.IpAddress.parseIp4(host, port) catch {
+        helpers.closeFd(sock);
         self.cs.cq.push(.{ .result = -1, .err_msg = "connect: invalid address", .err_category = .upstream_error });
         return;
     };
 
     self.cs.batch_completions.?[io_index] = .{
-        .op = .{ .connect = .{ .socket = sock, .addr = addr } },
+        .op = .{ .connect = .{ .socket = sock, .addr = XevConnectAddr.fromIpAddress(addr) } },
         .userdata = self,
         .callback = cosocket.onBatchComplete,
     };
@@ -111,7 +117,7 @@ pub fn submitBatchConnect(self: *Connection, host: []const u8, port: u16, io_ind
 
 /// Helper: create UDP socket and submit connect for batched I/O
 pub fn submitBatchUdpConnect(self: *Connection, host: []const u8, port: u16, timeout_ms: u32, io_index: u8) void {
-    const sock = std.posix.socket(
+    const sock = helpers.socket(
         std.posix.AF.INET,
         std.posix.SOCK.DGRAM | std.posix.SOCK.CLOEXEC,
         0,
@@ -128,14 +134,14 @@ pub fn submitBatchUdpConnect(self: *Connection, host: []const u8, port: u16, tim
         _ = std.posix.setsockopt(sock, std.posix.SOL.SOCKET, std.posix.SO.RCVTIMEO, std.mem.asBytes(&tv)) catch {};
     }
 
-    const addr = std.net.Address.parseIp4(host, port) catch {
-        std.posix.close(sock);
+    const addr = std.Io.net.IpAddress.parseIp4(host, port) catch {
+        helpers.closeFd(sock);
         self.cs.cq.push(.{ .result = -1, .err_msg = "udp_connect: invalid address", .err_category = .upstream_error });
         return;
     };
 
     self.cs.batch_completions.?[io_index] = .{
-        .op = .{ .connect = .{ .socket = sock, .addr = addr } },
+        .op = .{ .connect = .{ .socket = sock, .addr = XevConnectAddr.fromIpAddress(addr) } },
         .userdata = self,
         .callback = cosocket.onBatchComplete,
     };

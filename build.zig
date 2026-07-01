@@ -83,14 +83,14 @@ fn addSharedDeps(
     compile.root_module.addImport("stdlib", b.createModule(.{
         .root_source_file = b.path("lua/stdlib.zig"),
     }));
-    compile.addCSourceFile(.{
+    compile.root_module.addCSourceFile(.{
         .file = b.path("vendor/picohttpparser.c"),
         .flags = &.{"-std=c99"},
     });
-    compile.addIncludePath(b.path("vendor"));
-    compile.linkLibC();
-    compile.linkSystemLibrary("ssl");
-    compile.linkSystemLibrary("crypto");
+    compile.root_module.addIncludePath(b.path("vendor"));
+    compile.root_module.link_libc = true;
+    compile.root_module.linkSystemLibrary("ssl", .{});
+    compile.root_module.linkSystemLibrary("crypto", .{});
 
     // GCC 15's crt1.o has .sframe sections with R_X86_64_PC64 relocations that
     // Zig's bundled lld can't handle. --gc-sections discards unreferenced .sframe.

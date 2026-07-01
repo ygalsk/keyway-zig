@@ -13,6 +13,7 @@ const Connection = handler_mod.Connection;
 const http = @import("http.zig");
 const config = @import("../util/config.zig");
 const castUserdata = @import("../util/helpers.zig").castUserdata;
+const helpers = @import("../util/helpers.zig");
 const error_response = @import("error_response.zig");
 const router_mod = @import("router.zig");
 
@@ -24,7 +25,7 @@ pub const StaticState = struct {
     read_buf: []u8,
 
     pub fn deinit(self: *StaticState, allocator: std.mem.Allocator) void {
-        std.posix.close(self.fd);
+        helpers.closeFd(self.fd);
         allocator.free(self.read_buf);
     }
 };
@@ -142,10 +143,26 @@ pub fn serveStaticFile(
 
     // Resolve symlinks and verify the real path is still within root.
     // real_root was resolved once at route registration (avoids per-request realpathAlloc).
-    const real_resolved = std.fs.cwd().realpathAlloc(alloc, resolved) catch {
-        self.logAccess(404);
-        self.send404NotFound();
-        return;
+    var resolve_io: std.Io.Threaded = .init(alloc, .{});
+    defer resolve_io.deinit();
+    const real_resolved = blk: {
+        var rh = std.Io.Dir.cwd().openDir(resolve_io.io(), resolved, .{}) catch {
+            self.logAccess(404);
+            self.send404NotFound();
+            return;
+        };
+        defer rh.close(resolve_io.io());
+        var pbuf: [std.fs.max_path_bytes]u8 = undefined;
+        const n = rh.realPath(resolve_io.io(), &pbuf) catch {
+            self.logAccess(404);
+            self.send404NotFound();
+            return;
+        };
+        break :blk alloc.dupe(u8, pbuf[0..n]) catch {
+            self.logAccess(500);
+            self.send500InternalError();
+            return;
+        };
     };
     if (!std.mem.startsWith(u8, real_resolved, route.real_root)) {
         self.logAccess(403);
@@ -159,7 +176,9 @@ pub fn serveStaticFile(
         self.send500InternalError();
         return;
     };
-    const file = std.fs.openFileAbsoluteZ(resolved_z, .{}) catch {
+    var open_io: std.Io.Threaded = .init(alloc, .{});
+    defer open_io.deinit();
+    const file = std.Io.Dir.openFileAbsolute(open_io.io(), resolved_z, .{}) catch {
         self.logAccess(404);
         self.send404NotFound();
         return;
@@ -167,44 +186,45 @@ pub fn serveStaticFile(
     const fd = file.handle;
 
     // Stat for size + mtime
-    const stat = std.posix.fstat(fd) catch {
-        std.posix.close(fd);
+    const stat = file.stat(open_io.io()) catch {
+        helpers.closeFd(fd);
         self.logAccess(500);
         self.send500InternalError();
         return;
     };
 
     // Reject directories
-    if (stat.mode & std.posix.S.IFMT == std.posix.S.IFDIR) {
-        std.posix.close(fd);
+    if (stat.kind == .directory) {
+        helpers.closeFd(fd);
         self.logAccess(403);
         error_response.sendErrorStatus(self, 403, "is a directory");
         return;
     }
 
-    const file_size: u64 = @intCast(@max(0, stat.size));
+    const file_size: u64 = stat.size;
 
     // Size limit check
     if (file_size > config.STATIC_MAX_SIZE) {
-        std.posix.close(fd);
+        helpers.closeFd(fd);
         self.logAccess(413);
         error_response.sendErrorStatus(self, 413, "file too large");
         return;
     }
 
     // ETag: use inode + mtime + size
-    const mtime_sec = stat.mtim.sec;
+    const mtime_ns: i96 = stat.mtime.nanoseconds;
+    const mtime_sec: i64 = @intCast(@divFloor(mtime_ns, std.time.ns_per_s));
     var etag_buf: [64]u8 = undefined;
     const etag = std.fmt.bufPrint(&etag_buf, "\"{x}-{x}-{x}\"", .{
-        @as(u64, @bitCast(stat.ino)),
-        @as(u64, @bitCast(mtime_sec)),
+        stat.inode,
+        mtime_ns,
         file_size,
     }) catch "";
 
     // Check If-None-Match (use already-parsed headers, not raw buffer)
     if (http.Parser.getHeader(request, "If-None-Match")) |inm| {
         if (std.mem.eql(u8, inm, etag)) {
-            std.posix.close(fd);
+            helpers.closeFd(fd);
             self.logAccess(304);
             self.sendRawResponse("HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\n\r\n");
             return;
@@ -223,7 +243,7 @@ pub fn serveStaticFile(
         etag,
         &last_modified_buf,
     }) catch {
-        std.posix.close(fd);
+        helpers.closeFd(fd);
         self.logAccess(500);
         self.send500InternalError();
         return;
@@ -233,7 +253,7 @@ pub fn serveStaticFile(
 
     if (file_size == 0) {
         // Empty file — just send headers
-        std.posix.close(fd);
+        helpers.closeFd(fd);
         self.sendRawResponse(headers_text);
         return;
     }
@@ -241,24 +261,24 @@ pub fn serveStaticFile(
     // Small file fast path: single allocation, pread directly into combined buffer
     if (file_size <= config.STATIC_READ_SIZE) {
         const combined = alloc.alloc(u8, headers_text.len + @as(usize, @intCast(file_size))) catch {
-            std.posix.close(fd);
+            helpers.closeFd(fd);
             self.send500InternalError();
             return;
         };
         @memcpy(combined[0..headers_text.len], headers_text);
-        const bytes_read = std.posix.pread(fd, combined[headers_text.len..], 0) catch {
-            std.posix.close(fd);
+        const bytes_read = helpers.pread(fd, combined[headers_text.len..], 0) catch {
+            helpers.closeFd(fd);
             self.send500InternalError();
             return;
         };
-        std.posix.close(fd);
+        helpers.closeFd(fd);
         self.sendRawResponse(combined[0 .. headers_text.len + bytes_read]);
         return;
     }
 
     // Large file: send headers first, then pread+send loop
     const read_buf = self.base_allocator.alloc(u8, config.STATIC_READ_SIZE) catch {
-        std.posix.close(fd);
+        helpers.closeFd(fd);
         self.send500InternalError();
         return;
     };
@@ -301,7 +321,7 @@ fn sendNextChunk(self: *Connection) void {
     const remaining = ss.file_size - ss.bytes_sent;
     const to_read = @min(remaining, ss.read_buf.len);
 
-    const bytes_read = std.posix.pread(ss.fd, ss.read_buf[0..to_read], ss.bytes_sent) catch {
+    const bytes_read = helpers.pread(ss.fd, ss.read_buf[0..to_read], ss.bytes_sent) catch {
         self.close();
         return;
     };

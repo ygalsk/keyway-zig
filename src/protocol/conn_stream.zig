@@ -36,11 +36,11 @@ pub fn handleStreamUpgrade(self: *Connection, exchange: *HttpExchange) void {
 
     const alloc = self.arena.allocator();
     const estimated: usize = 512;
-    var header_buf = std.ArrayList(u8).initCapacity(alloc, estimated) catch {
+    var header_buf: std.Io.Writer.Allocating = std.Io.Writer.Allocating.initCapacity(alloc, estimated) catch {
         self.send500InternalError();
         return;
     };
-    response.serializeChunkedHeaders(header_buf.writer(alloc)) catch {
+    response.serializeChunkedHeaders(&header_buf.writer) catch {
         self.send500InternalError();
         return;
     };
@@ -62,13 +62,13 @@ pub fn handleStreamUpgrade(self: *Connection, exchange: *HttpExchange) void {
             self.send500InternalError();
             return;
         };
-        header_buf.appendSlice(alloc, chunk) catch {
+        header_buf.writer.writeAll(chunk) catch {
             self.send500InternalError();
             return;
         };
     }
 
-    self.submitSend(header_buf.items, onStreamWrite, false);
+    self.submitSend(header_buf.writer.buffered(), onStreamWrite, false);
 }
 
 /// Callback after a stream write completes — resume coroutine for next chunk.

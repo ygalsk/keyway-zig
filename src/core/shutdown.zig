@@ -113,7 +113,7 @@ pub fn registerSignalHandlers(coordinator: *ShutdownCoordinator) void {
     std.posix.sigaction(std.posix.SIG.INT, &act, null);
 }
 
-fn signalHandler(_: c_int) callconv(.c) void {
+fn signalHandler(_: std.posix.SIG) callconv(.c) void {
     if (global_coordinator) |coord| {
         coord.signalReceived();
     }

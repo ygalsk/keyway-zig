@@ -30,9 +30,20 @@ node_modules/
 # Planning artifacts
 .planning/
 
+# Serena (local semantic-nav tooling)
+.serena/
+
+# Regenerable analysis artifacts (review skill, graphify skill)
+review/
+graphify-out/
+src/graphify-out/
+
 # Test results
 tests/test-results/
 
 # Profiling
 perf.data*
 *.svg
+
+# Zig fetched dependency cache (regenerable from build.zig.zon)
+zig-pkg/

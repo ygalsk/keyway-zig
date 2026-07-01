@@ -1,4 +1,5 @@
 const std = @import("std");
+const helpers = @import("../util/helpers.zig");
 
 /// Per-worker connection pool for cosocket connections.
 /// Keyed by destination string (e.g. "127.0.0.1:6379"), LIFO retrieval,
@@ -38,7 +39,7 @@ pub const ConnectionPool = struct {
         while (it.next()) |entry| {
             // Close all pooled fds
             for (entry.value_ptr.entries.items) |pool_entry| {
-                std.posix.close(pool_entry.fd);
+                helpers.closeFd(pool_entry.fd);
             }
             entry.value_ptr.entries.deinit(self.allocator);
             // Free duped key
@@ -51,7 +52,7 @@ pub const ConnectionPool = struct {
     /// Returns null if no live connection available.
     pub fn get(self: *ConnectionPool, key: []const u8) ?PoolEntry {
         const pool = self.pools.getPtr(key) orelse return null;
-        const now = std.time.milliTimestamp();
+        const now = @divTrunc(helpers.monotonicNanos(), std.time.ns_per_ms);
 
         // Pop from back (LIFO) — most recently returned connection reused first
         while (pool.entries.items.len > 0) {
@@ -60,7 +61,7 @@ pub const ConnectionPool = struct {
             pool.entries.items.len = len - 1;
             if (@max(0, now - entry.inserted_at_ms) > @as(i64, pool.max_idle_ms)) {
                 // Expired — close and continue
-                std.posix.close(entry.fd);
+                helpers.closeFd(entry.fd);
                 continue;
             }
             return entry;
@@ -70,7 +71,7 @@ pub const ConnectionPool = struct {
 
     /// Sweep all pools, closing expired entries. Called periodically by the worker timer.
     pub fn sweep(self: *ConnectionPool) void {
-        const now = std.time.milliTimestamp();
+        const now = @divTrunc(helpers.monotonicNanos(), std.time.ns_per_ms);
         var it = self.pools.iterator();
         while (it.next()) |entry| {
             const pool = entry.value_ptr;
@@ -80,7 +81,7 @@ pub const ConnectionPool = struct {
                 i -= 1;
                 const pe = pool.entries.items[i];
                 if (@max(0, now - pe.inserted_at_ms) > @as(i64, pool.max_idle_ms)) {
-                    std.posix.close(pe.fd);
+                    helpers.closeFd(pe.fd);
                     _ = pool.entries.swapRemove(i);
                 }
             }
@@ -106,7 +107,7 @@ pub const ConnectionPool = struct {
             // First insertion — dupe the key, initialize the pool
             gop.key_ptr.* = try self.allocator.dupe(u8, key);
             gop.value_ptr.* = .{
-                .entries = .{},
+                .entries = .empty,
                 .max_size = effective_size,
                 .max_idle_ms = effective_timeout,
             };
@@ -116,14 +117,14 @@ pub const ConnectionPool = struct {
 
         // Enforce max size
         if (pool.entries.items.len >= pool.max_size) {
-            std.posix.close(fd);
+            helpers.closeFd(fd);
             return;
         }
 
         try pool.entries.append(self.allocator, .{
             .fd = fd,
             .reuse_count = reuse_count,
-            .inserted_at_ms = std.time.milliTimestamp(),
+            .inserted_at_ms = @divTrunc(helpers.monotonicNanos(), std.time.ns_per_ms),
         });
     }
 };
@@ -148,8 +149,8 @@ test "connection pool put and get roundtrip" {
     defer pool.deinit();
 
     // Use a pipe fd as a stand-in for a real socket (safe to close)
-    const pipes = try std.posix.pipe();
-    std.posix.close(pipes[0]); // close read end, keep write end as our "fd"
+    const pipes = try helpers.pipe();
+    helpers.closeFd(pipes[0]); // close read end, keep write end as our "fd"
     const fake_fd = pipes[1];
 
     try pool.put("127.0.0.1:6379", fake_fd, 0, 0, 0);
@@ -164,7 +165,7 @@ test "connection pool put and get roundtrip" {
     try std.testing.expect(entry2 == null);
 
     // Close the fd we got back
-    std.posix.close(fake_fd);
+    helpers.closeFd(fake_fd);
 }
 
 test "connection pool LIFO order" {
@@ -172,12 +173,12 @@ test "connection pool LIFO order" {
     defer pool.deinit();
 
     // Create two pipe fds
-    const pipes1 = try std.posix.pipe();
-    std.posix.close(pipes1[0]);
+    const pipes1 = try helpers.pipe();
+    helpers.closeFd(pipes1[0]);
     const fd1 = pipes1[1];
 
-    const pipes2 = try std.posix.pipe();
-    std.posix.close(pipes2[0]);
+    const pipes2 = try helpers.pipe();
+    helpers.closeFd(pipes2[0]);
     const fd2 = pipes2[1];
 
     try pool.put("host:1234", fd1, 0, 0, 0);
@@ -192,8 +193,8 @@ test "connection pool LIFO order" {
     try std.testing.expect(second != null);
     try std.testing.expectEqual(fd1, second.?.fd);
 
-    std.posix.close(fd1);
-    std.posix.close(fd2);
+    helpers.closeFd(fd1);
+    helpers.closeFd(fd2);
 }
 
 test "connection pool max size enforcement" {
@@ -201,12 +202,12 @@ test "connection pool max size enforcement" {
     defer pool.deinit();
 
     // Put with max_size=1
-    const pipes1 = try std.posix.pipe();
-    std.posix.close(pipes1[0]);
+    const pipes1 = try helpers.pipe();
+    helpers.closeFd(pipes1[0]);
     const fd1 = pipes1[1];
 
-    const pipes2 = try std.posix.pipe();
-    std.posix.close(pipes2[0]);
+    const pipes2 = try helpers.pipe();
+    helpers.closeFd(pipes2[0]);
     const fd2 = pipes2[1];
 
     try pool.put("host:80", fd1, 0, 0, 1); // max_size=1
@@ -220,7 +221,7 @@ test "connection pool max size enforcement" {
     const entry2 = pool.get("host:80");
     try std.testing.expect(entry2 == null);
 
-    std.posix.close(fd1);
+    helpers.closeFd(fd1);
     // fd2 was closed by put() — do not close again
 }
 
@@ -228,8 +229,8 @@ test "connection pool default values for zero args" {
     var pool = ConnectionPool.init(std.testing.allocator);
     defer pool.deinit();
 
-    const pipes = try std.posix.pipe();
-    std.posix.close(pipes[0]);
+    const pipes = try helpers.pipe();
+    helpers.closeFd(pipes[0]);
     const fd = pipes[1];
 
     // Put with 0,0 — should use defaults
@@ -241,5 +242,5 @@ test "connection pool default values for zero args" {
 
     // Clean up
     const entry = pool.get("host:80");
-    if (entry) |e| std.posix.close(e.fd);
+    if (entry) |e| helpers.closeFd(e.fd);
 }

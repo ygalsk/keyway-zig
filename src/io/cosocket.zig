@@ -32,6 +32,7 @@ const Lua = @import("luajit").Lua;
 const error_response = @import("../http/error_response.zig");
 const ErrorCategory = error_response.ErrorCategory;
 const castUserdata = @import("../util/helpers.zig").castUserdata;
+const helpers = @import("../util/helpers.zig");
 
 const cosocket_ops = @import("cosocket_ops.zig");
 const cosocket_tls = @import("../tls/cosocket_tls.zig");
@@ -314,7 +315,7 @@ pub fn onBatchComplete(
 
     if (op == .connect) {
         _ = result.connect catch {
-            std.posix.close(completion.op.connect.socket);
+            helpers.closeFd(completion.op.connect.socket);
             const classified = classifyOpError(op);
             self.cs.cq.push(.{ .result = -1, .err_msg = classified.msg, .err_category = classified.category });
             batchCompletionCheck(self);
@@ -391,7 +392,7 @@ fn batchCompletionCheck(self: *Connection) void {
                     s.coroutine_ref = 0;
                 }
                 if (s.outbound_fd != -1) {
-                    std.posix.close(s.outbound_fd);
+                    helpers.closeFd(s.outbound_fd);
                     s.outbound_fd = -1;
                 }
                 s.recv_buf = null;

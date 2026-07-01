@@ -15,13 +15,13 @@ pub const std_options: std.Options = .{
     .logFn = log.logFn,
 };
 
-pub fn main() !void {
-    var gpa = std.heap.GeneralPurposeAllocator(.{}){};
+pub fn main(init: std.process.Init.Minimal) !void {
+    var gpa = std.heap.DebugAllocator(.{}){};
     defer _ = gpa.deinit();
     const allocator = gpa.allocator();
 
     // Parse CLI arguments (falls back to env vars, then defaults)
-    const cli_config = cli.parse(allocator) catch |err| {
+    const cli_config = cli.parse(allocator, init.args) catch |err| {
         cli.printHelp();
         std.log.err("CLI parse error: {}", .{err});
         std.process.exit(1);
@@ -33,10 +33,7 @@ pub fn main() !void {
     }
 
     if (cli_config.show_version) {
-        var buf: [64]u8 = undefined;
-        const stderr = std.debug.lockStderrWriter(&buf);
-        defer std.debug.unlockStderrWriter();
-        stderr.print("keyway {s}\n", .{version}) catch {};
+        std.debug.print("keyway {s}\n", .{version});
         return;
     }
 

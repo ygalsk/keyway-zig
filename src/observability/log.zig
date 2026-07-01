@@ -8,6 +8,11 @@ pub threadlocal var worker_id: u16 = 0;
 /// Track whether logz has been initialized (guards against pre-init logging in tests).
 var initialized = false;
 
+/// Backing I/O for the logz pool. The 0.16 logz dep drives its pool through a
+/// `std.Io` rather than managing threads itself; this owns that io for the
+/// process lifetime. logz was already a self-threaded subsystem pre-0.16.
+var log_io: std.Io.Threaded = undefined;
+
 /// Map std.log.Level to logz.Level.
 fn toLogzLevel(level: std.log.Level) logz.Level {
     return switch (level) {
@@ -24,7 +29,8 @@ pub fn init(allocator: std.mem.Allocator, level: std.log.Level, log_format: cli.
         .logfmt => .logfmt,
         .json => .json,
     };
-    try logz.setup(allocator, .{
+    log_io = .init(allocator, .{});
+    try logz.setup(log_io.io(), allocator, .{
         .level = toLogzLevel(level),
         .pool_size = @intCast(num_workers * 4),
         .output = .stderr,
@@ -37,6 +43,7 @@ pub fn init(allocator: std.mem.Allocator, level: std.log.Level, log_format: cli.
 pub fn deinit() void {
     if (initialized) {
         logz.deinit();
+        log_io.deinit();
         initialized = false;
     }
 }
@@ -77,7 +84,7 @@ pub fn accessLog(method: []const u8, path: []const u8, status: u16, dur_us: i64)
 /// Bridge: route std.log calls through logz so dependency/stdlib logging is consistent.
 pub fn logFn(
     comptime level: std.log.Level,
-    comptime scope: @Type(.enum_literal),
+    comptime scope: @EnumLiteral(),
     comptime format: []const u8,
     args: anytype,
 ) void {

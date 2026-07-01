@@ -28,6 +28,7 @@ const config = @import("../util/config.zig");
 const params = @import("../http/params.zig");
 const conn_tls = @import("../tls/conn_tls.zig");
 const castUserdata = @import("../util/helpers.zig").castUserdata;
+const helpers = @import("../util/helpers.zig");
 const conn_sse = @import("../protocol/conn_sse.zig");
 const conn_ws = @import("../protocol/conn_ws.zig");
 const conn_stream = @import("../protocol/conn_stream.zig");
@@ -68,7 +69,7 @@ const LARGE_RESPONSE_THRESHOLD = config.LARGE_RESPONSE_THRESHOLD;
 
 /// Per-request HTTP state — reset between keep-alive requests.
 pub const HttpState = struct {
-    request_start_ns: i128 = 0,
+    request_start_ns: i64 = 0,
     request_method: []const u8 = "",
     request_path: []const u8 = "",
     request_raw_len: usize = 0, // total bytes consumed by current request (headers + body)
@@ -292,7 +293,7 @@ pub const Connection = struct {
                 self.lua_state.lua.unref(Lua.PseudoIndex.Registry, s.coroutine_ref);
             }
             // Close leaked outbound fd
-            if (s.outbound_fd != -1) std.posix.close(s.outbound_fd);
+            if (s.outbound_fd != -1) helpers.closeFd(s.outbound_fd);
             // Free outbound TLS state if mid-handshake (#21)
             s.cleanupTls(self.base_allocator);
         }
@@ -310,7 +311,7 @@ pub const Connection = struct {
         if (self.static_state) |*ss| ss.deinit(self.base_allocator);
         // Clean up TLS resources
         self.tls_state.deinit(self.base_allocator);
-        std.posix.close(self.socket);
+        helpers.closeFd(self.socket);
         self.arena.deinit();
         // param_cache/query_cache are inline structs, no deinit needed
         self.base_allocator.free(self.read_buffer.data);
@@ -545,7 +546,7 @@ pub const Connection = struct {
     }
 
     pub fn logAccess(self: *Connection, status: u16) void {
-        const dur_us: i64 = @intCast(@divTrunc(std.time.nanoTimestamp() - self.http_state.request_start_ns, 1000));
+        const dur_us: i64 = @intCast(@divTrunc(helpers.monotonicNanos() - self.http_state.request_start_ns, 1000));
         log.accessLog(self.http_state.request_method, self.http_state.request_path, status, dur_us);
         // Record metrics (latency + error tracking)
         const latency_us: u64 = @intCast(@max(0, dur_us));
@@ -669,7 +670,7 @@ pub const Connection = struct {
     /// error response is already in flight).
     pub fn handleRequest(self: *Connection) void {
         self.state = .processing;
-        self.http_state.request_start_ns = std.time.nanoTimestamp();
+        self.http_state.request_start_ns = helpers.monotonicNanos();
 
         const request = self.parseRequest() catch return;
         // Headers received successfully — cancel header timeout
@@ -759,14 +760,15 @@ pub const Connection = struct {
         prom.recordResponseBodySize(response.body.len);
         // Pre-size to avoid repeated ArrayList growth in arena (old buffers can't be freed)
         const estimated = response.body.len + 512;
-        var response_buf = try std.ArrayList(u8).initCapacity(alloc, estimated);
-        try response.serialize(response_buf.writer(alloc));
+        var response_buf: std.Io.Writer.Allocating = try .initCapacity(alloc, estimated);
+        try response.serialize(&response_buf.writer);
+        const response_bytes = response_buf.writer.buffered();
 
         if (self.ws_state != null) {
-            log.debug().string("msg", "ws response buf").int("len", response_buf.items.len).string("content", response_buf.items).log();
+            log.debug().string("msg", "ws response buf").int("len", response_bytes.len).string("content", response_bytes).log();
         }
 
-        self.submitSend(response_buf.items, onWrite, false);
+        self.submitSend(response_bytes, onWrite, false);
     }
 
     /// Submit a send on this connection's socket.
@@ -908,20 +910,39 @@ pub const Connection = struct {
         else
             raw_path;
 
-        // Connect to upstream
-        const stream = std.net.tcpConnectToHost(alloc, proxy_match.route.upstream_host, proxy_match.route.upstream_port) catch {
-            error_response.sendErrorStatus(self, 502, "proxy upstream connect failed");
-            return;
+        // Connect to upstream. std.net is gone in 0.16; this blocking client
+        // uses std.Io.net via a throwaway Threaded io. NOTE: this whole proxy
+        // path blocks the worker thread and should move to async libxev (#29).
+        var proxy_io: std.Io.Threaded = .init(alloc, .{});
+        defer proxy_io.deinit();
+        const pio = proxy_io.io();
+
+        const stream = blk: {
+            if (std.Io.net.IpAddress.parse(proxy_match.route.upstream_host, proxy_match.route.upstream_port)) |ipaddr| {
+                break :blk ipaddr.connect(pio, .{ .mode = .stream }) catch {
+                    error_response.sendErrorStatus(self, 502, "proxy upstream connect failed");
+                    return;
+                };
+            } else |_| {
+                const hostname = std.Io.net.HostName.init(proxy_match.route.upstream_host) catch {
+                    error_response.sendErrorStatus(self, 502, "proxy upstream connect failed");
+                    return;
+                };
+                break :blk hostname.connect(pio, proxy_match.route.upstream_port, .{ .mode = .stream }) catch {
+                    error_response.sendErrorStatus(self, 502, "proxy upstream connect failed");
+                    return;
+                };
+            }
         };
-        defer stream.close();
+        defer stream.close(pio);
 
         // Build upstream HTTP request
-        var req_buf = std.ArrayList(u8).initCapacity(alloc, 1024) catch {
+        var req_buf: std.Io.Writer.Allocating = std.Io.Writer.Allocating.initCapacity(alloc, 1024) catch {
             error_response.sendErrorStatus(self, 502, "proxy request alloc failed");
             return;
         };
-        const req_writer = req_buf.writer(alloc);
-        std.fmt.format(req_writer, "{s} {s} HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\n", .{
+        const req_writer = &req_buf.writer;
+        req_writer.print("{s} {s} HTTP/1.1\r\nHost: {s}:{d}\r\nConnection: close\r\n", .{
             request.method,
             upstream_path,
             proxy_match.route.upstream_host,
@@ -933,7 +954,7 @@ pub const Connection = struct {
         for (request.headers) |h| {
             if (std.ascii.eqlIgnoreCase(h.name, "host")) continue;
             if (std.ascii.eqlIgnoreCase(h.name, "connection")) continue;
-            std.fmt.format(req_writer, "{s}: {s}\r\n", .{ h.name, h.value }) catch {
+            req_writer.print("{s}: {s}\r\n", .{ h.name, h.value }) catch {
                 error_response.sendErrorStatus(self, 502, "proxy header build failed");
                 return;
             };
@@ -944,36 +965,30 @@ pub const Connection = struct {
         };
 
         // Send request + body
-        stream.writeAll(req_buf.items) catch {
+        var send_buf: [8192]u8 = undefined;
+        var upstream_writer = stream.writer(pio, &send_buf);
+        upstream_writer.interface.writeAll(req_buf.writer.buffered()) catch {
             error_response.sendErrorStatus(self, 502, "proxy upstream write failed");
             return;
         };
         if (request.body.len > 0) {
-            stream.writeAll(request.body) catch {
+            upstream_writer.interface.writeAll(request.body) catch {
                 error_response.sendErrorStatus(self, 502, "proxy upstream body write failed");
                 return;
             };
         }
-
-        // Read entire upstream response
-        var resp_buf = std.ArrayList(u8).initCapacity(alloc, 4096) catch {
-            error_response.sendErrorStatus(self, 502, "proxy response alloc failed");
+        upstream_writer.interface.flush() catch {
+            error_response.sendErrorStatus(self, 502, "proxy upstream write failed");
             return;
         };
-        var read_buf: [8192]u8 = undefined;
-        while (true) {
-            const n = stream.read(&read_buf) catch {
-                error_response.sendErrorStatus(self, 502, "proxy upstream read failed");
-                return;
-            };
-            if (n == 0) break;
-            resp_buf.appendSlice(alloc, read_buf[0..n]) catch {
-                error_response.sendErrorStatus(self, 502, "proxy response buffer failed");
-                return;
-            };
-        }
 
-        const upstream_response = resp_buf.items;
+        // Read entire upstream response (blocks until upstream closes)
+        var recv_buf: [8192]u8 = undefined;
+        var upstream_reader = stream.reader(pio, &recv_buf);
+        const upstream_response = upstream_reader.interface.allocRemaining(alloc, .unlimited) catch {
+            error_response.sendErrorStatus(self, 502, "proxy upstream read failed");
+            return;
+        };
         if (upstream_response.len == 0) {
             error_response.sendErrorStatus(self, 502, "proxy upstream empty response");
             return;

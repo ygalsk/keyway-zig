@@ -215,7 +215,7 @@ pub fn processWsFrames(conn: *Connection) void {
                     }
                     wss.fragment_opcode = f.frame.opcode;
                     const alloc = conn.arena.allocator();
-                    var buf = std.ArrayListUnmanaged(u8){};
+                    var buf: std.ArrayListUnmanaged(u8) = .empty;
                     buf.appendSlice(alloc, f.frame.payload) catch {
                         sendWsClose(conn, 1011);
                         return;

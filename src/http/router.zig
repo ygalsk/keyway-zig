@@ -99,8 +99,8 @@ pub const ProxyRoute = struct {
 pub const Router = struct {
     allocator: std.mem.Allocator,
     root: *Node,
-    static_routes: std.ArrayListUnmanaged(StaticRoute) = .{},
-    proxy_routes: std.ArrayListUnmanaged(ProxyRoute) = .{},
+    static_routes: std.ArrayListUnmanaged(StaticRoute) = .empty,
+    proxy_routes: std.ArrayListUnmanaged(ProxyRoute) = .empty,
 
     /// Initialize radix router
     pub fn init(allocator: std.mem.Allocator) !Router {
@@ -116,7 +116,13 @@ pub const Router = struct {
     pub fn addStaticRoute(self: *Router, prefix: []const u8, root_dir: []const u8, index: []const u8) !void {
         const prefix_copy = try self.allocator.dupe(u8, prefix);
         const root_copy = try self.allocator.dupe(u8, root_dir);
-        const real_root = try std.fs.cwd().realpathAlloc(self.allocator, root_dir);
+        var route_io: std.Io.Threaded = .init(self.allocator, .{});
+        defer route_io.deinit();
+        var root_handle = try std.Io.Dir.cwd().openDir(route_io.io(), root_dir, .{});
+        defer root_handle.close(route_io.io());
+        var real_root_buf: [std.fs.max_path_bytes]u8 = undefined;
+        const real_root_len = try root_handle.realPath(route_io.io(), &real_root_buf);
+        const real_root = try self.allocator.dupe(u8, real_root_buf[0..real_root_len]);
         const index_copy = try self.allocator.dupe(u8, index);
         try self.static_routes.append(self.allocator, .{
             .prefix = prefix_copy,
@@ -533,7 +539,7 @@ test "collectLuaRefs gathers all refs" {
     try router.addRoute("POST", "/a", 20);
     try router.addRoute("GET", "/b/{id}", 30);
 
-    var refs: std.ArrayListUnmanaged(i32) = .{};
+    var refs: std.ArrayListUnmanaged(i32) = .empty;
     defer refs.deinit(allocator);
     try router.collectLuaRefs(allocator, &refs);
 

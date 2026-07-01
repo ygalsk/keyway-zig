@@ -5,10 +5,10 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     ca-certificates xz-utils libssl-dev && \
     rm -rf /var/lib/apt/lists/*
 
-# Install Zig 0.15.0
-ADD https://ziglang.org/download/0.15.0/zig-x86_64-linux-0.15.0.tar.xz /tmp/zig.tar.xz
+# Install Zig 0.16.0
+ADD https://ziglang.org/download/0.16.0/zig-x86_64-linux-0.16.0.tar.xz /tmp/zig.tar.xz
 RUN tar -xf /tmp/zig.tar.xz -C /opt && \
-    ln -s /opt/zig-x86_64-linux-0.15.0/zig /usr/local/bin/zig && \
+    ln -s /opt/zig-x86_64-linux-0.16.0/zig /usr/local/bin/zig && \
     rm /tmp/zig.tar.xz
 
 WORKDIR /build
