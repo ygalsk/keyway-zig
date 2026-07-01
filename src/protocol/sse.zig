@@ -1,6 +1,7 @@
 const std = @import("std");
 const xev = @import("xev");
 const config = @import("../util/config.zig");
+const log = @import("../observability/log.zig");
 const handler_mod = @import("../core/handler.zig");
 const Connection = handler_mod.Connection;
 const conn_sse = @import("conn_sse.zig");
@@ -176,13 +177,17 @@ pub const SseBroadcastBus = struct {
 
     /// Publish a message to all workers' inboxes and wake their event loops.
     pub fn publish(self: *SseBroadcastBus, room: []const u8, data: []const u8) void {
-        for (self.slots[0..self.num_workers]) |*slot| {
+        for (self.slots[0..self.num_workers], 0..) |*slot, worker_idx| {
             if (!slot.ready) continue;
 
             // Dupe per-slot (each worker frees its own copy)
-            const room_dupe = self.allocator.dupe(u8, room) catch continue;
+            const room_dupe = self.allocator.dupe(u8, room) catch {
+                logDrop(room, worker_idx);
+                continue;
+            };
             const data_dupe = self.allocator.dupe(u8, data) catch {
                 self.allocator.free(room_dupe);
+                logDrop(room, worker_idx);
                 continue;
             };
 
@@ -191,12 +196,23 @@ pub const SseBroadcastBus = struct {
                 self.allocator.free(room_dupe);
                 self.allocator.free(data_dupe);
                 slot.mutex.unlock(self.io);
+                logDrop(room, worker_idx);
                 continue;
             };
             slot.mutex.unlock(self.io);
 
-            slot.notifier.notify() catch {};
+            // Enqueued, but if the wake fails the worker won't drain until the next notify.
+            slot.notifier.notify() catch |e| {
+                log.warn().string("msg", "SSE broadcast notify failed — worker not woken")
+                    .string("room", room).int("worker_slot", worker_idx).err(e).log();
+            };
         }
+    }
+
+    /// Warn that a broadcast was dropped for one worker (allocation failure).
+    fn logDrop(room: []const u8, worker_idx: usize) void {
+        log.warn().string("msg", "SSE broadcast dropped for worker (out of memory)")
+            .string("room", room).int("worker_slot", worker_idx).log();
     }
 
     /// xev.Async callback — fires on the worker's event loop thread.
