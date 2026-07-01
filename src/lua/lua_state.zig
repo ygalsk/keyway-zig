@@ -16,7 +16,6 @@ const lua_api = @import("lua_api.zig");
 const IoEntry = @import("../io/ring.zig").IoEntry;
 const io_request = @import("../io/io_request.zig");
 const ring = @import("../io/ring.zig");
-const ConnectionPool = @import("../io/connection_pool.zig").ConnectionPool;
 const Connection = @import("../core/handler.zig").Connection;
 const tls = @import("../tls/tls.zig");
 const castUserdata = @import("../util/helpers.zig").castUserdata;
@@ -62,9 +61,6 @@ pub const LuaState = struct {
     // Cosocket: temporary coroutine state (copied to Connection after yield)
     coroutine_ref: i32 = 0,
     coroutine_thread: ?*Lua = null,
-
-    // Connection pool for cosocket keepalive (per-worker, outlives requests)
-    pool: ConnectionPool,
 
     // Current connection being served (set during handler call/resume, cleared on completion)
     // Used by ring C bridge functions to access the Connection's SQ/CQ.
@@ -154,7 +150,6 @@ pub const LuaState = struct {
             .allocator = allocator,
             .cached_thread = cached_thread,
             .cached_thread_ref = cached_thread_ref,
-            .pool = ConnectionPool.init(allocator),
             .tls_manager = tls_manager,
         };
     }
@@ -665,7 +660,6 @@ pub const LuaState = struct {
     /// Clean up Lua state
     pub fn deinit(self: *LuaState) void {
         self.tls_manager.deinit();
-        self.pool.deinit();
         if (self.cached_thread_ref != 0) {
             self.lua.unref(Lua.PseudoIndex.Registry, self.cached_thread_ref);
         }

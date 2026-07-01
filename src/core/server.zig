@@ -29,8 +29,6 @@ pub const Server = struct {
     address: std.Io.net.IpAddress,
     accept_completion: xev.Completion,
     accept_cancel_completion: xev.Completion = .{},
-    pool_sweep_completion: xev.Completion = undefined,
-    pool_sweep_cancel_completion: xev.Completion = .{},
     drain_timer_completion: ?*xev.Completion = null,
     drain_timer_cancel_completion: xev.Completion = .{},
     coordinator: ?*ShutdownCoordinator = null,
@@ -157,27 +155,6 @@ pub const Server = struct {
     /// Start accepting connections and periodic housekeeping
     pub fn start(self: *Server) !void {
         self.acceptNext();
-        self.startPoolSweepTimer();
-    }
-
-    /// Periodic connection pool sweep — close idle connections that have exceeded
-    /// their max_idle_ms. Runs every 60s per-worker (no cross-worker coordination).
-    fn startPoolSweepTimer(self: *Server) void {
-        self.loop.timer(&self.pool_sweep_completion, 60_000, self, onPoolSweep);
-    }
-
-    fn onPoolSweep(
-        userdata: ?*anyopaque,
-        _: *xev.Loop,
-        _: *xev.Completion,
-        _: xev.Result,
-    ) xev.CallbackAction {
-        const self = castUserdata(Server, userdata);
-        if (self.draining) return .disarm;
-        self.lua_state.pool.sweep();
-        // Re-arm for next sweep
-        self.startPoolSweepTimer();
-        return .disarm;
     }
 
     fn acceptNext(self: *Server) void {
@@ -317,15 +294,6 @@ pub const Server = struct {
             if (self.reload_coordinator) |rc| {
                 rc.getAsync(self.worker_id).notify() catch {};
             }
-
-            // Cancel the recurring pool-sweep timer. It self-disarms on drain,
-            // but only on its next fire (up to 60s away) — too slow to exit
-            // within the drain deadline, so remove it now.
-            self.pool_sweep_cancel_completion = .{
-                .op = .{ .timer_remove = .{ .timer = &self.pool_sweep_completion } },
-                .callback = onCancelComplete,
-            };
-            self.loop.add(&self.pool_sweep_cancel_completion);
 
             // Stop the file watcher's recurring poll timer (--watch mode) so it
             // stops rearming and the loop can reach active == 0.

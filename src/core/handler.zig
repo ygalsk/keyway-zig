@@ -15,8 +15,6 @@ const http = @import("../http/http.zig");
 const HttpExchange = @import("../http/http_exchange.zig").HttpExchange;
 const Router = @import("../http/router.zig").Router;
 const LuaState = @import("../lua/lua_state.zig").LuaState;
-const io_request_mod = @import("../io/io_request.zig");
-const TlsMode = io_request_mod.TlsMode;
 const ring = @import("../io/ring.zig");
 const tls_mod = @import("../tls/tls.zig");
 const TlsContext = tls_mod.TlsContext;
@@ -51,15 +49,6 @@ pub const SuspendedState = struct {
     coroutine_thread: *anyopaque,
     outbound_fd: std.posix.socket_t,
     pending_op: ring.IoEntry.Op,
-    outbound_tls: ?*tls_mod.TlsConn = null, // during handshake; persists if kTLS unavailable
-
-    /// Free outbound TLS conn and null the pointer. Safe to call when outbound_tls is null.
-    pub fn cleanupTls(self: *SuspendedState, alloc: std.mem.Allocator) void {
-        if (self.outbound_tls) |tc| {
-            tls_mod.freeTlsConn(alloc, tc);
-            self.outbound_tls = null;
-        }
-    }
 };
 
 const READ_BUFFER_SIZE = config.READ_BUFFER_SIZE;
@@ -98,10 +87,6 @@ pub const CosocketState = struct {
     batch_completions: ?*[ring.SubmissionRing.MAX_DEPTH]xev.Completion = null,
     batch_recv_bufs: ?*[ring.SubmissionRing.MAX_DEPTH]?[]u8 = null,
     suspended: ?SuspendedState = null,
-    /// True when a single-shot pending_io was converted to a degenerate SQ entry.
-    /// On completion, results are pushed to the Lua stack (legacy API) instead of
-    /// being left in the CQ for ring_result() reads.
-    single_shot_mode: bool = false,
 
     /// Ensure batch arrays are allocated. Called at the start of drainSubmissionRing.
     /// Returns false on allocation failure.
@@ -292,8 +277,6 @@ pub const Connection = struct {
             }
             // Close leaked outbound fd
             if (s.outbound_fd != -1) helpers.closeFd(s.outbound_fd);
-            // Free outbound TLS state if mid-handshake (#21)
-            s.cleanupTls(self.base_allocator);
         }
         // Clean up lazy-allocated cosocket batch arrays
         self.cs.deinitBatchArrays(self.base_allocator);
@@ -1053,7 +1036,6 @@ pub const Connection = struct {
         self.cs.sq.reset();
         self.cs.cq.reset();
         self.cs.pending_completions = 0;
-        self.cs.single_shot_mode = false;
         // Free the arena if its retained capacity grew large; otherwise keep it
         // for reuse. Watermark on the arena's actual capacity, not the response
         // size — large intermediate allocations (and the static/streaming paths,
