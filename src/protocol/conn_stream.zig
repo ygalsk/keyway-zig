@@ -169,6 +169,6 @@ fn onTerminalWrite(
     const self = castUserdata(Connection, userdata);
     _ = self.handleSendCompletion(result) orelse return .disarm;
     // Reuse handleHttpPostWrite for keep-alive/pipelining reset
-    self.handleHttpPostWrite(0);
+    self.handleHttpPostWrite();
     return .disarm;
 }
