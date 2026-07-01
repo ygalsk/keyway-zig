@@ -35,6 +35,9 @@ pub const FileWatcher = struct {
     debounce_armed: bool = false,
     debounce_completion: xev.Completion = .{},
 
+    // Set on shutdown so the recurring poll timer stops rearming (issue #90).
+    draining: bool = false,
+
     // Reload target
     lua_state: *LuaState,
     router: *Router,
@@ -125,6 +128,9 @@ pub const FileWatcher = struct {
     ) xev.CallbackAction {
         const self: *FileWatcher = @ptrCast(@alignCast(userdata orelse return .disarm));
 
+        // Shutting down — stop rearming so the loop can drain (issue #90).
+        if (self.draining) return .disarm;
+
         // Read all pending inotify events
         var buf: [4096]u8 align(@alignOf(std.os.linux.inotify_event)) = undefined;
         var has_lua_change = false;
@@ -187,6 +193,7 @@ pub const FileWatcher = struct {
     ) xev.CallbackAction {
         const self: *FileWatcher = @ptrCast(@alignCast(userdata orelse return .disarm));
         self.debounce_armed = false;
+        if (self.draining) return .disarm;
 
         log.info().string("msg", "file change detected — reloading").log();
         self.lua_state.reload(self.router, self.script_path);

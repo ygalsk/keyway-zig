@@ -1087,6 +1087,16 @@ pub const Connection = struct {
         // Decrement active connection counter
         self.server.metrics.decrementActiveConnections();
         prom.connectionClosed();
+        // If this was the last connection during drain, finish shutdown now
+        // rather than waiting out the drain deadline.
+        self.server.maybeFinishDrain();
+        // Cancel any armed deadline timer so a force-closed connection doesn't
+        // linger until its header/request timeout fires (issue #90 force path;
+        // also the recv-error-mid-request path). Both are refcount-safe no-ops
+        // when their timer isn't armed, and bump pending_timer_ops for the
+        // in-flight timer_remove so maybeFinishClose can't free early.
+        self.cancelHeaderTimer();
+        self.cancelRequestTimer();
         // Deferred deinit: only free when all armed cosocket completions have fired.
         // Normal HTTP connections have pending_completions == 0 (no cosocket I/O),
         // so maybeFinishClose is equivalent to deinit() in the common case.
