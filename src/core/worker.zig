@@ -201,6 +201,7 @@ pub const Worker = struct {
             async_watcher.wait(&loop, &shutdown_completion, ShutdownContext, shutdown_ctx, onShutdownSignal);
             server.coordinator = coord;
             server.worker_id = ctx.worker_id;
+            server.drain_timer_completion = &drain_timer_completion;
         }
         server.reload_coordinator = ctx.reload_coordinator;
 
@@ -213,6 +214,8 @@ pub const Worker = struct {
                 .lua_state = &lua_state,
                 .router = &router,
                 .script_path = ctx.script_path,
+                .server = &server,
+                .allocator = ctx.allocator,
             };
             reload_async.wait(&loop, &reload_completion, ReloadContext, reload_ctx, onReloadSignal);
         }
@@ -226,6 +229,7 @@ pub const Worker = struct {
             };
             if (file_watcher) |*fw| {
                 fw.start(&loop);
+                server.file_watcher = fw;
                 log.info().string("msg", "file watcher started").string("script", ctx.script_path).log();
             }
         }
@@ -275,7 +279,9 @@ fn onShutdownSignal(
         return .disarm;
     }
 
-    log.info().string("msg", "shutting down").log();
+    // stopAccepting sets draining; a second wake (last connection closed during
+    // drain) re-enters here to finish early — don't re-log the banner.
+    if (!ctx.server.draining) log.info().string("msg", "shutting down").log();
     ctx.server.stopAccepting();
 
     const active = ctx.server.metrics.active_connections.load(.monotonic);
@@ -321,6 +327,8 @@ const ReloadContext = struct {
     lua_state: *LuaState,
     router: *Router,
     script_path: []const u8,
+    server: *Server,
+    allocator: std.mem.Allocator,
 };
 
 /// xev.Async callback — fires on the worker's event loop when reload signal received.
@@ -332,6 +340,14 @@ fn onReloadSignal(
 ) xev.CallbackAction {
     _ = r catch return .disarm;
     const ctx = ctx_opt orelse return .disarm;
+
+    // Shutdown woke us to self-disarm (forceCloseAll set socket = -1). Without
+    // this the always-rearming wait keeps loop.active > 0 and the worker never
+    // exits — see issue #90.
+    if (ctx.server.socket == -1) {
+        ctx.allocator.destroy(ctx);
+        return .disarm;
+    }
 
     log.info().string("msg", "performing hot reload").log();
     ctx.lua_state.reload(ctx.router, ctx.script_path);

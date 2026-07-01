@@ -12,6 +12,7 @@ const sse = @import("../protocol/sse.zig");
 const SseRegistry = sse.SseRegistry;
 const SseBroadcastBus = sse.SseBroadcastBus;
 const ShutdownCoordinator = @import("shutdown.zig").ShutdownCoordinator;
+const FileWatcher = @import("../io/file_watcher.zig").FileWatcher;
 const tuning = @import("../util/config.zig");
 const WorkerMetrics = @import("../observability/metrics.zig").WorkerMetrics;
 const prom = @import("../observability/prom.zig");
@@ -29,8 +30,12 @@ pub const Server = struct {
     accept_completion: xev.Completion,
     accept_cancel_completion: xev.Completion = .{},
     pool_sweep_completion: xev.Completion = undefined,
+    pool_sweep_cancel_completion: xev.Completion = .{},
+    drain_timer_completion: ?*xev.Completion = null,
+    drain_timer_cancel_completion: xev.Completion = .{},
     coordinator: ?*ShutdownCoordinator = null,
     reload_coordinator: ?*@import("reload.zig").ReloadCoordinator = null,
+    file_watcher: ?*FileWatcher = null,
     worker_id: usize = 0,
     router: *Router,
     lua_state: *LuaState,
@@ -273,6 +278,15 @@ pub const Server = struct {
         self.draining = true;
     }
 
+    /// Called after a connection closes. If we're draining and this was the
+    /// last connection, wake the shutdown async so the worker exits immediately
+    /// instead of waiting out the full drain deadline. Cheap no-op otherwise.
+    pub fn maybeFinishDrain(self: *Server) void {
+        if (!self.draining or self.socket == -1) return;
+        if (self.metrics.active_connections.load(.monotonic) != 0) return;
+        if (self.coordinator) |coord| coord.getAsync(self.worker_id).notify() catch {};
+    }
+
     /// Force-close the listen socket and every tracked client connection.
     /// Safe to call multiple times (guards against double-close).
     pub fn forceCloseAll(self: *Server) void {
@@ -296,6 +310,38 @@ pub const Server = struct {
             // Wake shutdown async so it can self-disarm (sees socket == -1)
             if (self.coordinator) |coord| {
                 coord.getAsync(self.worker_id).notify() catch {};
+            }
+
+            // Wake reload async so it can self-disarm (sees socket == -1).
+            // Its wait() always rearms, so without this the loop never drains.
+            if (self.reload_coordinator) |rc| {
+                rc.getAsync(self.worker_id).notify() catch {};
+            }
+
+            // Cancel the recurring pool-sweep timer. It self-disarms on drain,
+            // but only on its next fire (up to 60s away) — too slow to exit
+            // within the drain deadline, so remove it now.
+            self.pool_sweep_cancel_completion = .{
+                .op = .{ .timer_remove = .{ .timer = &self.pool_sweep_completion } },
+                .callback = onCancelComplete,
+            };
+            self.loop.add(&self.pool_sweep_cancel_completion);
+
+            // Stop the file watcher's recurring poll timer (--watch mode) so it
+            // stops rearming and the loop can reach active == 0.
+            if (self.file_watcher) |fw| fw.draining = true;
+
+            // Cancel the drain-deadline timer if it's still pending. On force
+            // shutdown (2nd signal) the deadline is moot; without this the loop
+            // lingers until the deadline fires instead of exiting immediately.
+            if (self.drain_timer_completion) |dt| {
+                if (dt.state() == .active) {
+                    self.drain_timer_cancel_completion = .{
+                        .op = .{ .timer_remove = .{ .timer = dt } },
+                        .callback = onCancelComplete,
+                    };
+                    self.loop.add(&self.drain_timer_cancel_completion);
+                }
             }
 
             helpers.closeFd(self.socket);
