@@ -13,11 +13,11 @@ Zig: reads ctx → serializes response → submits async send via libxev
 
 - All I/O is initiated by Zig, completed asynchronously by the kernel.
 - libxev callbacks **dispatch** to the next stage; they hold no business logic.
-- Lua coroutines yield on cosocket ops; Zig resumes them when I/O completes.
+- Lua issues no outbound I/O calls. Coroutines only yield for WS/SSE/stream flow control (send a frame, flush a chunk); Zig resumes them when the operation completes.
 
 ## 2. Per-Core Isolation
 
-One worker thread per CPU core, pinned for cache locality. Each worker exclusively owns its `xev.Loop`, `LuaState`, `Router`, server socket (`SO_REUSEPORT`, kernel distributes), `SseRegistry`, `ConnectionPool`. `TlsContext` is shared read-only (immutable after init).
+One worker thread per CPU core, pinned for cache locality. Each worker exclusively owns its `xev.Loop`, `LuaState`, `Router`, server socket (`SO_REUSEPORT`, kernel distributes), `SseRegistry`. `TlsContext` is shared read-only (immutable after init).
 
 **No Lua state is shared. No cross-thread access. No mutexes on the hot path.** The only cross-worker mechanism is `SseBroadcastBus` (per-worker mutex-protected inboxes + `xev.Async` notifiers). eBPF can optionally pin a client to the same worker.
 
@@ -31,7 +31,7 @@ Accept → Read → Parse → Route → Execute → Respond → Reuse
 2. **Read** — libxev recv fills the `LinearBuffer`; TLS ciphertext is decrypted through `conn_tls`.
 3. **Parse** — picohttpparser (C FFI) yields a zero-copy `Request` — method/path/headers/body are slices into the buffer, no allocations.
 4. **Route** — `Router.match` does an O(path-length) trie lookup into inline `ParamArray`/`QueryArray` (zero heap).
-5. **Execute** — `LuaState.callLuaHandler` runs a Lua coroutine with the `HttpExchange` userdata; cosocket calls yield → Zig does the I/O → Zig resumes.
+5. **Execute** — `LuaState.callLuaHandler` runs a Lua coroutine with the `HttpExchange` userdata. WS/SSE/stream handlers yield for flow control; Zig resumes them. All other handlers run to completion without yielding.
 6. **Respond** — `HttpExchange.toResponse` → `Response.serialize` → async send. Special paths: SSE (`conn_sse`), WebSocket (`conn_ws`), chunked (`conn_stream`). Static routes short-circuit before Lua (`static.zig`, ETag/Last-Modified).
 7. **Reuse** — arena + buffer reset for keep-alive; if the response exceeded `LARGE_RESPONSE_THRESHOLD`, arena backing memory is freed to bound growth.
 
@@ -41,7 +41,6 @@ Accept → Read → Parse → Route → Execute → Respond → Reuse
 - **Arena-per-request** — every per-request allocation uses the `Connection`'s arena; reset after send.
 - **Pointer-in-userdata** — Lua gets a userdata holding a pointer to the arena-allocated `HttpExchange`, so coroutines can't touch another request's state.
 - **Inline params** — `ParamArray`/`QueryArray` are fixed-size inline arrays (caps in `config.zig`), no heap.
-- **Connection pooling** — cosocket connections pooled per-worker by `host:port`, LIFO, lazy expiry.
 
 ## 5. Module Map
 
@@ -51,10 +50,10 @@ Source lives under `src/`, grouped by responsibility. Read the directory, not a 
 |---|---|
 | `core/` | Per-core lifecycle: `main`→`ThreadPool`→`worker` (CPU-pinned, owns loop+LuaState+Router+Server), `server` (accept, SO_REUSEPORT, BPF, TLS init), `handler` (`Connection`: socket lifecycle, read/write completions, arena, coroutine suspend/resume), `shutdown`, `reload`. |
 | `http/` | HTTP path: `http` (Request/Response/parser bindings/serialize), `router` (zero-alloc trie), `route_loader`, `http_exchange` (the Lua-visible `ctx`), `params`, `static`, `error_response`. |
-| `io/` | Outbound I/O + rings: `cosocket`(+`_ops`), `ring`/`ring_api` (IoEntry rings), `io_request`, `connection_pool`, `file_watcher`, `bpf_reuseport`. |
+| `io/` | Async-yield engine driving WS/SSE/stream: `cosocket` (yield/resume bridge to libxev), `ring` (IoEntry submission/completion rings), `io_request`, `file_watcher`, `bpf_reuseport`. |
 | `lua/` | LuaJIT: `lua_state` (state, handler dispatch, coroutine lifecycle), `lua_api` (ctx/headers/params metatables, cosocket registration), `json`. |
 | `protocol/` | Upgraded protocols: `ws`/`conn_ws`, `sse`/`conn_sse` (SseRegistry + SseBroadcastBus), `conn_stream`. |
-| `tls/` | `tls` (TlsContext/TlsConn/kTLS), `conn_tls` (inbound), `cosocket_tls` (outbound client). |
+| `tls/` | `tls` (TlsContext/TlsConn/kTLS), `conn_tls` (inbound handshake). |
 | `observability/` | `metrics` (per-worker atomics), `prom` (Prometheus export), `log`. |
 | `util/` | `buffer` (LinearBuffer), `config` (tunable constants), `cli`, `helpers` (`castUserdata`), `clock`. |
 
@@ -62,7 +61,7 @@ Source lives under `src/`, grouped by responsibility. Read the directory, not a 
 
 Lua touches only `ctx` through metatables. **Read:** `ctx.method/.path/.body`, `ctx.params.id`, `ctx.headers["Key"]`, `ctx.query.name`. **Write:** `ctx.status`, `ctx.body`, `ctx.headers["Key"]`. No verbs (`send()`/`write()`) — state assignment only. Routes register via the declarative `keyway.routes` table; middleware chains at global and per-route levels.
 
-Cosocket ops (`keyway.tcp_connect`, socket methods) are the one exception: function calls that **yield** the coroutine — but Lua still performs no I/O; it yields, Zig does the I/O and resumes with the result.
+No exceptions: Lua never issues outbound I/O. WS/SSE/stream handlers yield the coroutine for flow control only (send a frame, flush a chunk); Zig still owns the I/O and drives the resume. A declarative async-upstream primitive is tracked as future work (#96) — not built until a concrete need lands.
 
 ## 7. Design Rules (non-negotiable)
 

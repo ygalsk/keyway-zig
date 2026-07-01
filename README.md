@@ -71,7 +71,6 @@ No `send()`, no `write()`, no lifecycle calls — only state assignment. Zig com
 ## Features
 
 - **Per-core isolation** — one worker thread, one Lua state, one event loop per CPU core. No locks.
-- **Cosockets** — non-blocking outbound TCP (Redis, PostgreSQL, etc.) via coroutine yield/resume with per-worker connection pooling.
 - **WebSocket** — upgrade via `ctx.upgrade = "websocket"`, frame encoding/decoding handled by Zig.
 - **SSE** — upgrade via `ctx.upgrade = "sse"`, cross-worker broadcast via `SseBroadcastBus`.
 - **Chunked streaming** — `ctx.upgrade = "stream"` with `coroutine.yield()` to flush chunks.
@@ -93,13 +92,13 @@ src/
 ├── core/           # server, worker, handler, shutdown, reload
 ├── http/           # HTTP types, exchange, router, params, static
 ├── protocol/       # WebSocket, SSE, chunked streaming
-├── tls/            # TLS primitives, inbound/outbound handshake
-├── io/             # cosocket engine, ring, connection pool, BPF
+├── tls/            # TLS primitives, inbound handshake, kTLS offload
+├── io/             # async-yield engine (WS/SSE/stream), rings, file watcher, BPF
 ├── lua/            # LuaJIT state management, Lua API bindings
 ├── observability/  # logging, metrics, Prometheus
 └── util/           # buffer, helpers, config, CLI
 dashboard/          # Solid.js admin dashboard + keyway.lua entry script
-lua/                # Lua stdlib modules (keyway.socket, keyway.dns, etc.)
+lua/                # embedded Lua stdlib modules (keyway.form, keyway.response)
 tests/              # Integration tests (Bun)
 observability/      # Prometheus + Grafana config
 ```
@@ -138,7 +137,6 @@ Keyway ships a built-in Solid.js dashboard at `/__keyway/dashboard`. It provides
 - Real-time event stream via SSE
 - Route and middleware inspection
 - Lua file editor (read/write/delete)
-- HTTP probe tool and DNS lookup
 - Embedded Grafana view
 
 Access is restricted to localhost (`127.0.0.1` / `::1`). Manual reload: `POST /__keyway/reload`.
@@ -164,10 +162,6 @@ Access is restricted to localhost (`127.0.0.1` / `::1`). Manual reload: `POST /_
 | Module | Purpose |
 |---|---|
 | `keyway.response` | `json_response`, `get_header`, `broadcast_event`, `broadcast_html`, `now_us` |
-| `keyway.socket` | LuaSocket-compatible TCP — `connect`, `send`, `receive`, `setkeepalive` |
-| `keyway.ring` | Batched I/O ring — submit multiple ops, yield once |
-| `keyway.dns` | DNS A-record lookup, `resolve_host` via FFI getaddrinfo |
-| `keyway.http_client` | Outbound HTTP (`probe`, `post`) with SSRF protection |
 | `keyway.form` | Form data parsing |
 
 ## Observability
