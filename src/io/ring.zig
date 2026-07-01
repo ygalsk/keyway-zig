@@ -101,8 +101,11 @@ pub const CompletionRing = struct {
         self.tail += 1;
     }
 
-    pub inline fn get(self: *const CompletionRing, index: u8) CQEntry {
-        std.debug.assert(index < self.tail);
+    /// Returns the CQE at `index`, or null if out of bounds. Real check (not a
+    /// debug assert) so an invalid index can't read uninitialized/OOB memory in
+    /// release builds.
+    pub inline fn get(self: *const CompletionRing, index: u8) ?CQEntry {
+        if (index >= self.tail) return null;
         return self.entries[index];
     }
 
@@ -164,10 +167,11 @@ test "CompletionRing: push/get/reset" {
     cq.push(.{ .result = 5 }); // fd from connect
     cq.push(.{ .result = 6, .buf = "PONG\r\n" }); // recv result
 
-    try std.testing.expectEqual(@as(i32, 5), cq.get(0).result);
-    try std.testing.expectEqual(@as(i32, 6), cq.get(1).result);
-    try std.testing.expectEqualStrings("PONG\r\n", cq.get(1).buf.?);
-    try std.testing.expect(cq.get(0).buf == null);
+    try std.testing.expectEqual(@as(i32, 5), cq.get(0).?.result);
+    try std.testing.expectEqual(@as(i32, 6), cq.get(1).?.result);
+    try std.testing.expectEqualStrings("PONG\r\n", cq.get(1).?.buf.?);
+    try std.testing.expect(cq.get(0).?.buf == null);
+    try std.testing.expect(cq.get(2) == null); // out of bounds returns null
 
     cq.reset();
     try std.testing.expectEqual(@as(u8, 0), cq.tail);
@@ -181,15 +185,15 @@ test "CQEntry: err_category round-trips correctly" {
     cq.push(.{ .result = -1, .err_msg = "recv: alloc failed", .err_category = .server_error });
     cq.push(.{ .result = 5 }); // success entry, no category
 
-    const e0 = cq.get(0);
+    const e0 = cq.get(0).?;
     try std.testing.expectEqual(@as(i32, -1), e0.result);
     try std.testing.expectEqual(ErrorCategory.upstream_error, e0.err_category.?);
     try std.testing.expectEqualStrings("connection refused", std.mem.span(e0.err_msg.?));
 
-    const e1 = cq.get(1);
+    const e1 = cq.get(1).?;
     try std.testing.expectEqual(ErrorCategory.server_error, e1.err_category.?);
 
-    const e2 = cq.get(2);
+    const e2 = cq.get(2).?;
     try std.testing.expect(e2.err_category == null);
     try std.testing.expect(e2.err_msg == null);
 }

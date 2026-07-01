@@ -1004,7 +1004,13 @@ pub const Connection = struct {
     /// Post-write handler for WebSocket upgrade: reset arena, consume HTTP bytes,
     /// enter WS frame read loop.
     fn handleWsPostWrite(self: *Connection, bytes_written: usize) void {
-        std.debug.assert(self.ws_state != null);
+        // state == .websocket must imply ws_state != null; if it doesn't (logic
+        // bug), close rather than let a downstream `.?` deref null in release.
+        if (self.ws_state == null) {
+            log.err().string("msg", "ws post-write with null ws_state, closing").log();
+            self.close();
+            return;
+        }
         log.debug().string("msg", "ws 101 sent, entering WS mode").int("bytes_written", bytes_written).int("raw_len", self.http_state.request_raw_len).int("buf_avail_read", self.read_buffer.availableRead()).int("buf_avail_write", self.read_buffer.availableWrite()).log();
         _ = self.arena.reset(.retain_capacity);
         if (self.http_state.request_raw_len > 0) {
@@ -1025,7 +1031,13 @@ pub const Connection = struct {
 
     /// Post-write handler for SSE upgrade: start watching for client disconnect.
     fn handleSsePostWrite(self: *Connection) void {
-        std.debug.assert(self.sse_state != null);
+        // state == .sse must imply sse_state != null; if it doesn't (logic bug),
+        // close rather than let startSseDisconnectWatch deref null in release.
+        if (self.sse_state == null) {
+            log.err().string("msg", "sse post-write with null sse_state, closing").log();
+            self.close();
+            return;
+        }
         conn_sse.startSseDisconnectWatch(self);
     }
 
