@@ -371,7 +371,7 @@ fn finishStaticFile(self: *Connection) void {
     }
     self.state = .writing;
     // Reuse handleHttpPostWrite for keep-alive/pipelining reset
-    self.handleHttpPostWrite(0);
+    self.handleHttpPostWrite();
 }
 
 // =============================================================================

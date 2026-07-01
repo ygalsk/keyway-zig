@@ -63,7 +63,7 @@ pub const SuspendedState = struct {
 };
 
 const READ_BUFFER_SIZE = config.READ_BUFFER_SIZE;
-const LARGE_RESPONSE_THRESHOLD = config.LARGE_RESPONSE_THRESHOLD;
+const ARENA_RETAIN_LIMIT = config.ARENA_RETAIN_LIMIT;
 
 /// Per-request HTTP state — reset between keep-alive requests.
 pub const HttpState = struct {
@@ -996,7 +996,7 @@ pub const Connection = struct {
             .websocket => self.handleWsPostWrite(bytes_written),
             .sse => self.handleSsePostWrite(),
             .streaming => conn_stream.handleStreamPostWrite(self),
-            else => self.handleHttpPostWrite(bytes_written),
+            else => self.handleHttpPostWrite(),
         }
         return .disarm;
     }
@@ -1031,7 +1031,7 @@ pub const Connection = struct {
 
     /// Post-write handler for HTTP responses: reset state for keep-alive,
     /// handle pipelining.
-    pub fn handleHttpPostWrite(self: *Connection, bytes_written: usize) void {
+    pub fn handleHttpPostWrite(self: *Connection) void {
         // Cancel the per-request deadline timer on successful response completion
         self.cancelRequestTimer();
         self.cs.suspended = null;
@@ -1039,9 +1039,12 @@ pub const Connection = struct {
         self.cs.cq.reset();
         self.cs.pending_completions = 0;
         self.cs.single_shot_mode = false;
-        // Shrink arena if response was large to prevent unbounded growth
-        // on keep-alive connections that occasionally serve large responses.
-        if (bytes_written > LARGE_RESPONSE_THRESHOLD) {
+        // Free the arena if its retained capacity grew large; otherwise keep it
+        // for reuse. Watermark on the arena's actual capacity, not the response
+        // size — large intermediate allocations (and the static/streaming paths,
+        // which report zero bytes here) would otherwise leave the arena inflated
+        // for the connection's lifetime.
+        if (self.arena.queryCapacity() > ARENA_RETAIN_LIMIT) {
             _ = self.arena.reset(.free_all);
         } else {
             _ = self.arena.reset(.retain_capacity);

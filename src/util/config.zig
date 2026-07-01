@@ -10,8 +10,10 @@ pub const WRITE_BUFFER_SIZE = 8192;
 /// Ciphertext receive buffer for inbound TLS connections.
 pub const CIPHERTEXT_BUFFER_SIZE = 8192;
 
-/// Free arena if response exceeds this size (prevents unbounded growth on keep-alive).
-pub const LARGE_RESPONSE_THRESHOLD = 1024 * 1024;
+/// Free the per-request arena between requests if its retained capacity exceeds
+/// this size; otherwise keep the capacity for reuse. Prevents unbounded growth on
+/// keep-alive connections that occasionally serve a large response.
+pub const ARENA_RETAIN_LIMIT = 1024 * 1024;
 
 /// Maximum route parameters per request (e.g., /users/{id}/posts/{post_id}).
 pub const MAX_ROUTE_PARAMS = 4;
