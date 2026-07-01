@@ -49,57 +49,20 @@ pub const Response = struct {
 
     /// Comptime-generated status line table indexed by HTTP status code.
     /// Each entry is a complete "HTTP/1.1 NNN Reason\r\n" string, enabling
-    /// single-memcpy serialization with no runtime formatting.
+    /// single-memcpy serialization with no runtime formatting. Reason phrases
+    /// come from std.http.Status; unmapped codes fall back to "Unknown".
     const status_lines = blk: {
-        const known = .{
-            .{ 101, "Switching Protocols" },
-            .{ 200, "OK" },
-            .{ 201, "Created" },
-            .{ 204, "No Content" },
-            .{ 301, "Moved Permanently" },
-            .{ 302, "Found" },
-            .{ 304, "Not Modified" },
-            .{ 400, "Bad Request" },
-            .{ 401, "Unauthorized" },
-            .{ 403, "Forbidden" },
-            .{ 404, "Not Found" },
-            .{ 405, "Method Not Allowed" },
-            .{ 408, "Request Timeout" },
-            .{ 413, "Content Too Large" },
-            .{ 429, "Too Many Requests" },
-            .{ 500, "Internal Server Error" },
-            .{ 502, "Bad Gateway" },
-            .{ 503, "Service Unavailable" },
-        };
-
+        @setEvalBranchQuota(100_000);
         var table: [600][]const u8 = undefined;
-
-        // Fill every slot with a generic "HTTP/1.1 NNN Unknown\r\n" line
         for (0..600) |code| {
-            const digits: *const [3]u8 = comptime_digits: {
-                var buf: [3]u8 = undefined;
-                buf[0] = '0' + @as(u8, @intCast(code / 100));
-                buf[1] = '0' + @as(u8, @intCast((code / 10) % 10));
-                buf[2] = '0' + @as(u8, @intCast(code % 10));
-                break :comptime_digits &buf;
+            const phrase = @as(std.http.Status, @enumFromInt(code)).phrase() orelse "Unknown";
+            const digits = [3]u8{
+                '0' + @as(u8, @intCast(code / 100)),
+                '0' + @as(u8, @intCast((code / 10) % 10)),
+                '0' + @as(u8, @intCast(code % 10)),
             };
-            table[code] = "HTTP/1.1 " ++ digits ++ " Unknown\r\n";
+            table[code] = "HTTP/1.1 " ++ &digits ++ " " ++ phrase ++ "\r\n";
         }
-
-        // Overwrite known codes with their proper reason phrases
-        for (known) |entry| {
-            const code: comptime_int = entry[0];
-            const reason: []const u8 = entry[1];
-            const digits: *const [3]u8 = comptime_digits: {
-                var buf: [3]u8 = undefined;
-                buf[0] = '0' + @as(u8, @intCast(code / 100));
-                buf[1] = '0' + @as(u8, @intCast((code / 10) % 10));
-                buf[2] = '0' + @as(u8, @intCast(code % 10));
-                break :comptime_digits &buf;
-            };
-            table[code] = "HTTP/1.1 " ++ digits ++ " " ++ reason ++ "\r\n";
-        }
-
         break :blk table;
     };
 
@@ -305,6 +268,13 @@ test "response serialization" {
 
     const expected = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!";
     try std.testing.expectEqualStrings(expected, buf.writer.buffered());
+}
+
+test "status_lines: known phrase and unmapped-code fallback" {
+    // Non-200 known code takes its std.http.Status phrase.
+    try std.testing.expectEqualStrings("HTTP/1.1 404 Not Found\r\n", Response.status_lines[404]);
+    // Unmapped code falls back to "Unknown" with correct 3-digit extraction.
+    try std.testing.expectEqualStrings("HTTP/1.1 599 Unknown\r\n", Response.status_lines[599]);
 }
 
 test "http parser - simple GET request" {
