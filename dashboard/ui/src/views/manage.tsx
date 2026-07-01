@@ -302,8 +302,6 @@ export function RoutesView(props: {
   }
 
   onMount(async () => {
-    // Try to sync middleware overrides from Redis before loading routes
-    try { await api("/__keyway/api/middleware/sync", { method: "POST" }); } catch {}
     await loadRoutes();
     const p = getHashParams();
     const ctxFilter = p.get("filter_pattern");
