@@ -1,60 +1,38 @@
-# CLAUDE.md
+# Keyway
 
-## Build Commands
+A programmable HTTP engine: **Zig owns the execution engine** (memory, io_uring via libxev, LuaJIT); **Lua expresses routing/policy** as declarative state on `ctx` — it never performs I/O. Stack: Zig, LuaJIT, libxev, picohttpparser, eBPF.
+
+**What it's for:** a programmable reverse proxy / API gateway (peers: OpenResty, Kong, Envoy) — Lua expresses routing, auth, rate-limiting, transforms, and TLS as *policy*, not app logic. Craft-first, aspiring open-source; the dashboard is the end-to-end test client, not the product. Fuller rationale: README / MANIFEST.md.
+
+## Build & test
 
 ```bash
-zig build          # Build the keyway binary
-zig build run      # Build and run the server (listens on 0.0.0.0:8080)
-zig build test     # Run all unit tests (tests are embedded in source files)
+zig build                     # build the keyway binary
+zig build run                 # run the server (0.0.0.0:8080)
+zig build test                # unit tests (embedded in source files)
+cd tests && bun run test:ci   # bun integration suite (needs a running server)
 ```
 
-Requires Zig 0.15.0+. Dependencies (libxev, zig-luajit) are fetched via `build.zig.zon`.
+Zig version and deps: see `build.zig.zon` — the source of truth, so this file can't go stale on a bump.
 
-## What Keyway Is
+## The contracts — read these
 
-Keyway is a programmable HTTP engine where Zig owns the execution engine (memory, I/O, event loop) and Lua expresses routing policy through a declarative interface. Tech stack: Zig, LuaJIT, libxev (io_uring), picohttpparser, eBPF.
+- **MANIFEST.md** — *architecture* contract: proactor model, per-core isolation, zero-copy, request lifecycle, the Lua contract, module map. Authoritative: code conforms or the deviation is justified.
+- **.claude/rules/zig-gotchas.md** — read before editing any `.zig`.
 
-## Architecture
+## Working conventions
 
-Read **MANIFEST.md** — it is the authoritative design contract. Key rules:
+Work is tracked as **GitHub Issues** (the backlog, hand-driven via `gh`). Branch `kw/<issue#>-<slug>`; PR body contains `Closes #<issue#>`. **No AI/Claude attribution in commits or PRs.**
 
-- **Proactor model**: Lua never performs I/O. Lua sets fields on `ctx`, Zig submits all I/O via io_uring/libxev.
-- **Per-core isolation**: One worker thread per CPU core. Each owns its own xev loop, LuaJIT state, router, and server socket (`SO_REUSEPORT`). No sharing, no locking.
-- **Lua contract**: Lua interacts only with `ctx` (HttpExchange userdata) through metatables. State assignment, not method calls. Routes registered via `keyway.routes`.
-- **Zero-copy default**: Headers/path/body are slices into `LinearBuffer`. Copying is a failure mode.
+## Non-negotiables
 
-### Cosocket Key Constraint
+- **Proactor:** Lua never does I/O or syscalls — it sets fields on `ctx`; Zig submits all I/O via libxev/io_uring.
+- **Per-core isolation:** one thread / one xev loop / one LuaState / one Router per core, `SO_REUSEPORT`. No sharing, no hot-path locks.
+- **Zero-copy default:** headers/path/body are slices into the read buffer. Copying is a failure mode.
+- **Surgical & minimal:** touch only what the task needs; simplest change that works; no speculative abstractions. Spot something incoherent? File an issue — don't fix it inline.
+- **Verify before done:** `zig build test` + the bun integration suite must pass.
 
-zig-luajit marks `resumeCoroutine`/`yieldCoroutine` as private. We declare `extern "c" fn lua_resume` and `@ptrCast` the `*Lua` to call it directly.
+## Testing & tone
 
-## Principles
-
-- **Simplicity, not timidity**: Default to the simplest change — but when something architecturally incoherent is spotted (bad abstraction, misplaced responsibility, structural bug), **stop, note it, and surface it to the user**. Don't silently fix it or silently ignore it. The user decides whether to re-plan now or finish current work and address it later.
-- **Root causes, not patches**: Find the real problem. No temporary fixes.
-- **Verify before done**: Run `zig build test`, check compilation, demonstrate the fix.
-
-## Testing Philosophy
-
-**Integration-first, DDD/TDD red-green cycle.** Don't think in small unit tests. Think in integration tests that prove the architecture works end-to-end.
-
-The **dashboard is the integration test client** — a real consumer of the Zig server that exercises the architecture (HTTP, WebSocket, SSE, cosocket, routing). Bugs found through the dashboard are categorized, isolated, and fixed against the real server.
-
-### Bug Triage by Layer
-
-Each layer (JS, Lua, Zig) is well-understood in isolation. JS and Lua have rich ecosystems, stdlib, and tooling — if something breaks at those layers using standard, well-known patterns, **the bug is below them**. Use this to triage:
-
-1. **JS layer issue** → likely surfaces a Lua-layer limitation or mismatch
-2. **Lua layer issue** → likely surfaces a Zig-layer implementation bug or missing capability
-3. Each layer is encapsulated — if it's coherent on its own level, the flaw comes from the layer below
-
-This layered debugging model is how we pinpoint Zig implementation issues efficiently. Problems at higher layers are symptoms; the Zig engine is where root causes live.
-
-### Test Stack
-
-- **Zig side**: `zig build test` for internal correctness (embedded tests in source files)
-- **Integration side**: `bun test` against a running keyway server
-  - Native `fetch`, `WebSocket`, `EventSource` — no mock libraries
-  - `Bun.spawn()` manages server lifecycle (start in `beforeAll`, kill in `afterAll`)
-  - `--preload` for global server setup across suites
-  - `CLAUDECODE=1 bun test --bail --timeout 10000` for agentic workflows (failures only)
-- **Later**: Playwright for browser-based dashboard UI testing
+- **Integration-first.** The dashboard is the integration test client. Triage by layer: if JS/Lua breaks using standard patterns, the real bug is usually in the layer below — the Zig engine is where root causes live.
+- **Skeptical mentor.** Default stance is challenge, not agreement: decompose from first principles (what *genus*? essential vs. accidental?), research current (2025–2026) practice, critique the tradeoffs — *then* recommend. If an idea is genuinely good, say why. Terse, direct — a senior engineer who's seen too many rewrites.

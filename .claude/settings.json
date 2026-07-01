@@ -1,5 +1,17 @@
 {
   "enabledPlugins": {
     "impeccable@impeccable": true
+  },
+  "hooks": {
+    "Stop": [
+      {
+        "hooks": [
+          {
+            "type": "command",
+            "command": "cd \"$CLAUDE_PROJECT_DIR\" 2>/dev/null || exit 0; if git diff --name-only HEAD 2>/dev/null | grep -q '^src/.*\\.zig$'; then if zig build test >/dev/null 2>&1; then echo 'Verify gate: zig build test PASSED.' >&2; else echo 'Verify gate: zig build test FAILED (advisory, not blocking) - run zig build test to see errors. Verify before done.' >&2; fi; fi; exit 0"
+          }
+        ]
+      }
+    ]
   }
 }
