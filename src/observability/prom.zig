@@ -33,18 +33,12 @@ pub const Metrics = struct {
     connections_active: ConnectionGauge,
     connections_rejected_total: ConnectionCounter,
 
-    // -- io_uring / Ring buffer --
-    ring_submissions_total: ConnectionCounter,
-    ring_completions_total: ConnectionCounter,
-    ring_batch_size: RingBatchSizeHist,
-
     // -- Lua runtime --
     lua_coroutines_active: ConnectionGauge,
     lua_script_duration_seconds: LuaScriptDuration,
 
     // Bucket bounds (must live inside the struct so HistogramVec comptime refs resolve)
     const latency_buckets = [_]f64{ 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0, 10.0 };
-    const ring_batch_buckets = [_]f64{ 1, 2, 4, 8, 16 };
     const body_size_buckets = [_]u64{ 64, 256, 1_024, 4_096, 16_384, 65_536, 262_144, 1_048_576, 4_194_304 };
 
     // Labeled types
@@ -57,7 +51,6 @@ pub const Metrics = struct {
     const BodySizeHist = m.Histogram(u64, &body_size_buckets);
     const ConnectionCounter = m.CounterVec(u64, WorkerLabels);
     const ConnectionGauge = m.GaugeVec(i64, WorkerLabels);
-    const RingBatchSizeHist = m.HistogramVec(f64, WorkerLabels, &ring_batch_buckets);
     const LuaScriptDuration = m.HistogramVec(f64, ScriptDurationLabels, &latency_buckets);
 };
 
@@ -87,15 +80,6 @@ pub fn init(allocator: Allocator) !void {
         .connections_rejected_total = try Metrics.ConnectionCounter.init(allocator, io, "keyway_connections_rejected_total", .{
             .help = "Total rejected connections",
         }, .{}),
-        .ring_submissions_total = try Metrics.ConnectionCounter.init(allocator, io, "keyway_ring_submissions_total", .{
-            .help = "Total ring buffer submissions",
-        }, .{}),
-        .ring_completions_total = try Metrics.ConnectionCounter.init(allocator, io, "keyway_ring_completions_total", .{
-            .help = "Total ring buffer completions",
-        }, .{}),
-        .ring_batch_size = try Metrics.RingBatchSizeHist.init(allocator, io, "keyway_ring_batch_size", .{
-            .help = "Submissions per batch drain",
-        }, .{}),
         .lua_coroutines_active = try Metrics.ConnectionGauge.init(allocator, io, "keyway_lua_coroutines_active", .{
             .help = "Active Lua coroutines",
         }, .{}),
@@ -111,9 +95,6 @@ pub fn deinit() void {
     global.connections_accepted_total.deinit();
     global.connections_active.deinit();
     global.connections_rejected_total.deinit();
-    global.ring_submissions_total.deinit();
-    global.ring_completions_total.deinit();
-    global.ring_batch_size.deinit();
     global.lua_coroutines_active.deinit();
     global.lua_script_duration_seconds.deinit();
     metrics_io.deinit();
@@ -165,16 +146,6 @@ pub fn connectionRejected() void {
     global.connections_rejected_total.incr(wlabels()) catch {};
 }
 
-/// Ring buffer submission(s).
-pub fn ringSubmissions(count: u64) void {
-    global.ring_submissions_total.incrBy(wlabels(), count) catch {};
-}
-
-/// Ring buffer completion(s).
-pub fn ringCompletions(count: u64) void {
-    global.ring_completions_total.incrBy(wlabels(), count) catch {};
-}
-
 /// Lua coroutine started.
 pub fn luaCoroutineStarted() void {
     global.lua_coroutines_active.incr(wlabels()) catch {};
@@ -183,11 +154,6 @@ pub fn luaCoroutineStarted() void {
 /// Lua coroutine finished (completed or errored).
 pub fn luaCoroutineFinished() void {
     global.lua_coroutines_active.incrBy(wlabels(), -1) catch {};
-}
-
-/// Record ring batch size (SQEs per drain).
-pub fn ringBatchSize(count: u8) void {
-    global.ring_batch_size.observe(wlabels(), @floatFromInt(count)) catch {};
 }
 
 /// Record Lua script execution duration.
@@ -212,7 +178,6 @@ test "prom: init and record" {
     connectionClosed();
     recordRequestBodySize(512);
     recordResponseBodySize(2048);
-    ringBatchSize(3);
     luaScriptDuration("/users", 500);
 }
 
@@ -238,6 +203,5 @@ test "prom: write produces output with worker_id labels" {
     // Verify route label is present on requests counter
     try std.testing.expect(std.mem.indexOf(u8, buf, "route=") != null);
     // Verify new metrics are present
-    try std.testing.expect(std.mem.indexOf(u8, buf, "# TYPE keyway_ring_batch_size histogram") != null);
     try std.testing.expect(std.mem.indexOf(u8, buf, "# TYPE keyway_lua_script_duration_seconds histogram") != null);
 }

@@ -5,7 +5,6 @@ const http = @import("../http/http.zig");
 const ws = @import("ws.zig");
 const handler_mod = @import("../core/handler.zig");
 const Connection = handler_mod.Connection;
-const cosocket = @import("../io/cosocket.zig");
 const params = @import("../http/params.zig");
 const HttpExchange = @import("../http/http_exchange.zig").HttpExchange;
 const castUserdata = @import("../util/helpers.zig").castUserdata;
@@ -288,7 +287,7 @@ fn dispatchWsMessage(conn: *Connection, payload: []const u8) void {
         return;
     };
 
-    // Set current_connection so cosocket/ring ops inside on_message work
+    // Set current_connection so ws_send/sse_broadcast calls inside on_message work
     conn.lua_state.current_connection = conn;
 
     // Dispatch via shared coroutine infrastructure
@@ -328,14 +327,10 @@ fn dispatchWsMessage(conn: *Connection, payload: []const u8) void {
                 .allocator = alloc,
             };
 
-            conn.cs.suspended = .{
-                .completion = undefined,
+            conn.suspended = .{
                 .exchange = dummy_exchange,
-                .recv_buf = null,
                 .coroutine_ref = conn.lua_state.coroutine_ref,
                 .coroutine_thread = @ptrCast(conn.lua_state.coroutine_thread.?),
-                .outbound_fd = -1,
-                .pending_op = .none,
             };
             conn.lua_state.coroutine_ref = 0;
             conn.lua_state.coroutine_thread = null;
@@ -345,35 +340,23 @@ fn dispatchWsMessage(conn: *Connection, payload: []const u8) void {
     }
 }
 
-/// Take framed WS data from pending_io and send it.
+/// Take the pending WS send payload and frame+send it.
 fn submitWsSend(conn: *Connection) void {
-    const pending = conn.lua_state.pending_io orelse {
-        resumeWithError(conn, "ws_send: no pending I/O");
+    const raw_data = conn.lua_state.pending_ws_send orelse {
+        conn.resumeWithError(.server_error, "ws_send: no pending I/O");
         return;
     };
-    conn.lua_state.pending_io = null;
-
-    // ws_send uses send variant with fd=0 as signal
-    const snd = switch (pending) {
-        .send => |s| s,
-        else => {
-            // Unexpected op during WS — close
-            conn.close();
-            return;
-        },
-    };
-
-    const raw_data = snd.data;
+    conn.lua_state.pending_ws_send = null;
 
     // Arena-dupe send_data (Lua string may be GC'd across yield)
     const data = conn.arena.allocator().dupe(u8, raw_data) catch {
-        resumeWithError(conn,"ws_send: arena alloc failed");
+        conn.resumeWithError(.server_error, "ws_send: arena alloc failed");
         return;
     };
 
     // Serialize as WS text frame
     const frame_buf = conn.arena.allocator().alloc(u8, data.len + ws.MAX_FRAME_OVERHEAD) catch {
-        resumeWithError(conn,"ws_send: arena alloc failed");
+        conn.resumeWithError(.server_error, "ws_send: arena alloc failed");
         return;
     };
     const frame_len = ws.serializeFrame(.text, data, frame_buf);
@@ -397,39 +380,20 @@ fn onWsSendComplete(
     _ = self.handleSendCompletion(result) orelse return .disarm;
 
     // Resume coroutine with success
-    const s = &self.cs.suspended.?;
+    const s = &self.suspended.?;
     const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
     thread.pushInteger(1);
-    wsDispatchResume(self, thread, 1);
+    self.dispatchResume(thread, 1);
     return .disarm;
 }
 
-/// Route a WS coroutine yield to the correct I/O path.
-/// Ring batch (SQ has entries) vs WS send (pending_io) vs cosocket single-shot.
+/// Route a WS coroutine yield to the correct path: a pending ws:send() gets
+/// framed and sent; a bare yield with nothing pending resumes with an error.
 pub fn routeWsYield(conn: *Connection) void {
-    if (conn.lua_state.pending_io != null and conn.cs.sq.len() == 0) {
+    if (conn.lua_state.pending_ws_send != null) {
         submitWsSend(conn);
     } else {
-        cosocket.dispatchIo(conn);
-    }
-}
-
-/// Resume WS coroutine and handle result.
-fn wsDispatchResume(conn: *Connection, thread: *Lua, nresults: c_int) void {
-    conn.lua_state.current_connection = conn;
-    const s = &conn.cs.suspended.?;
-    const resume_result = conn.lua_state.resumeHandler(@ptrCast(thread), nresults, s.exchange) catch {
-        cosocket.completeHandler(conn);
-        return;
-    };
-
-    switch (resume_result) {
-        .completed => {
-            cosocket.completeHandler(conn);
-        },
-        .yielded => {
-            routeWsYield(conn);
-        },
+        conn.resumeWithError(.server_error, "no pending I/O operation");
     }
 }
 
@@ -501,13 +465,4 @@ fn handleWsClose(conn: *Connection, payload: []const u8) void {
 
     // Echo close frame back, then disconnect (onWsCloseSent calls conn.close())
     sendWsClose(conn, status_code);
-}
-
-/// Resume coroutine with nil, error_message for pre-submission failures (WS context).
-fn resumeWithError(conn: *Connection, msg: [:0]const u8) void {
-    const s = &conn.cs.suspended.?;
-    const thread: *Lua = @ptrCast(@alignCast(s.coroutine_thread));
-    thread.pushNil();
-    thread.pushString(msg);
-    cosocket.dispatchResume(conn, thread, 2, s.exchange);
 }

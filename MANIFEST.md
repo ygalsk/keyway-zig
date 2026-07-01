@@ -50,8 +50,8 @@ Source lives under `src/`, grouped by responsibility. Read the directory, not a 
 |---|---|
 | `core/` | Per-core lifecycle: `main`→`ThreadPool`→`worker` (CPU-pinned, owns loop+LuaState+Router+Server), `server` (accept, SO_REUSEPORT, BPF, TLS init), `handler` (`Connection`: socket lifecycle, read/write completions, arena, coroutine suspend/resume), `shutdown`, `reload`. |
 | `http/` | HTTP path: `http` (Request/Response/parser bindings/serialize), `router` (zero-alloc trie), `route_loader`, `http_exchange` (the Lua-visible `ctx`), `params`, `static`, `error_response`. |
-| `io/` | Async-yield engine driving WS/SSE/stream: `cosocket` (yield/resume bridge to libxev), `ring` (IoEntry submission/completion rings), `io_request`, `file_watcher`, `bpf_reuseport`. |
-| `lua/` | LuaJIT: `lua_state` (state, handler dispatch, coroutine lifecycle), `lua_api` (ctx/headers/params metatables, cosocket registration), `json`. |
+| `io/` | Async-yield entry points for WS/SSE flow control: `io_request` (ws_send C function), `file_watcher`, `bpf_reuseport`. The yield/resume bridge itself lives on `core/handler`'s `Connection`. |
+| `lua/` | LuaJIT: `lua_state` (state, handler dispatch, coroutine lifecycle), `lua_api` (ctx/headers/params metatables, async API registration), `json`. |
 | `protocol/` | Upgraded protocols: `ws`/`conn_ws`, `sse`/`conn_sse` (SseRegistry + SseBroadcastBus), `conn_stream`. |
 | `tls/` | `tls` (TlsContext/TlsConn/kTLS), `conn_tls` (inbound handshake). |
 | `observability/` | `metrics` (per-worker atomics), `prom` (Prometheus export), `log`. |

@@ -14,7 +14,6 @@ const Connection = handler_mod.Connection;
 const HttpExchange = @import("../http/http_exchange.zig").HttpExchange;
 const http = @import("../http/http.zig");
 const castUserdata = @import("../util/helpers.zig").castUserdata;
-const cosocket = @import("../io/cosocket.zig");
 const Lua = @import("luajit").Lua;
 const lua_resume = @import("../lua/lua_state.zig").lua_resume;
 

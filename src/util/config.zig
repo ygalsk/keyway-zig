@@ -21,9 +21,6 @@ pub const MAX_ROUTE_PARAMS = 4;
 /// Maximum query string parameters per request.
 pub const MAX_QUERY_PARAMS = 16;
 
-/// Submission/completion ring depth for batched cosocket I/O.
-pub const RING_DEPTH = 16;
-
 /// Encrypt buffer for draining wbio ciphertext (handshake, small sends).
 pub const TLS_ENCRYPT_BUF_SIZE = 20 * 1024;
 
@@ -64,9 +61,6 @@ pub const STATIC_READ_SIZE: usize = 65536;
 pub const STATIC_MAX_SIZE: u64 = 100 * 1024 * 1024;
 
 comptime {
-    // RING_DEPTH must be a power of 2 (ring buffer wrapping requires it)
-    if (RING_DEPTH == 0 or (RING_DEPTH & (RING_DEPTH - 1)) != 0)
-        @compileError("RING_DEPTH must be a power of 2");
     // Buffer sizes must be at least 4096 for reasonable HTTP operation
     if (READ_BUFFER_SIZE < 4096)
         @compileError("READ_BUFFER_SIZE must be >= 4096");

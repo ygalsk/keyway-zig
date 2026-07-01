@@ -114,7 +114,7 @@ pub const Worker = struct {
         // 5. Wire SSE broadcast bus (cross-worker pub/sub, if enabled)
         // 6. Create LuaState (Lua VM + std libs + metatables + cached thread)
         // 7. Set SSE registry on LuaState (for broadcast C function)
-        // 8. Register cosocket API (C closures with *LuaState upvalue)
+        // 8. Register async API (C closures with *LuaState upvalue)
         // 9. Set worker globals (keyway.worker_id)
         // 10. Load Lua script + process route table
         // 11. Create Server (socket, bind, listen, TLS context)
@@ -122,7 +122,7 @@ pub const Worker = struct {
         //
         // Invariants:
         // - CPU pinning MUST happen before any allocations (NUMA locality)
-        // - registerCosocketApi needs stable *LuaState pointer (after init)
+        // - registerAsyncApi needs stable *LuaState pointer (after init)
         // - setWorkerGlobals must precede loadScript (scripts may read worker_id)
         // - processRouteTable must follow loadScript (reads keyway.routes)
 
@@ -152,8 +152,8 @@ pub const Worker = struct {
         // Set SSE registry on LuaState (for broadcast C function)
         lua_state.sse_registry = &sse_registry;
 
-        // Register cosocket API (needs stable *LuaState pointer)
-        lua_state.registerCosocketApi();
+        // Register async API (needs stable *LuaState pointer)
+        lua_state.registerAsyncApi();
 
         // Register file I/O API (admin operations, behind localhost_guard)
         lua_state.registerFileApi();
