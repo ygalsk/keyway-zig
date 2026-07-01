@@ -37,13 +37,6 @@ fn syscallErrno(rc: usize) std.posix.E {
     return .SUCCESS;
 }
 
-/// `std.posix.pread` replacement (removed in 0.16).
-pub fn pread(fd: std.posix.fd_t, buf: []u8, offset: u64) !usize {
-    const rc = std.os.linux.pread(fd, buf.ptr, buf.len, @intCast(offset));
-    if (syscallErrno(rc) != .SUCCESS) return error.PReadFailed;
-    return rc;
-}
-
 /// `std.posix.pipe` replacement (removed in 0.16).
 pub fn pipe() ![2]std.posix.fd_t {
     var fds: [2]std.posix.fd_t = undefined;
