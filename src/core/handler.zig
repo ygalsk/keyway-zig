@@ -474,6 +474,9 @@ pub const Connection = struct {
             }
             break :blk cb.writeSlice();
         } else blk: {
+            // Reclaim space consumed by a prior pipelined request before
+            // deciding the buffer is full (writeSlice no longer auto-compacts).
+            self.read_buffer.compact();
             if (self.read_buffer.availableWrite() == 0) {
                 self.send400BadRequest();
                 return;
