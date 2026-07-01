@@ -15,7 +15,6 @@ const Router = @import("../http/router.zig").Router;
 const lua_api = @import("lua_api.zig");
 const IoEntry = @import("../io/ring.zig").IoEntry;
 const io_request = @import("../io/io_request.zig");
-const ring_api = @import("../io/ring_api.zig");
 const ring = @import("../io/ring.zig");
 const ConnectionPool = @import("../io/connection_pool.zig").ConnectionPool;
 const Connection = @import("../core/handler.zig").Connection;
@@ -553,19 +552,7 @@ pub const LuaState = struct {
     /// Must be called after init (needs stable *LuaState pointer).
     pub fn registerCosocketApi(self: *LuaState) void {
         const funcs = .{
-            .{ "__keyway_io_connect", io_request.keyway_io_connect },
-            .{ "__keyway_io_send", io_request.keyway_io_send },
-            .{ "__keyway_io_recv", io_request.keyway_io_recv },
-            .{ "__keyway_io_close", io_request.keyway_io_close },
-            .{ "__keyway_pool_connect", io_request.keyway_pool_connect },
-            .{ "__keyway_pool_setkeepalive", io_request.keyway_pool_setkeepalive },
-            .{ "__keyway_io_udp_connect", io_request.keyway_io_udp_connect },
-            .{ "__keyway_io_sslhandshake", io_request.keyway_io_sslhandshake },
             .{ "__keyway_ws_send", io_request.keyway_ws_send },
-            // Ring API: batched I/O
-            .{ "__keyway_ring_push", ring_api.keyway_ring_push },
-            .{ "__keyway_ring_submit", ring_api.keyway_ring_submit },
-            .{ "__keyway_ring_result", ring_api.keyway_ring_result },
             .{ "__keyway_sse_broadcast", keyway_sse_broadcast },
         };
 
@@ -590,37 +577,6 @@ pub const LuaState = struct {
 
         registry.broadcast(std.mem.span(room), std.mem.span(data));
         return 0;
-    }
-
-    // --- Ring API delegation methods ---
-    // These let ring_api.zig access the current Connection's SQ/CQ
-    // without importing handler.zig, sealing the proactor boundary.
-
-    /// Push an IoEntry onto the current Connection's submission ring.
-    /// Returns error.NoActiveRequest if no connection is active.
-    pub fn pushSqEntry(self: *LuaState, entry: ring.IoEntry) error{ RingFull, NoActiveRequest }!void {
-        const conn = self.currentConnection() orelse return error.NoActiveRequest;
-        try conn.cs.sq.push(entry);
-    }
-
-    /// Read a completion entry by index from the current Connection's CQ.
-    /// Returns null if no connection is active or index is out of range.
-    pub fn getCqEntry(self: *LuaState, index: u8) ?ring.CQEntry {
-        const conn = self.currentConnection() orelse return null;
-        if (index >= conn.cs.cq.tail) return null;
-        return conn.cs.cq.get(index);
-    }
-
-    /// Return the number of pending SQ entries, or null if no connection is active.
-    pub fn sqLen(self: *LuaState) ?u8 {
-        const conn = self.currentConnection() orelse return null;
-        return conn.cs.sq.len();
-    }
-
-    /// Return the CQ tail (number of completions), or null if no connection is active.
-    pub fn cqTail(self: *LuaState) ?u8 {
-        const conn = self.currentConnection() orelse return null;
-        return conn.cs.cq.tail;
     }
 
     /// Cast current_connection to *Connection. Internal helper.
