@@ -202,14 +202,6 @@ keyway.proxy = {
 keyway.routes = {
     middleware = { localhost_guard },
 
-    -- Dashboard: SSE event stream
-    ["/__keyway/events"] = {
-        GET = function(ctx)
-            ctx.upgrade = "sse"
-            ctx.sse_room = "keyway:access"
-        end,
-    },
-
     -- Dashboard: WebSocket command interface
     ["/__keyway/ws"] = {
         GET = function(ctx)
@@ -417,6 +409,13 @@ keyway.routes = {
                 return
             end
             local decoded = url_decode(ctx.params.path)
+            if decoded:match("%.lua$") then
+                local fn, lerr = loadstring(body.content, "@" .. decoded)
+                if not fn then
+                    response.json_response(ctx, 422, { error = lerr })
+                    return
+                end
+            end
             local file_path = "dashboard/" .. decoded
             local success, err = __keyway_file_write(file_path, body.content)
             if not success then
