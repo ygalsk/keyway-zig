@@ -19,17 +19,34 @@ pub inline fn requireString(lua: *Lua, idx: i32, err_msg: [:0]const u8) []const 
 }
 
 /// Parse TLS mode from a Lua argument: boolean (backward compat) or string ("verify","insecure","custom").
-/// Returns .verify as the default.
+/// An absent/nil argument defaults to .verify. Any other malformed value (unknown string,
+/// or a type that is neither boolean nor string) raises a Lua error rather than silently
+/// defaulting — a wrong stack index must fail loud, not quietly pick a mode.
 pub fn parseTlsMode(lua: *Lua, arg_index: i32) TlsMode {
-    if (lua.isString(arg_index)) {
-        const mode_str = std.mem.span(lua.toString(arg_index) catch return TlsMode.verify);
-        if (std.mem.eql(u8, mode_str, "custom")) return TlsMode.custom;
-        if (std.mem.eql(u8, mode_str, "insecure")) return TlsMode.insecure;
-        return TlsMode.verify;
-    } else if (lua.isBoolean(arg_index) and lua.toBoolean(arg_index)) {
-        return TlsMode.insecure;
+    if (lua.isNoneOrNil(arg_index)) return TlsMode.verify;
+
+    if (lua.isBoolean(arg_index)) {
+        // Backward compat: true = insecure, false = verify.
+        return if (lua.toBoolean(arg_index)) TlsMode.insecure else TlsMode.verify;
     }
-    return TlsMode.verify;
+
+    if (lua.isString(arg_index)) {
+        const mode_str = std.mem.span(lua.toString(arg_index) catch {
+            lua.pushString("tls mode: unreadable string argument");
+            lua.raiseError();
+            unreachable;
+        });
+        if (std.mem.eql(u8, mode_str, "verify")) return TlsMode.verify;
+        if (std.mem.eql(u8, mode_str, "insecure")) return TlsMode.insecure;
+        if (std.mem.eql(u8, mode_str, "custom")) return TlsMode.custom;
+        lua.pushString("tls mode: expected 'verify', 'insecure', or 'custom'");
+        lua.raiseError();
+        unreachable;
+    }
+
+    lua.pushString("tls mode: expected boolean or string ('verify'/'insecure'/'custom')");
+    lua.raiseError();
+    unreachable;
 }
 
 /// Parse a Lua stack into an IoEntry based on an op string.
@@ -316,4 +333,35 @@ pub fn keyway_io_udp_connect(lua: *Lua) callconv(.c) c_int {
     } };
 
     return lua_yield(@ptrCast(lua), 0);
+}
+
+test "parseTlsMode maps valid inputs and defaults absent/nil to verify" {
+    const lua = try Lua.init(std.testing.allocator);
+    defer lua.deinit();
+
+    // Absent argument (index past top) → verify.
+    try std.testing.expectEqual(TlsMode.verify, parseTlsMode(lua, 1));
+
+    lua.pushNil();
+    try std.testing.expectEqual(TlsMode.verify, parseTlsMode(lua, lua.getTop()));
+    lua.pop(1);
+
+    // Boolean backward-compat: true = insecure, false = verify.
+    lua.pushBoolean(true);
+    try std.testing.expectEqual(TlsMode.insecure, parseTlsMode(lua, lua.getTop()));
+    lua.pop(1);
+    lua.pushBoolean(false);
+    try std.testing.expectEqual(TlsMode.verify, parseTlsMode(lua, lua.getTop()));
+    lua.pop(1);
+
+    const cases = .{
+        .{ "verify", TlsMode.verify },
+        .{ "insecure", TlsMode.insecure },
+        .{ "custom", TlsMode.custom },
+    };
+    inline for (cases) |c| {
+        lua.pushString(c[0]);
+        try std.testing.expectEqual(c[1], parseTlsMode(lua, lua.getTop()));
+        lua.pop(1);
+    }
 }
