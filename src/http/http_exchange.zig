@@ -58,7 +58,12 @@ pub const HttpExchange = struct {
         };
     }
 
-    /// Add a response header
+    /// Add a response header.
+    ///
+    /// Ownership: `name` and `value` are copied into the exchange allocator, so
+    /// the caller keeps ownership of its input buffers and may free or reuse
+    /// them immediately after this returns. The copies live for the exchange's
+    /// lifetime (freed via `toResponse` transfer or `deinit`).
     pub fn addResponseHeader(self: *HttpExchange, name: []const u8, value: []const u8) !void {
         // Copy strings from Lua memory into arena (Lua strings are temporary)
         const name_copy = try self.allocator.dupe(u8, name);
