@@ -65,7 +65,6 @@ pub const Worker = struct {
         coordinator: ?*ShutdownCoordinator,
         reload_coordinator: ?*ReloadCoordinator,
         metrics: *WorkerMetrics,
-        all_metrics_ptrs: []const *WorkerMetrics,
         ready_count: *std.atomic.Value(usize),
         script_path: []const u8,
         watch: bool,
@@ -186,9 +185,6 @@ pub const Worker = struct {
             ctx.metrics,
         );
         defer server.deinit();
-
-        // Expose all worker metrics to health endpoint
-        server.all_worker_metrics = ctx.all_metrics_ptrs;
 
         // Register shutdown Async watcher (fires when coordinator signals drain)
         var shutdown_completion: xev.Completion = undefined;
@@ -352,7 +348,6 @@ pub const ThreadPool = struct {
     coordinator: ?*ShutdownCoordinator = null,
     reload_coordinator: ?*ReloadCoordinator = null,
     worker_metrics: []WorkerMetrics,
-    all_metrics_ptrs: []*WorkerMetrics,
     ready_count: *std.atomic.Value(usize),
 
     /// Create thread pool with the given number of workers.
@@ -393,12 +388,6 @@ pub const ThreadPool = struct {
         // Create SSE broadcast bus (shared across all workers)
         const sse_bus = SseBroadcastBus.init(allocator, num_workers) catch null;
 
-        // Build slice of pointers to all worker metrics (for health endpoint aggregation)
-        const all_metrics_ptrs = try allocator.alloc(*WorkerMetrics, num_workers);
-        for (all_metrics_ptrs, 0..) |*ptr, i| {
-            ptr.* = &worker_metrics[i];
-        }
-
         // Spawn workers
         for (workers, 0..) |*worker, i| {
             worker.* = try Worker.spawn(allocator, .{
@@ -411,7 +400,6 @@ pub const ThreadPool = struct {
                 .coordinator = coordinator,
                 .reload_coordinator = reload_coordinator,
                 .metrics = &worker_metrics[i],
-                .all_metrics_ptrs = all_metrics_ptrs,
                 .ready_count = ready_count,
                 .script_path = script_path,
                 .watch = watch,
@@ -426,7 +414,6 @@ pub const ThreadPool = struct {
             .coordinator = coordinator,
             .reload_coordinator = reload_coordinator,
             .worker_metrics = worker_metrics,
-            .all_metrics_ptrs = all_metrics_ptrs,
             .ready_count = ready_count,
         };
     }
@@ -450,7 +437,6 @@ pub const ThreadPool = struct {
         if (self.sse_bus) |bus| bus.deinit();
         self.allocator.destroy(self.bpf_ready);
         self.allocator.destroy(self.ready_count);
-        self.allocator.free(self.all_metrics_ptrs);
         self.allocator.free(self.worker_metrics);
         self.allocator.free(self.workers);
     }

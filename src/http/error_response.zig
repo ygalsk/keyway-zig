@@ -1,8 +1,8 @@
 //! Unified error response model.
 //!
 //! Every HTTP error response (4xx, 5xx) flows through this module.
-//! ErrorCategory maps error classes to default status codes, plain-text bodies,
-//! and severity-based log levels. Pre-serialized responses avoid runtime formatting.
+//! ErrorCategory maps error classes to default status codes and severity-based
+//! log levels. Pre-serialized responses avoid runtime formatting.
 //!
 //! No internal details (Zig error names, file paths, stack traces) leak to clients.
 
@@ -24,16 +24,6 @@ pub const ErrorCategory = enum {
             .server_error => 500,
             .timeout => 504,
             .upstream_error => 502,
-        };
-    }
-
-    /// Default plain-text body for this error category.
-    pub fn defaultBody(self: ErrorCategory) []const u8 {
-        return switch (self) {
-            .client_error => "Bad Request",
-            .server_error => "Internal Server Error",
-            .timeout => "Gateway Timeout",
-            .upstream_error => "Bad Gateway",
         };
     }
 
@@ -69,18 +59,10 @@ const response_413 = comptimeErrorResponse(413, "Content Too Large", "Content To
 /// Pre-serialized 404 response for route misses.
 const response_404 = comptimeErrorResponse(404, "Not Found", "Not Found");
 
-/// Get pre-serialized response bytes for a category.
-fn categoryResponse(category: ErrorCategory) []const u8 {
-    return switch (category) {
-        .client_error => response_400,
-        .server_error => response_500,
-        .timeout => response_504,
-        .upstream_error => response_502,
-    };
-}
-
 /// Get pre-serialized response bytes for a specific status code.
 /// Returns null if no pre-serialized response exists for that status.
+/// Every ErrorCategory.defaultStatus() is present here, so category dispatch
+/// routes through this too.
 fn statusResponse(status: u16) ?[]const u8 {
     return switch (status) {
         400 => response_400,
@@ -119,7 +101,7 @@ pub fn logError(
 /// Send an error response for a category. Logs the error and sends the pre-serialized response.
 pub fn sendError(conn: *Connection, category: ErrorCategory, internal_msg: []const u8) void {
     logError(category, category.defaultStatus(), conn.http_state.request_method, conn.http_state.request_path, internal_msg);
-    conn.sendRawResponse(categoryResponse(category));
+    conn.sendRawResponse(statusResponse(category.defaultStatus()).?);
 }
 
 /// Send an error response for a specific status code.
@@ -130,7 +112,7 @@ pub fn sendErrorStatus(conn: *Connection, status: u16, internal_msg: []const u8)
     if (statusResponse(status)) |resp| {
         conn.sendRawResponse(resp);
     } else {
-        conn.sendRawResponse(categoryResponse(category));
+        conn.sendRawResponse(statusResponse(category.defaultStatus()).?);
     }
 }
 
@@ -143,13 +125,6 @@ test "ErrorCategory.defaultStatus maps correctly" {
     try std.testing.expectEqual(@as(u16, 500), ErrorCategory.server_error.defaultStatus());
     try std.testing.expectEqual(@as(u16, 504), ErrorCategory.timeout.defaultStatus());
     try std.testing.expectEqual(@as(u16, 502), ErrorCategory.upstream_error.defaultStatus());
-}
-
-test "ErrorCategory.defaultBody maps correctly" {
-    try std.testing.expectEqualStrings("Bad Request", ErrorCategory.client_error.defaultBody());
-    try std.testing.expectEqualStrings("Internal Server Error", ErrorCategory.server_error.defaultBody());
-    try std.testing.expectEqualStrings("Gateway Timeout", ErrorCategory.timeout.defaultBody());
-    try std.testing.expectEqualStrings("Bad Gateway", ErrorCategory.upstream_error.defaultBody());
 }
 
 test "ErrorCategory.logLevel maps correctly" {

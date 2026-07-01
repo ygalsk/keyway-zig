@@ -38,6 +38,9 @@ review/
 graphify-out/
 src/graphify-out/
 
+# Dashboard bundle source maps (regenerable from dashboard/ui)
+dashboard/public/*.map
+
 # Test results
 tests/test-results/
 

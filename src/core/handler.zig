@@ -35,8 +35,6 @@ const conn_stream = @import("../protocol/conn_stream.zig");
 const cosocket = @import("../io/cosocket.zig");
 const error_response = @import("../http/error_response.zig");
 const Server = @import("server.zig").Server;
-const WorkerMetrics = @import("../observability/metrics.zig").WorkerMetrics;
-const metrics_mod = @import("../observability/metrics.zig");
 const prom = @import("../observability/prom.zig");
 const static_mod = @import("../http/static.zig");
 
@@ -548,9 +546,7 @@ pub const Connection = struct {
     pub fn logAccess(self: *Connection, status: u16) void {
         const dur_us: i64 = @intCast(@divTrunc(helpers.monotonicNanos() - self.http_state.request_start_ns, 1000));
         log.accessLog(self.http_state.request_method, self.http_state.request_path, status, dur_us);
-        // Record metrics (latency + error tracking)
         const latency_us: u64 = @intCast(@max(0, dur_us));
-        self.server.metrics.recordRequest(latency_us, status >= 400);
         prom.recordRequest(self.http_state.request_method, status, latency_us, self.http_state.route_pattern);
     }
 
@@ -812,33 +808,14 @@ pub const Connection = struct {
         return false;
     }
 
-    /// Zig-native health endpoint. Returns JSON metrics with zero Lua overhead.
-    /// 200 when ready, 503 when draining.
+    /// Zig-native liveness endpoint. 200 when ready, 503 when draining.
+    /// Request/latency stats live in Prometheus (/metrics), not here.
     fn serveHealth(self: *Connection, alloc: std.mem.Allocator) void {
         const server = self.server;
-        const status_str: []const u8 = if (server.draining) "draining" else "ok";
-        const http_status: u16 = if (server.draining) 503 else 200;
-        const status_text: []const u8 = if (server.draining) "Service Unavailable" else "OK";
-
-        // Aggregate metrics from all workers via the metrics slice stored on server
-        const agg = metrics_mod.aggregate(server.all_worker_metrics, status_str);
-
-        const json_fmt = "{{\"status\":\"{s}\",\"worker_count\":{d},\"total_requests\":{d},\"total_errors\":{d},\"active_connections\":{d},\"rejected_connections\":{d},\"latency\":{{\"min_us\":{d},\"max_us\":{d},\"avg_us\":{d}}}}}";
-        const json_args = .{
-            agg.status,
-            agg.worker_count,
-            agg.total_requests,
-            agg.total_errors,
-            agg.active_connections,
-            agg.rejected_connections,
-            agg.latency_min_us,
-            agg.latency_max_us,
-            agg.latency_avg_us,
-        };
-        const body = std.fmt.allocPrint(alloc, json_fmt, json_args) catch {
-            error_response.sendError(self, .server_error, "health endpoint allocation failed");
-            return;
-        };
+        const draining = server.draining;
+        const http_status: u16 = if (draining) 503 else 200;
+        const status_text: []const u8 = if (draining) "Service Unavailable" else "OK";
+        const body: []const u8 = if (draining) "{\"status\":\"draining\"}" else "{\"status\":\"ok\"}";
         self.sendJsonResponse(alloc, http_status, status_text, body);
     }
 
