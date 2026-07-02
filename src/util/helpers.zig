@@ -28,10 +28,14 @@ pub fn monotonicNanos() i64 {
 
 // -- Raw syscall wrappers ---------------------------------------------------
 // Zig 0.16 removed most `std.posix.*` syscall wrappers. These reimplement the
-// few keyway needs via raw `std.os.linux` / libc calls. Errno decode mirrors
-// the manual decoder in src/tls/tls.zig (raw syscalls return -errno as usize).
+// few keyway needs via raw `std.os.linux` / libc calls.
 
-fn syscallErrno(rc: usize) std.posix.E {
+/// Decode errno from a raw Linux syscall return value.
+/// Raw syscalls return -errno as usize on failure. std.posix.errno() doesn't
+/// reliably decode all values (e.g. small negative values can slip through),
+/// so we decode manually: negate the signed value to get the errno integer.
+/// Also used directly by src/tls/tls.zig for its raw setsockopt/getsockopt calls.
+pub fn syscallErrno(rc: usize) std.posix.E {
     const signed: isize = @bitCast(rc);
     if (signed < 0 and signed > -4096) return @enumFromInt(@as(u16, @intCast(-signed)));
     return .SUCCESS;

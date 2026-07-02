@@ -7,7 +7,7 @@ const Lua = @import("luajit").Lua;
 const max_depth = 128;
 const alloc = std.heap.c_allocator;
 
-const Buf = std.ArrayListUnmanaged(u8);
+const Buf = std.Io.Writer.Allocating;
 
 const EncodeError = error{
     DepthLimitExceeded,
@@ -25,10 +25,10 @@ pub fn jsonEncode(lua: *Lua) callconv(.c) c_int {
         lua.pushString("JSON encode: argument required");
         lua.raiseError();
     }
-    var buf: Buf = .empty;
+    var buf: Buf = .init(alloc);
 
     encodeValue(lua, 1, &buf, 0) catch |err| {
-        buf.deinit(alloc);
+        buf.deinit();
         const msg: [*:0]const u8 = switch (err) {
             error.DepthLimitExceeded => "JSON encode: depth limit exceeded (circular reference?)",
             error.OutOfMemory => "JSON encode: out of memory",
@@ -39,8 +39,8 @@ pub fn jsonEncode(lua: *Lua) callconv(.c) c_int {
         lua.raiseError();
     };
 
-    lua.pushLString(buf.items);
-    buf.deinit(alloc);
+    lua.pushLString(buf.written());
+    buf.deinit();
     return 1;
 }
 
@@ -51,8 +51,8 @@ fn encodeValue(lua: *Lua, idx: i32, buf: *Buf, depth: u32) EncodeError!void {
     const abs = if (idx > 0) idx else lua.getTop() + idx + 1;
 
     switch (lua.getType(abs)) {
-        .nil, .none => buf.appendSlice(alloc, "null") catch return error.OutOfMemory,
-        .boolean => buf.appendSlice(alloc, if (lua.toBoolean(abs)) "true" else "false") catch return error.OutOfMemory,
+        .nil, .none => buf.writer.writeAll("null") catch return error.OutOfMemory,
+        .boolean => buf.writer.writeAll(if (lua.toBoolean(abs)) "true" else "false") catch return error.OutOfMemory,
         .string => {
             const str = lua.toLString(abs) catch return error.NotSerializable;
             try encodeString(str, buf);
@@ -68,38 +68,12 @@ fn encodeNumber(lua: *Lua, idx: i32, buf: *Buf) EncodeError!void {
     if (std.math.isNan(n) or std.math.isInf(n)) return error.InvalidNumber;
 
     var num_buf: [64]u8 = undefined;
-    const floored = @floor(n);
-    if (floored == n and n >= -9007199254740992.0 and n <= 9007199254740992.0) {
-        const formatted = std.fmt.bufPrint(&num_buf, "{d}", .{@as(i64, @intFromFloat(n))}) catch return error.OutOfMemory;
-        buf.appendSlice(alloc, formatted) catch return error.OutOfMemory;
-    } else {
-        const formatted = std.fmt.bufPrint(&num_buf, "{d}", .{n}) catch return error.OutOfMemory;
-        buf.appendSlice(alloc, formatted) catch return error.OutOfMemory;
-    }
+    const formatted = std.fmt.bufPrint(&num_buf, "{d}", .{n}) catch return error.OutOfMemory;
+    buf.writer.writeAll(formatted) catch return error.OutOfMemory;
 }
 
 fn encodeString(str: []const u8, buf: *Buf) EncodeError!void {
-    buf.append(alloc, '"') catch return error.OutOfMemory;
-    for (str) |c| {
-        switch (c) {
-            '"' => buf.appendSlice(alloc, "\\\"") catch return error.OutOfMemory,
-            '\\' => buf.appendSlice(alloc, "\\\\") catch return error.OutOfMemory,
-            '\n' => buf.appendSlice(alloc, "\\n") catch return error.OutOfMemory,
-            '\r' => buf.appendSlice(alloc, "\\r") catch return error.OutOfMemory,
-            '\t' => buf.appendSlice(alloc, "\\t") catch return error.OutOfMemory,
-            0x08 => buf.appendSlice(alloc, "\\b") catch return error.OutOfMemory,
-            0x0C => buf.appendSlice(alloc, "\\f") catch return error.OutOfMemory,
-            else => {
-                if (c < 0x20) {
-                    const hex = "0123456789abcdef";
-                    buf.appendSlice(alloc, &[6]u8{ '\\', 'u', '0', '0', hex[c >> 4], hex[c & 0x0f] }) catch return error.OutOfMemory;
-                } else {
-                    buf.append(alloc, c) catch return error.OutOfMemory;
-                }
-            },
-        }
-    }
-    buf.append(alloc, '"') catch return error.OutOfMemory;
+    std.json.Stringify.encodeJsonString(str, .{}, &buf.writer) catch return error.OutOfMemory;
 }
 
 fn encodeTable(lua: *Lua, abs_idx: i32, buf: *Buf, depth: u32) EncodeError!void {
@@ -107,7 +81,7 @@ fn encodeTable(lua: *Lua, abs_idx: i32, buf: *Buf, depth: u32) EncodeError!void 
     const first_type = lua.getTableIndexRaw(abs_idx, 1);
     if (first_type != .nil) {
         lua.pop(1);
-        buf.append(alloc, '[') catch return error.OutOfMemory;
+        buf.writer.writeByte('[') catch return error.OutOfMemory;
         var i: i32 = 1;
         while (true) {
             const t = lua.getTableIndexRaw(abs_idx, i);
@@ -115,12 +89,12 @@ fn encodeTable(lua: *Lua, abs_idx: i32, buf: *Buf, depth: u32) EncodeError!void 
                 lua.pop(1);
                 break;
             }
-            if (i > 1) buf.append(alloc, ',') catch return error.OutOfMemory;
+            if (i > 1) buf.writer.writeByte(',') catch return error.OutOfMemory;
             try encodeValue(lua, -1, buf, depth + 1);
             lua.pop(1);
             i += 1;
         }
-        buf.append(alloc, ']') catch return error.OutOfMemory;
+        buf.writer.writeByte(']') catch return error.OutOfMemory;
         return;
     }
     lua.pop(1); // pop nil from table[1] check
@@ -128,17 +102,17 @@ fn encodeTable(lua: *Lua, abs_idx: i32, buf: *Buf, depth: u32) EncodeError!void 
     // Object mode (or empty table)
     lua.pushNil();
     if (!lua.next(abs_idx)) {
-        buf.appendSlice(alloc, "{}") catch return error.OutOfMemory;
+        buf.writer.writeAll("{}") catch return error.OutOfMemory;
         return;
     }
 
-    buf.append(alloc, '{') catch return error.OutOfMemory;
+    buf.writer.writeByte('{') catch return error.OutOfMemory;
     var first = true;
     // First key-value pair already on stack from next() above
     while (true) {
         // key at -2, value at -1
         if (lua.isString(-2)) {
-            if (!first) buf.append(alloc, ',') catch return error.OutOfMemory;
+            if (!first) buf.writer.writeByte(',') catch return error.OutOfMemory;
             first = false;
 
             const key = lua.toLString(-2) catch {
@@ -146,13 +120,13 @@ fn encodeTable(lua: *Lua, abs_idx: i32, buf: *Buf, depth: u32) EncodeError!void 
                 return error.NotSerializable;
             };
             try encodeString(key, buf);
-            buf.append(alloc, ':') catch return error.OutOfMemory;
+            buf.writer.writeByte(':') catch return error.OutOfMemory;
             try encodeValue(lua, -1, buf, depth + 1);
         }
         lua.pop(1); // pop value, keep key for next()
         if (!lua.next(abs_idx)) break;
     }
-    buf.append(alloc, '}') catch return error.OutOfMemory;
+    buf.writer.writeByte('}') catch return error.OutOfMemory;
 }
 
 // ── Decode ──────────────────────────────────────────────────────────
