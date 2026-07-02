@@ -8,9 +8,6 @@ const Connection = handler_mod.Connection;
 const HttpExchange = @import("../http/http_exchange.zig").HttpExchange;
 const castUserdata = @import("../util/helpers.zig").castUserdata;
 const Lua = @import("luajit").Lua;
-const lua_api = @import("../lua/lua_api.zig");
-const tls_mod = @import("../tls/tls.zig");
-const TlsConn = tls_mod.TlsConn;
 const config = @import("../util/config.zig");
 
 /// WebSocket connection state — set after successful 101 upgrade.

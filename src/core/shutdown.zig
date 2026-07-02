@@ -74,11 +74,6 @@ pub const ShutdownCoordinator = struct {
         // Already force_shutdown — nothing to do
     }
 
-    /// Returns true when state is not running (draining or force_shutdown).
-    pub fn isDraining(self: *const ShutdownCoordinator) bool {
-        return self.state.load(.monotonic) != @intFromEnum(State.running);
-    }
-
     /// Returns true when state is force_shutdown.
     pub fn isForceShutdown(self: *const ShutdownCoordinator) bool {
         return self.state.load(.monotonic) == @intFromEnum(State.force_shutdown);
@@ -128,7 +123,7 @@ test "ShutdownCoordinator state machine: init is running" {
     var coordinator = coord;
     defer coordinator.deinit();
 
-    try std.testing.expect(!coordinator.isDraining());
+    try std.testing.expectEqual(@intFromEnum(State.running), coordinator.state.load(.monotonic));
     try std.testing.expect(!coordinator.isForceShutdown());
 }
 
@@ -137,7 +132,7 @@ test "ShutdownCoordinator state machine: first signal -> draining" {
     defer coordinator.deinit();
 
     coordinator.signalReceived();
-    try std.testing.expect(coordinator.isDraining());
+    try std.testing.expectEqual(@intFromEnum(State.draining), coordinator.state.load(.monotonic));
     try std.testing.expect(!coordinator.isForceShutdown());
 }
 
@@ -147,7 +142,7 @@ test "ShutdownCoordinator state machine: second signal -> force_shutdown" {
 
     coordinator.signalReceived();
     coordinator.signalReceived();
-    try std.testing.expect(coordinator.isDraining());
+    try std.testing.expect(coordinator.state.load(.monotonic) != @intFromEnum(State.running));
     try std.testing.expect(coordinator.isForceShutdown());
 }
 

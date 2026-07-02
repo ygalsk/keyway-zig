@@ -7,9 +7,6 @@ const params = @import("params.zig");
 const Node = struct {
     allocator: std.mem.Allocator,
 
-    // Static path segment prefix (e.g., "users", "posts")
-    prefix: []const u8,
-
     // Children for static segments (map segment -> node)
     children: std.StringHashMap(*Node),
 
@@ -27,11 +24,10 @@ const Node = struct {
         node: *Node,
     };
 
-    fn init(allocator: std.mem.Allocator, prefix: []const u8) !*Node {
+    fn init(allocator: std.mem.Allocator) !*Node {
         const node = try allocator.create(Node);
         node.* = Node{
             .allocator = allocator,
-            .prefix = prefix,
             .children = std.StringHashMap(*Node).init(allocator),
             .param_child = null,
             .methods = null,
@@ -40,11 +36,6 @@ const Node = struct {
     }
 
     fn deinit(self: *Node) void {
-        // Free prefix if allocated
-        if (self.prefix.len > 0) {
-            self.allocator.free(self.prefix);
-        }
-
         // Recursively free children (and their keys)
         var it = self.children.iterator();
         while (it.next()) |entry| {
@@ -186,7 +177,7 @@ pub const Router = struct {
 
     /// Initialize radix router
     pub fn init(allocator: std.mem.Allocator) !Router {
-        const root = try Node.init(allocator, "");
+        const root = try Node.init(allocator);
         return Router{
             .allocator = allocator,
             .root = root,
@@ -315,7 +306,7 @@ pub const Router = struct {
 
                 // Get or create param child
                 if (node.param_child == null) {
-                    const param_node = try Node.init(self.allocator, "");
+                    const param_node = try Node.init(self.allocator);
                     const param = try self.allocator.create(Node.ParamChild);
                     param.* = .{
                         .param_name = try self.allocator.dupe(u8, param_name),
@@ -331,9 +322,9 @@ pub const Router = struct {
                 if (!gop.found_existing) {
                     // Create new node with duplicated segment (owned by us)
                     const segment_copy = try self.allocator.dupe(u8, segment);
-                    // HashMap owns the segment string; node gets empty prefix to avoid double-free
+                    // HashMap owns the duplicated segment key.
                     gop.key_ptr.* = segment_copy; // Update HashMap key to use our copy
-                    const child_node = try Node.init(self.allocator, "");
+                    const child_node = try Node.init(self.allocator);
                     gop.value_ptr.* = child_node;
                 }
                 node = gop.value_ptr.*;
@@ -456,7 +447,7 @@ pub const Router = struct {
         self.root.deinit();
 
         // Reinit fresh root
-        self.root = try Node.init(self.allocator, "");
+        self.root = try Node.init(self.allocator);
     }
 
     /// Returns true if no routes have been registered

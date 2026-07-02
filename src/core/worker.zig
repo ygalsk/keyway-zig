@@ -11,8 +11,6 @@ const SseBroadcastBus = sse.SseBroadcastBus;
 const ShutdownCoordinator = @import("shutdown.zig").ShutdownCoordinator;
 const ReloadCoordinator = @import("reload.zig").ReloadCoordinator;
 const FileWatcher = @import("../io/file_watcher.zig").FileWatcher;
-const metrics_mod = @import("../observability/metrics.zig");
-const WorkerMetrics = metrics_mod.WorkerMetrics;
 const config = @import("../util/config.zig");
 const prom = @import("../observability/prom.zig");
 
@@ -48,11 +46,7 @@ inline fn pinThreadToCore(core_id: usize) bool {
 /// Worker thread - owns its own event loop and Lua state
 /// Each worker accepts connections independently using SO_REUSEPORT
 pub const Worker = struct {
-    allocator: std.mem.Allocator,
     thread: std.Thread,
-    config: Server.Config,
-    router: *Router,
-    worker_id: usize,
 
     /// Worker context passed to thread
     const Context = struct {
@@ -64,7 +58,7 @@ pub const Worker = struct {
         sse_bus: ?*SseBroadcastBus,
         coordinator: ?*ShutdownCoordinator,
         reload_coordinator: ?*ReloadCoordinator,
-        metrics: *WorkerMetrics,
+        metrics: *std.atomic.Value(u32),
         ready_count: *std.atomic.Value(usize),
         live_count: *std.atomic.Value(usize),
         script_path: []const u8,
@@ -78,13 +72,7 @@ pub const Worker = struct {
 
         const thread = try std.Thread.spawn(.{}, workerMain, .{ctx});
 
-        return Worker{
-            .allocator = allocator,
-            .thread = thread,
-            .config = context.config,
-            .router = undefined, // Each worker creates its own router
-            .worker_id = context.worker_id,
-        };
+        return Worker{ .thread = thread };
     }
 
     /// Wait for worker thread to finish
@@ -317,7 +305,7 @@ fn onShutdownSignal(
     if (!ctx.server.draining) log.info().string("msg", "shutting down").log();
     ctx.server.stopAccepting();
 
-    const active = ctx.server.metrics.active_connections.load(.monotonic);
+    const active = ctx.server.metrics.load(.monotonic);
     log.info().string("msg", "draining active connections").int("active", active).int("deadline_ms", config.DRAIN_DEADLINE_MS).log();
 
     if (active == 0) {
@@ -343,7 +331,7 @@ fn onDrainDeadline(
 ) xev.CallbackAction {
     if (userdata) |ud| {
         const server: *Server = @ptrCast(@alignCast(ud));
-        const remaining = server.metrics.active_connections.load(.monotonic);
+        const remaining = server.metrics.load(.monotonic);
         if (remaining > 0) {
             log.info().string("msg", "drain deadline expired — force-closing connections").int("remaining", remaining).log();
         }
@@ -398,7 +386,7 @@ pub const ThreadPool = struct {
     sse_bus: ?*SseBroadcastBus,
     coordinator: ?*ShutdownCoordinator = null,
     reload_coordinator: ?*ReloadCoordinator = null,
-    worker_metrics: []WorkerMetrics,
+    worker_metrics: []std.atomic.Value(u32),
     ready_count: *std.atomic.Value(usize),
     live_count: *std.atomic.Value(usize),
 
@@ -421,10 +409,10 @@ pub const ThreadPool = struct {
         errdefer allocator.free(workers);
 
         // Create per-worker metrics (allocated here so pointers remain stable)
-        const worker_metrics = try allocator.alloc(WorkerMetrics, num_workers);
+        const worker_metrics = try allocator.alloc(std.atomic.Value(u32), num_workers);
         errdefer allocator.free(worker_metrics);
         for (worker_metrics) |*m| {
-            m.* = WorkerMetrics.init();
+            m.* = std.atomic.Value(u32).init(0);
         }
 
         // Create BPF synchronization flag

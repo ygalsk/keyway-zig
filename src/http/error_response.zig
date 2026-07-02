@@ -15,7 +15,6 @@ pub const ErrorCategory = enum {
     client_error,
     server_error,
     timeout,
-    upstream_error,
 
     /// Default HTTP status code for this error category.
     pub fn defaultStatus(self: ErrorCategory) u16 {
@@ -23,15 +22,14 @@ pub const ErrorCategory = enum {
             .client_error => 400,
             .server_error => 500,
             .timeout => 504,
-            .upstream_error => 502,
         };
     }
 
-    /// Log severity: warn for client-facing/timeout, err for server/upstream failures.
+    /// Log severity: warn for client-facing/timeout, err for server failures.
     pub fn logLevel(self: ErrorCategory) std.log.Level {
         return switch (self) {
             .client_error, .timeout => .warn,
-            .server_error, .upstream_error => .err,
+            .server_error => .err,
         };
     }
 };
@@ -124,14 +122,12 @@ test "ErrorCategory.defaultStatus maps correctly" {
     try std.testing.expectEqual(@as(u16, 400), ErrorCategory.client_error.defaultStatus());
     try std.testing.expectEqual(@as(u16, 500), ErrorCategory.server_error.defaultStatus());
     try std.testing.expectEqual(@as(u16, 504), ErrorCategory.timeout.defaultStatus());
-    try std.testing.expectEqual(@as(u16, 502), ErrorCategory.upstream_error.defaultStatus());
 }
 
 test "ErrorCategory.logLevel maps correctly" {
     try std.testing.expectEqual(std.log.Level.warn, ErrorCategory.client_error.logLevel());
     try std.testing.expectEqual(std.log.Level.warn, ErrorCategory.timeout.logLevel());
     try std.testing.expectEqual(std.log.Level.err, ErrorCategory.server_error.logLevel());
-    try std.testing.expectEqual(std.log.Level.err, ErrorCategory.upstream_error.logLevel());
 }
 
 test "pre-serialized responses are valid HTTP" {

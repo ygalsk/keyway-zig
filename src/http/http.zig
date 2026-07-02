@@ -10,7 +10,6 @@ const c = @cImport({
 pub const Request = struct {
     method: []const u8,
     path: []const u8,
-    version: u8,
     headers: []Header,
     body: []const u8,
     /// Total bytes consumed from input buffer (headers + body per Content-Length)
@@ -215,7 +214,6 @@ pub const Parser = struct {
             return Request{
                 .method = method,
                 .path = path,
-                .version = @as(u8, @intCast(minor_version)),
                 .headers = headers,
                 .body = decoded.body,
                 .raw_len = bytes_consumed + decoded.total_consumed,
@@ -234,7 +232,6 @@ pub const Parser = struct {
         return Request{
             .method = method,
             .path = path,
-            .version = @as(u8, @intCast(minor_version)),
             .headers = headers,
             .body = body,
             .raw_len = total_needed,
@@ -288,7 +285,6 @@ test "http parser - simple GET request" {
 
     try std.testing.expectEqualStrings("GET", request.method);
     try std.testing.expectEqualStrings("/test", request.path);
-    try std.testing.expectEqual(@as(u8, 1), request.version); // HTTP/1.1
     try std.testing.expectEqual(@as(usize, 2), request.headers.len);
 }
 
@@ -412,7 +408,6 @@ test "getContentLength returns value when header present" {
     const request = Request{
         .method = "POST",
         .path = "/upload",
-        .version = 1,
         .headers = @constCast(&headers),
         .body = "",
         .raw_len = 0,
@@ -427,7 +422,6 @@ test "getContentLength returns null when header missing" {
     const request = Request{
         .method = "GET",
         .path = "/",
-        .version = 1,
         .headers = @constCast(&headers),
         .body = "",
         .raw_len = 0,
@@ -442,7 +436,6 @@ test "getContentLength returns null for malformed value" {
     const request = Request{
         .method = "POST",
         .path = "/",
-        .version = 1,
         .headers = @constCast(&headers),
         .body = "",
         .raw_len = 0,
@@ -457,7 +450,6 @@ test "getContentLength is case-insensitive" {
     const request = Request{
         .method = "POST",
         .path = "/",
-        .version = 1,
         .headers = @constCast(&headers),
         .body = "",
         .raw_len = 0,

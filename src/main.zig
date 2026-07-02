@@ -114,7 +114,6 @@ comptime {
     _ = @import("http/http.zig");
     _ = @import("observability/log.zig");
     _ = @import("lua/lua_state.zig");
-    _ = @import("observability/metrics.zig");
     _ = @import("http/params.zig");
     _ = @import("observability/prom.zig");
     _ = @import("core/reload.zig");
