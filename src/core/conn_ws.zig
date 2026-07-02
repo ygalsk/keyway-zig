@@ -22,14 +22,63 @@ pub const WsState = struct {
     fragment_opcode: ws.Opcode = .text,
 };
 
+/// True if the comma-separated header `value` contains `token` (case-insensitive).
+/// RFC 6455 §4.2.1 rules 5-6 phrase the Upgrade/Connection checks this way.
+fn headerHasToken(value: []const u8, token: []const u8) bool {
+    var it = std.mem.splitScalar(u8, value, ',');
+    while (it.next()) |part| {
+        if (std.ascii.eqlIgnoreCase(std.mem.trim(u8, part, " \t"), token)) return true;
+    }
+    return false;
+}
+
 /// Validate upgrade request, build 101 response, store WsState, send it.
 pub fn handleWsUpgrade(conn: *Connection, exchange: *HttpExchange, request: *const http.Request) !void {
+    // ctx.on_message/on_close are ref'd into the Lua registry before this
+    // runs (lua_api.zig). The success path below moves those refs into
+    // conn.ws_state and zeroes the exchange copies; every other return from
+    // this function is a rejected handshake, and nothing else ever unrefs
+    // the exchange copies — so free them here on any path that doesn't
+    // zero them first. No-op on success.
+    const lua = conn.lua_state.lua;
+    defer {
+        if (exchange.ws_on_message_ref != 0) lua.unref(Lua.PseudoIndex.Registry, exchange.ws_on_message_ref);
+        if (exchange.ws_on_close_ref != 0) lua.unref(Lua.PseudoIndex.Registry, exchange.ws_on_close_ref);
+    }
+
+    // RFC 6455 §4.2.1 rule 1: the request line MUST be GET.
+    if (!std.mem.eql(u8, request.method, "GET")) {
+        return error.InvalidWsMethod;
+    }
+
+    const alloc = conn.arena.allocator();
+
+    // RFC 6455 §4.4: on an unsupported version, respond 426 with the
+    // version we support instead of failing the handshake generically.
+    const version_hdr = http.Parser.getHeader(request, "Sec-WebSocket-Version");
+    const version = if (version_hdr) |v| std.mem.trim(u8, v, " \t") else null;
+    if (version == null or !std.mem.eql(u8, version.?, "13")) {
+        var resp = http.Response.init(alloc);
+        resp.status = 426;
+        try resp.addHeader("Sec-WebSocket-Version", "13");
+        try resp.addHeader("Connection", "close");
+        conn.logAccess(426);
+        try conn.writeResponseDirect(&resp);
+        return;
+    }
+
+    // RFC 6455 §4.2.1 rules 5-6: Upgrade/Connection headers must carry the
+    // upgrade tokens (case-insensitive, possibly comma-separated).
+    const upgrade_hdr = http.Parser.getHeader(request, "Upgrade") orelse return error.MissingUpgradeHeader;
+    if (!headerHasToken(upgrade_hdr, "websocket")) return error.InvalidUpgradeHeader;
+
+    const connection_hdr = http.Parser.getHeader(request, "Connection") orelse return error.MissingConnectionHeader;
+    if (!headerHasToken(connection_hdr, "upgrade")) return error.InvalidConnectionHeader;
+
     // Validate Sec-WebSocket-Key header
     const sec_key = http.Parser.getHeader(request, "Sec-WebSocket-Key") orelse {
         return error.MissingWebSocketKey;
     };
-
-    const alloc = conn.arena.allocator();
 
     // Compute accept key
     var accept_key: [28]u8 = undefined;
@@ -192,9 +241,21 @@ pub fn processWsFrames(conn: *Connection) void {
 
                 // Handle control frames immediately (RFC 6455 §5.5):
                 // control frames can be interleaved during fragmentation
+                if ((f.frame.opcode == .ping or f.frame.opcode == .pong or f.frame.opcode == .close) and
+                    (!f.frame.fin or f.frame.payload.len > 125))
+                {
+                    // RFC 6455 §5.5: control frames MUST NOT be fragmented
+                    // and MUST carry a payload of 125 bytes or fewer.
+                    sendWsClose(conn, 1002);
+                    return;
+                }
+
                 switch (f.frame.opcode) {
                     .ping => {
-                        sendWsFrame(conn, .pong, f.frame.payload);
+                        sendWsFrame(conn, .pong, f.frame.payload) catch {
+                            sendWsClose(conn, 1002);
+                            return;
+                        };
                         continue;
                     },
                     .pong => continue,
@@ -214,7 +275,7 @@ pub fn processWsFrames(conn: *Connection) void {
                             sendWsClose(conn, 1002);
                             return;
                         }
-                        dispatchWsMessage(conn, f.frame.payload);
+                        dispatchWsMessage(conn, f.frame.payload, f.frame.opcode == .text);
                         return;
                     }
                     // First fragment of a multi-frame message
@@ -261,7 +322,7 @@ pub fn processWsFrames(conn: *Connection) void {
                         defer conn.base_allocator.free(payload);
                         fb.deinit(conn.arena.allocator());
                         wss.fragment_buf = null;
-                        dispatchWsMessage(conn, payload);
+                        dispatchWsMessage(conn, payload, wss.fragment_opcode == .text);
                         return;
                     }
                 } else {
@@ -277,13 +338,23 @@ pub fn processWsFrames(conn: *Connection) void {
 }
 
 /// Dispatch a WebSocket message to the Lua on_message callback as a fresh coroutine.
-fn dispatchWsMessage(conn: *Connection, payload: []const u8) void {
+/// `is_text` is true for a (possibly reassembled) text message; binary messages
+/// are exempt from UTF-8 validation.
+fn dispatchWsMessage(conn: *Connection, payload: []const u8, is_text: bool) void {
     log.debug().string("msg", "ws dispatchWsMessage").int("payload_len", payload.len).log();
     const wss = conn.ws_state orelse {
         log.err().string("msg", "ws no ws_state, closing").log();
         conn.close();
         return;
     };
+
+    // RFC 6455 §8.1: a text message — including one reassembled from
+    // continuation frames — must be valid UTF-8, checked on the reassembled
+    // result since a multi-byte codepoint may split across fragments.
+    if (is_text and !std.unicode.utf8ValidateSlice(payload)) {
+        sendWsClose(conn, 1007);
+        return;
+    }
 
     if (wss.on_message_ref == 0) {
         // No callback registered — just continue reading
@@ -393,11 +464,13 @@ pub fn routeWsYield(conn: *Connection) void {
     }
 }
 
-/// Send a WS frame directly (for pong, close responses).
-fn sendWsFrame(conn: *Connection, opcode: ws.Opcode, payload: []const u8) void {
-    var frame_buf: [128 + ws.MAX_FRAME_OVERHEAD]u8 = undefined;
-    const truncated = if (payload.len > 128) payload[0..128] else payload;
-    const frame_len = ws.serializeFrame(opcode, truncated, &frame_buf);
+/// Send a WS control frame (currently only pong). RFC 6455 §5.5: control-frame
+/// payloads MUST be 125 bytes or fewer — reject rather than silently
+/// truncate, since truncating a pong would echo the wrong payload back.
+fn sendWsFrame(conn: *Connection, opcode: ws.Opcode, payload: []const u8) !void {
+    if (payload.len > 125) return error.ControlFramePayloadTooLarge;
+    var frame_buf: [125 + ws.MAX_FRAME_OVERHEAD]u8 = undefined;
+    const frame_len = ws.serializeFrame(opcode, payload, &frame_buf);
 
     conn.submitSend(frame_buf[0..frame_len], onWsControlSent, true);
 }
@@ -445,8 +518,43 @@ fn onWsCloseSent(
     return .disarm;
 }
 
+/// RFC 6455 §7.4.1: valid application close codes. 1004-1006 and 1012-1015
+/// are reserved and MUST NOT appear on the wire; 3000-4999 are
+/// library/framework-registered or private-use.
+fn isValidCloseCode(code: u16) bool {
+    return switch (code) {
+        1000, 1001, 1002, 1003, 1007, 1008, 1009, 1010, 1011 => true,
+        3000...4999 => true,
+        else => false,
+    };
+}
+
 /// Handle incoming close frame — fire on_close, echo close back, disconnect.
 fn handleWsClose(conn: *Connection, payload: []const u8) void {
+    // RFC 6455 §7.4.1: a close code, if present, must be a 2-byte payload;
+    // a lone 1-byte payload is a protocol error.
+    if (payload.len == 1) {
+        sendWsClose(conn, 1002);
+        return;
+    }
+
+    const status_code: u16 = if (payload.len >= 2)
+        std.mem.readInt(u16, payload[0..2], .big)
+    else
+        1000;
+
+    if (payload.len >= 2 and !isValidCloseCode(status_code)) {
+        sendWsClose(conn, 1002);
+        return;
+    }
+
+    // RFC 6455 §7.4.1 / Autobahn 7.5.1: the close reason, if present, must
+    // be valid UTF-8.
+    if (payload.len > 2 and !std.unicode.utf8ValidateSlice(payload[2..])) {
+        sendWsClose(conn, 1007);
+        return;
+    }
+
     // Fire on_close callback if registered
     if (conn.ws_state) |wss| {
         if (wss.on_close_ref != 0) {
@@ -455,12 +563,6 @@ fn handleWsClose(conn: *Connection, payload: []const u8) void {
             lua.callProtected(0, 0, 0) catch {};
         }
     }
-
-    // Extract status code from payload (first 2 bytes) or default to 1000
-    const status_code: u16 = if (payload.len >= 2)
-        std.mem.readInt(u16, payload[0..2], .big)
-    else
-        1000;
 
     // Echo close frame back, then disconnect (onWsCloseSent calls conn.close())
     sendWsClose(conn, status_code);

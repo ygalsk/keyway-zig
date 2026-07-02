@@ -23,7 +23,8 @@ pub const ParseResult = union(enum) {
 };
 
 /// Parse a single WebSocket frame from data. Unmasking is done in-place.
-/// Client frames MUST be masked per RFC 6455.
+/// Client frames MUST be masked per RFC 6455 §5.1 (unmasked -> protocol
+/// error). RSV1-3 must be unset since we negotiate no extensions (§5.2).
 pub fn parseFrame(data: []u8) !ParseResult {
     if (data.len < 2) return .incomplete;
 
@@ -31,6 +32,9 @@ pub fn parseFrame(data: []u8) !ParseResult {
     const b1 = data[1];
 
     const fin = (b0 & 0x80) != 0;
+    // RFC 6455 §5.2: RSV1-3 (bits 0x40, 0x20, 0x10) are reserved for
+    // extensions; we negotiate none, so a client setting any is a protocol error.
+    if (b0 & 0x70 != 0) return error.ReservedBitsSet;
     const opcode: Opcode = @enumFromInt(@as(u4, @truncate(b0 & 0x0F)));
     const masked = (b1 & 0x80) != 0;
     var payload_len: u64 = b1 & 0x7F;
@@ -68,14 +72,9 @@ pub fn parseFrame(data: []u8) !ParseResult {
             .consumed = end,
         } };
     } else {
-        const end = std.math.add(usize, pos, payload_len_usize) catch return error.FrameTooLarge;
-        if (data.len < end) return .incomplete;
-
-        const payload = data[pos..end];
-        return .{ .frame = .{
-            .frame = .{ .fin = fin, .opcode = opcode, .payload = payload },
-            .consumed = end,
-        } };
+        // RFC 6455 §5.1: a server MUST close the connection upon receiving
+        // an unmasked frame from a client.
+        return error.UnmaskedFrame;
     }
 }
 
@@ -168,22 +167,24 @@ test "parseFrame - rejects oversized 64-bit length" {
     try std.testing.expectError(error.FrameTooLarge, parseFrame(&data));
 }
 
-test "parseFrame - unmasked ping" {
+test "parseFrame - unmasked frame rejected (#175)" {
+    // RFC 6455 §5.1: server MUST close on an unmasked client frame.
     var data = [_]u8{
         0x89, // FIN + ping
         0x00, // no mask, len=0
     };
+    try std.testing.expectError(error.UnmaskedFrame, parseFrame(&data));
+}
 
-    const result = try parseFrame(&data);
-    switch (result) {
-        .frame => |f| {
-            try std.testing.expect(f.frame.fin);
-            try std.testing.expectEqual(Opcode.ping, f.frame.opcode);
-            try std.testing.expectEqual(@as(usize, 0), f.frame.payload.len);
-            try std.testing.expectEqual(@as(usize, 2), f.consumed);
-        },
-        .incomplete => return error.TestUnexpectedResult,
-    }
+test "parseFrame - RSV bit set rejected (#175)" {
+    // RFC 6455 §5.2: RSV1-3 must be unset; we negotiate no extensions.
+    var data = [_]u8{
+        0xC1, // FIN + RSV1 + text
+        0x82, // MASK + len=2
+        0x37, 0xfa, 0x21, 0x3d, // mask key
+        'H' ^ 0x37, 'i' ^ 0xfa, // masked payload
+    };
+    try std.testing.expectError(error.ReservedBitsSet, parseFrame(&data));
 }
 
 test "serializeFrame - small text" {
