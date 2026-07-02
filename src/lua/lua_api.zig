@@ -81,7 +81,17 @@ fn luaExchangeNewIndex(lua: *Lua) callconv(.c) c_int {
 
     if (std.mem.eql(u8, key_str, "status")) {
         const status = lua.toInteger(3);
-        ex.status = @intCast(status);
+        if (status < 100 or status > 599) {
+            // Reject, don't clamp or crash: leave ex.status untouched and mark the
+            // exchange failed. dispatchToHandler checks handler_error after a normal
+            // return and sends 500 — a Lua-raised error here can't be safely unwound
+            // through the coroutine (see #186).
+            if (ex.handler_error == null) {
+                ex.handler_error = std.fmt.allocPrint(ex.allocator, "ctx.status: {d} out of range (100-599)", .{status}) catch "ctx.status: out of range (100-599)";
+            }
+        } else {
+            ex.status = @intCast(status);
+        }
     } else if (std.mem.eql(u8, key_str, "body")) {
         const body_span = checkString(lua, 3, "ctx.body: value must be a string");
         // Arena-dupe immediately — Lua string lifetime is unpredictable across yields.
@@ -346,3 +356,52 @@ pub fn registerKeywayModule(lua: *Lua) void {
     log.debug().string("msg", "keyway lua module registered").log();
 }
 
+// (#172) ctx.status out of range must not raise (unsafe to unwind through a coroutine,
+// see #186) — it should leave ex.status untouched and set the sticky handler_error flag.
+test "ctx.status rejects out-of-range values via handler_error, not raiseError" {
+    const allocator = std.testing.allocator;
+
+    const lua = try Lua.init(allocator);
+    defer lua.deinit();
+    registerHttpExchangeMetatable(lua);
+
+    var url_params = params.ParamArray{};
+    var query = params.QueryArray{};
+    var response_headers = try std.ArrayList(http.Header).initCapacity(allocator, 0);
+    defer response_headers.deinit(allocator);
+
+    var exchange = HttpExchange{
+        .method = "GET",
+        .path = "/test",
+        .headers = &[_]http.Header{},
+        .params = &url_params,
+        .query = &query,
+        .body = "",
+        .status = 200,
+        .response_headers = response_headers,
+        .response_body = "",
+        .allocator = allocator,
+    };
+
+    const ud = lua.newUserdata(@sizeOf(*HttpExchange));
+    castUserdata(*HttpExchange, @as(?*anyopaque, ud)).* = &exchange;
+    lua.getMetatableRegistry("HttpExchange");
+    lua.setMetatable(-2);
+    lua.setGlobal("ctx");
+
+    try lua.doString("ctx.status = 70000");
+    try std.testing.expectEqual(@as(u16, 200), exchange.status);
+    try std.testing.expect(exchange.handler_error != null);
+    try std.testing.expect(std.mem.indexOf(u8, exchange.handler_error.?, "70000") != null);
+
+    // Sticky: a second out-of-range write must not overwrite the first error.
+    try lua.doString("ctx.status = -1");
+    try std.testing.expect(std.mem.indexOf(u8, exchange.handler_error.?, "70000") != null);
+    allocator.free(exchange.handler_error.?);
+    exchange.handler_error = null;
+
+    // A fresh, valid assignment still works and leaves handler_error null.
+    try lua.doString("ctx.status = 204");
+    try std.testing.expectEqual(@as(u16, 204), exchange.status);
+    try std.testing.expect(exchange.handler_error == null);
+}

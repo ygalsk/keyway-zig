@@ -34,6 +34,13 @@ pub const HttpExchange = struct {
     // === STREAM UPGRADE (chunked transfer encoding) ===
     upgrade_stream: bool = false,
 
+    // === HANDLER ERROR (set by __newindex on invalid ctx writes, e.g. bad ctx.status) ===
+    // Sticky: first error wins. Checked after a normal (non-yielding) handler return.
+    // ponytail: stream-upgrade and async-resume completions don't consume this —
+    // they proceed with the default status instead of a 500 (no crash either way,
+    // the guard is at the assignment site). Hoist into those paths with #173.
+    handler_error: ?[]const u8 = null,
+
     // === INTERNAL ===
     allocator: std.mem.Allocator,
 

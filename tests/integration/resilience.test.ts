@@ -3,9 +3,11 @@ import { rawStatus, withServer } from "../harness";
 
 describe("worker resilience regressions", () => {
   // (#172)
-  test.failing("out-of-range Lua status does not kill the next request", async () => {
+  test("out-of-range Lua status does not kill the next request", async () => {
     await withServer(async ({ base }) => {
-      await fetch(`${base}/test/status/70000`).catch(() => null);
+      const bad = await fetch(`${base}/test/status/70000`);
+      expect(bad.status).toBe(500);
+
       const next = await fetch(`${base}/test/hello`);
       expect(next.status).toBe(200);
     });

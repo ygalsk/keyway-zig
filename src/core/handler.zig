@@ -576,6 +576,13 @@ pub const Connection = struct {
             .completed => {
                 self.lua_state.current_connection = null;
 
+                if (exchange.handler_error) |msg| {
+                    log.err().string("msg", "lua handler error").int("fd", self.socket).stringSafe("method", request.method).string("path", clean_path).string("error", msg).log();
+                    self.logAccess(500);
+                    error_response.sendError(self, .server_error, "lua handler error");
+                    return;
+                }
+
                 if (self.tryUpgrade(exchange, request)) return;
 
                 self.logAccess(exchange.status);
