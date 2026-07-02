@@ -549,6 +549,26 @@ pub const Connection = struct {
         return request;
     }
 
+    /// WS/SSE upgrade check for a completed handler. Both are long-lived —
+    /// exempt from the request timeout — so the cancel is centralized here
+    /// instead of repeated per-protocol. Returns true if the request was
+    /// consumed by the upgrade (caller must not log/write a normal response).
+    fn tryUpgrade(self: *Connection, exchange: *HttpExchange, request: *const http.Request) bool {
+        if (!exchange.upgrade_websocket and !exchange.upgrade_sse) return false;
+
+        self.cancelRequestTimer();
+
+        if (exchange.upgrade_websocket) {
+            conn_ws.handleWsUpgrade(self, exchange, request) catch {
+                self.logAccess(400);
+                error_response.sendError(self, .client_error, "websocket upgrade failed");
+            };
+        } else {
+            conn_sse.handleSseUpgrade(self, exchange);
+        }
+        return true;
+    }
+
     fn dispatchToHandler(self: *Connection, ref: i32, exchange: *HttpExchange, request: *const http.Request, clean_path: []const u8) !void {
         // Record request body size
         prom.recordRequestBodySize(exchange.body.len);
@@ -568,23 +588,7 @@ pub const Connection = struct {
             .completed => {
                 self.lua_state.current_connection = null;
 
-                if (exchange.upgrade_websocket) {
-                    // WebSocket connections are long-lived — exempt from request timeout
-                    self.cancelRequestTimer();
-                    conn_ws.handleWsUpgrade(self, exchange, request) catch {
-                        self.logAccess(400);
-                        error_response.sendError(self, .client_error, "websocket upgrade failed");
-                        return;
-                    };
-                    return;
-                }
-
-                if (exchange.upgrade_sse) {
-                    // SSE connections are long-lived — exempt from request timeout
-                    self.cancelRequestTimer();
-                    conn_sse.handleSseUpgrade(self, exchange);
-                    return;
-                }
+                if (self.tryUpgrade(exchange, request)) return;
 
                 self.logAccess(exchange.status);
                 try self.writeResponse(exchange);
