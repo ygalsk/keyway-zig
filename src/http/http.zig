@@ -112,6 +112,17 @@ pub const Header = struct {
     value: []const u8,
 };
 
+/// True if `s` is a valid HTTP field-value integer: 1*DIGIT, nothing else.
+/// `std.fmt.parseInt` alone also accepts a leading '+', '-', and Zig's '_'
+/// digit separators — none of which RFC 7230 permits for Content-Length.
+fn isDigitsOnly(s: []const u8) bool {
+    if (s.len == 0) return false;
+    for (s) |b| {
+        if (!std.ascii.isDigit(b)) return false;
+    }
+    return true;
+}
+
 /// HTTP parser using picohttpparser
 pub const Parser = struct {
     allocator: std.mem.Allocator,
@@ -174,33 +185,55 @@ pub const Parser = struct {
         // Without this, leftover body bytes corrupt the next keep-alive request.
         const bytes_consumed = @as(usize, @intCast(result));
 
-        var content_length: usize = 0;
+        // Single pass over headers: collect Content-Length (rejecting malformed
+        // values and duplicates whose parsed values disagree) and the value of
+        // the last Transfer-Encoding header (repeated TE headers combine per
+        // RFC 7230 §3.3.2 — the final coding is what determines chunked-ness).
+        var content_length: ?usize = null;
+        var transfer_encoding: ?[]const u8 = null;
         for (0..num_headers) |i| {
             const h = c_headers[i];
             const name = h.name[0..h.name_len];
             if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-                content_length = std.fmt.parseInt(usize, h.value[0..h.value_len], 10) catch 0;
-                break;
-            }
-        }
-
-        // Check for Transfer-Encoding: chunked (mutually exclusive with Content-Length)
-        var is_chunked = false;
-        if (content_length == 0) {
-            for (0..num_headers) |i| {
-                const h = c_headers[i];
-                const name = h.name[0..h.name_len];
-                if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
-                    const val = h.value[0..h.value_len];
-                    if (std.ascii.indexOfIgnoreCase(val, "chunked") != null) {
-                        is_chunked = true;
-                        break;
-                    }
+                const val = h.value[0..h.value_len];
+                if (!isDigitsOnly(val)) {
+                    self.allocator.free(headers);
+                    return error.InvalidRequest;
                 }
+                const parsed = std.fmt.parseInt(usize, val, 10) catch {
+                    self.allocator.free(headers);
+                    return error.InvalidRequest;
+                };
+                if (content_length) |existing| {
+                    if (existing != parsed) {
+                        self.allocator.free(headers);
+                        return error.InvalidRequest;
+                    }
+                } else {
+                    content_length = parsed;
+                }
+            } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+                transfer_encoding = h.value[0..h.value_len];
             }
         }
 
-        if (is_chunked) {
+        // A request with both headers is the classic CL.TE/TE.CL smuggling
+        // primitive — reject rather than picking a framing to trust (RFC 7230 §3.3.3).
+        if (transfer_encoding != null and content_length != null) {
+            self.allocator.free(headers);
+            return error.InvalidRequest;
+        }
+
+        if (transfer_encoding) |te_val| {
+            // Final coding is the last comma-separated token of the last TE header.
+            const last_token = if (std.mem.lastIndexOfScalar(u8, te_val, ',')) |idx| te_val[idx + 1 ..] else te_val;
+            const final_coding = std.mem.trim(u8, last_token, " \t");
+            if (!std.ascii.eqlIgnoreCase(final_coding, "chunked")) {
+                // Non-chunked final coding: body length is undeterminable.
+                self.allocator.free(headers);
+                return error.InvalidRequest;
+            }
+
             // Decode chunked body: hex-size\r\n + data\r\n + ... + 0\r\n\r\n
             const chunk_data = buf[bytes_consumed..];
             const decoded = decodeChunkedBody(chunk_data, self.allocator) catch |err| {
@@ -220,14 +253,15 @@ pub const Parser = struct {
             };
         }
 
-        const total_needed = bytes_consumed + content_length;
+        const cl = content_length orelse 0;
+        const total_needed = bytes_consumed + cl;
         if (buf.len < total_needed) {
             // Body not fully received yet — need more data
             self.allocator.free(headers);
             return error.Incomplete;
         }
 
-        const body = if (content_length > 0) buf[bytes_consumed .. bytes_consumed + content_length] else &[_]u8{};
+        const body = if (cl > 0) buf[bytes_consumed .. bytes_consumed + cl] else &[_]u8{};
 
         return Request{
             .method = method,
@@ -296,6 +330,92 @@ test "http parser - incomplete request" {
     const partial_request = "GET /test HTTP";
     const result = parser.parseRequest(partial_request);
     try std.testing.expectError(error.Incomplete, result);
+}
+
+test "http parser - rejects Content-Length and Transfer-Encoding together" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+
+    const request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nping\r\n0\r\n\r\n";
+    const result = parser.parseRequest(request);
+    try std.testing.expectError(error.InvalidRequest, result);
+}
+
+test "http parser - rejects duplicate Content-Length with distinct values" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+
+    const request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nContent-Length: 5\r\n\r\nhello";
+    const result = parser.parseRequest(request);
+    try std.testing.expectError(error.InvalidRequest, result);
+}
+
+test "http parser - accepts duplicate Content-Length with identical values" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+
+    const request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nContent-Length: 04\r\n\r\nping";
+    const request_result = try parser.parseRequest(request);
+    defer allocator.free(request_result.headers);
+    try std.testing.expectEqualStrings("ping", request_result.body);
+}
+
+test "http parser - rejects malformed Content-Length" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+
+    const request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: abc\r\n\r\nping";
+    const result = parser.parseRequest(request);
+    try std.testing.expectError(error.InvalidRequest, result);
+}
+
+test "http parser - rejects signed Content-Length" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+
+    const request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: +4\r\n\r\nping";
+    const result = parser.parseRequest(request);
+    try std.testing.expectError(error.InvalidRequest, result);
+}
+
+test "http parser - rejects Content-Length with digit separator" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+
+    const request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1_0\r\n\r\nping";
+    const result = parser.parseRequest(request);
+    try std.testing.expectError(error.InvalidRequest, result);
+}
+
+test "http parser - plain Transfer-Encoding: chunked decodes" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+
+    const request = "POST /test HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nping\r\n0\r\n\r\n";
+    const request_result = try parser.parseRequest(request);
+    defer allocator.free(request_result.headers);
+    defer allocator.free(request_result.body);
+    try std.testing.expectEqualStrings("ping", request_result.body);
+}
+
+test "http parser - Transfer-Encoding with chunked as final coding decodes" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+
+    const request = "POST /test HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip, chunked\r\n\r\n4\r\nping\r\n0\r\n\r\n";
+    const request_result = try parser.parseRequest(request);
+    defer allocator.free(request_result.headers);
+    defer allocator.free(request_result.body);
+    try std.testing.expectEqualStrings("ping", request_result.body);
+}
+
+test "http parser - rejects Transfer-Encoding with non-chunked final coding" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+
+    const request = "POST /test HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked, gzip\r\n\r\n4\r\nping\r\n0\r\n\r\n";
+    const result = parser.parseRequest(request);
+    try std.testing.expectError(error.InvalidRequest, result);
 }
 
 test "101 switching protocols serialization" {
@@ -397,6 +517,7 @@ fn decodeChunkedBody(data: []const u8, allocator: std.mem.Allocator) !ChunkedRes
 /// Returns null if header is missing or value is malformed.
 pub fn getContentLength(request: *const Request) ?u64 {
     const val = Parser.getHeader(request, "content-length") orelse return null;
+    if (!isDigitsOnly(val)) return null;
     return std.fmt.parseInt(u64, val, 10) catch null;
 }
 
