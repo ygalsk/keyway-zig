@@ -66,6 +66,7 @@ pub const TlsState = struct {
     tls_conn: ?tls_mod.TlsConn = null,
     ciphertext_buffer: ?LinearBuffer = null, // recv target for TLS connections
     tls_handshake_complete: bool = false, // flag for sendTlsData -> onTlsHandshakeWrite
+    ktls_active: bool = false, // true after kTLS offload; marks a plaintext-socket recv as TLS
 
     pub fn deinit(self: *TlsState, alloc: std.mem.Allocator) void {
         if (self.tls_conn) |*tc| tc.deinit(alloc);
@@ -475,7 +476,19 @@ pub const Connection = struct {
                 return .disarm;
             }
             if (err != error.EOF) {
-                log.err().string("msg", "recv failed").int("fd", self.socket).err(err).log();
+                // On a kTLS socket a control record — typically the peer's
+                // close_notify at teardown — surfaces to recv as EIO, which
+                // libxev maps to error.Unexpected, not EOF. That's a normal TLS
+                // close, not a failure: log it at debug instead of a spurious
+                // ERROR on every HTTPS connection. We can't process a
+                // post-handshake record here regardless (the SSL object was
+                // freed after the handshake) — surviving a KeyUpdate needs the
+                // userspace data path (#196).
+                if (self.tls_state.ktls_active) {
+                    log.debug().string("msg", "kTLS connection closed by peer (control record)").int("fd", self.socket).log();
+                } else {
+                    log.err().string("msg", "recv failed").int("fd", self.socket).err(err).log();
+                }
             }
             self.close();
             return .disarm;
