@@ -177,6 +177,7 @@ pub const Server = struct {
         result: xev.Result,
     ) xev.CallbackAction {
         _ = completion;
+        _ = loop;
 
         const self = castUserdata(Server, userdata);
 
@@ -217,15 +218,7 @@ pub const Server = struct {
         prom.connectionAccepted();
 
         // Create connection handler
-        const conn = Connection.init(
-            self.allocator,
-            loop,
-            client_socket,
-            self.router,
-            self.lua_state,
-            self.sse_registry,
-            self,
-        ) catch |err| {
+        const conn = Connection.init(self, client_socket) catch |err| {
             log.err().string("msg", "connection init failed").err(err).log();
             helpers.closeFd(client_socket);
             self.acceptNext();

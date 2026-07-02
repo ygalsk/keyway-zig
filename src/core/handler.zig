@@ -157,15 +157,8 @@ pub const Connection = struct {
     // Sub-struct: inbound TLS (set once at connection init, persists across keep-alive)
     tls_state: TlsState = .{},
 
-    pub fn init(
-        allocator: std.mem.Allocator,
-        loop: *xev.Loop,
-        socket: std.posix.socket_t,
-        router: *Router,
-        lua_state: *LuaState,
-        sse_registry: ?*SseRegistry,
-        server: *Server,
-    ) !*Connection {
+    pub fn init(server: *Server, socket: std.posix.socket_t) !*Connection {
+        const allocator = server.allocator;
         const conn = try allocator.create(Connection);
         errdefer allocator.destroy(conn);
 
@@ -181,16 +174,16 @@ pub const Connection = struct {
         conn.* = Connection{
             .base_allocator = allocator,
             .arena = arena,
-            .loop = loop,
+            .loop = server.loop,
             .socket = socket,
-            .router = router,
-            .lua_state = lua_state,
+            .router = server.router,
+            .lua_state = server.lua_state,
             .read_completion = .{},
             .write_completion = .{},
             .read_buffer = read_buf,
             .param_cache = ParamArray{},
             .query_cache = QueryArray{},
-            .sse_registry = sse_registry,
+            .sse_registry = server.sse_registry,
             .server = server,
         };
 
