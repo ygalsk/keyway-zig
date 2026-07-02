@@ -405,3 +405,28 @@ test "ctx.status rejects out-of-range values via handler_error, not raiseError" 
     try std.testing.expectEqual(@as(u16, 204), exchange.status);
     try std.testing.expect(exchange.handler_error == null);
 }
+
+// A lua_error raised from a C function must be contained by an enclosing pcall
+// (return LUA_ERRRUN), not exit(1) the process. This fails — silent exit(1),
+// crashing the whole test binary — when --gc-sections strips the .eh_frame the
+// external DWARF unwinder needs to step through keyway's C frames (#186).
+fn kw186RaisingCFn(lua: *Lua) callconv(.c) c_int {
+    lua.pushString("kwBOOM");
+    lua.raiseError();
+}
+
+test "C-raised lua_error is contained by pcall, not exit(1) (#186)" {
+    const allocator = std.testing.allocator;
+    const lua = try Lua.init(allocator);
+    defer lua.deinit();
+    lua.openLibs();
+
+    lua.pushCFunction(kw186RaisingCFn);
+    lua.setGlobal("kw186boom");
+
+    try lua.doString(
+        \\local ok, err = pcall(kw186boom)
+        \\assert(ok == false, "pcall did not contain the C-raise")
+        \\assert(type(err) == 'string' and err:find('kwBOOM', 1, true), "error payload lost: " .. tostring(err))
+    );
+}

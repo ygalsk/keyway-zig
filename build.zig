@@ -116,7 +116,9 @@ fn addSharedDeps(
     compile.root_module.linkSystemLibrary("ssl", .{});
     compile.root_module.linkSystemLibrary("crypto", .{});
 
-    // GCC 15's crt1.o has .sframe sections with R_X86_64_PC64 relocations that
-    // Zig's bundled lld can't handle. --gc-sections discards unreferenced .sframe.
-    compile.link_gc_sections = true;
+    // Deliberately NOT --gc-sections: it strips the .eh_frame FDEs for keyway's
+    // own frames and the zig-luajit wrapper, so LuaJIT's external DWARF unwinder
+    // can't traverse them and a C-raised lua_error exit(1)s the process (#186).
+    // If a future GCC's crt1.o reintroduces the .sframe R_X86_64_PC64 relocation
+    // lld can't handle, strip ONLY .sframe — never blanket gc-sections again.
 }
