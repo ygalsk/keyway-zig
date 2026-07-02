@@ -1,6 +1,7 @@
 const std = @import("std");
 const log = @import("../observability/log.zig");
 const config = @import("../util/config.zig");
+const helpers = @import("../util/helpers.zig");
 const c = @cImport({
     @cInclude("openssl/ssl.h");
     @cInclude("openssl/err.h");
@@ -16,18 +17,6 @@ pub const TLS_RECORD_MAX_SIZE = config.TLS_RECORD_MAX_SIZE;
 
 // kTLS setsockopt constants
 const SOL_TLS: i32 = 282;
-
-/// Decode errno from a raw Linux syscall return value.
-/// Raw syscalls return -errno as usize on failure. std.posix.errno() doesn't
-/// reliably decode all values (e.g. small negative values can slip through),
-/// so we decode manually: negate the signed value to get the errno integer.
-fn syscallErrno(rc: usize) std.posix.E {
-    const signed: isize = @bitCast(rc);
-    if (signed < 0 and signed > -4096) {
-        return @enumFromInt(@as(u16, @intCast(-signed)));
-    }
-    return .SUCCESS;
-}
 
 /// Per-worker TLS context wrapping SSL_CTX.
 /// One per worker thread — shares config across all connections on that worker.
@@ -127,21 +116,10 @@ fn parseKeylogSecret(rest: []const u8, out: *[48]u8, len: *u8) void {
     // client_random is 32 bytes = 64 hex chars, then a space, then the secret
     if (rest.len < 65) return;
     const secret_hex = rest[65..];
-    const n = secret_hex.len / 2;
+    const n = secret_hex.len / 2; // ignore a trailing odd hex digit, as before
     if (n == 0 or n > 48) return;
-    for (0..n) |i| {
-        out[i] = (hexVal(secret_hex[i * 2]) orelse return) << 4 | (hexVal(secret_hex[i * 2 + 1]) orelse return);
-    }
+    _ = std.fmt.hexToBytes(out[0..n], secret_hex[0 .. n * 2]) catch return;
     len.* = @intCast(n);
-}
-
-fn hexVal(ch: u8) ?u8 {
-    return switch (ch) {
-        '0'...'9' => ch - '0',
-        'a'...'f' => ch - 'a' + 10,
-        'A'...'F' => ch - 'A' + 10,
-        else => null,
-    };
 }
 
 // ============================================================================
@@ -433,7 +411,7 @@ pub const TlsConn = struct {
         const ulp = [4]u8{ 't', 'l', 's', 0 };
         const rc = std.os.linux.setsockopt(fd, std.posix.IPPROTO.TCP, c.TCP_ULP, &ulp, ulp.len);
         if (rc != 0) {
-            const e = syscallErrno(rc);
+            const e = helpers.syscallErrno(rc);
             if (e == .NOENT) {
                 log.warn().string("msg", "ktls tls kernel module not loaded (ENOENT from TCP_ULP) — run 'modprobe tls'").log();
             } else {
@@ -548,7 +526,7 @@ pub const TlsConn = struct {
             @intCast(info_bytes.len),
         );
         if (rc != 0) {
-            const e = syscallErrno(rc);
+            const e = helpers.syscallErrno(rc);
             log.err().string("msg", "ktls setsockopt SOL_TLS failed").int("dir", direction).int("errno", @intFromEnum(e)).stringSafe("errname", @tagName(e)).int("fd", fd).log();
             return error.KtlsSetupFailed;
         }
@@ -643,17 +621,6 @@ pub const TlsConn = struct {
 // Tests
 // ============================================================================
 
-test "hexVal decodes hex characters" {
-    try std.testing.expectEqual(@as(?u8, 0), hexVal('0'));
-    try std.testing.expectEqual(@as(?u8, 9), hexVal('9'));
-    try std.testing.expectEqual(@as(?u8, 10), hexVal('a'));
-    try std.testing.expectEqual(@as(?u8, 15), hexVal('f'));
-    try std.testing.expectEqual(@as(?u8, 10), hexVal('A'));
-    try std.testing.expectEqual(@as(?u8, 15), hexVal('F'));
-    try std.testing.expectEqual(@as(?u8, null), hexVal('g'));
-    try std.testing.expectEqual(@as(?u8, null), hexVal(' '));
-}
-
 test "parseKeylogSecret parses valid TLS 1.3 keylog line" {
     // 64 hex chars (client_random) + space + 64 hex chars (32-byte secret)
     const client_random_hex = "a" ** 64;
@@ -673,6 +640,17 @@ test "parseKeylogSecret rejects short input" {
     var out: [48]u8 = .{0} ** 48;
     var len: u8 = 0;
     parseKeylogSecret("tooshort", &out, &len);
+    try std.testing.expectEqual(@as(u8, 0), len);
+}
+
+test "parseKeylogSecret rejects invalid hex characters" {
+    const client_random_hex = "a" ** 64;
+    const secret_hex = "zz" ++ "00" ** 31; // invalid first byte, 64 hex chars total
+    const rest = client_random_hex ++ " " ++ secret_hex;
+
+    var out: [48]u8 = .{0} ** 48;
+    var len: u8 = 0;
+    parseKeylogSecret(rest, &out, &len);
     try std.testing.expectEqual(@as(u8, 0), len);
 }
 

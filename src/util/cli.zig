@@ -35,19 +35,30 @@ const ParseError = error{
 pub fn parse(allocator: std.mem.Allocator, args_ctx: std.process.Args) (ParseError || std.process.Args.Iterator.InitError)!Config {
     var config = Config{};
 
-    // Track which fields were set by CLI args (env vars only apply to unset fields)
-    var cli_host = false;
+    // host/script/tls-*/enable-bpf/watch never fail to parse from env, so
+    // applying them before CLI args (which unconditionally overwrite below)
+    // is a safe reorder: still CLI > env > default, zero presence tracking.
+    if (helpers.getenv("KEYWAY_HOST")) |val| config.host = val;
+    if (helpers.getenv("KEYWAY_SCRIPT")) |val| config.script = val;
+    if (helpers.getenv("KEYWAY_TLS_CERT")) |val| config.tls_cert_path = val;
+    if (helpers.getenv("KEYWAY_TLS_KEY")) |val| config.tls_key_path = val;
+    if (helpers.getenv("KEYWAY_ENABLE_BPF")) |val| {
+        config.enable_bpf = std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
+    }
+    if (helpers.getenv("KEYWAY_WATCH")) |val| {
+        config.watch = std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
+    }
+
+    // port/workers/log-level/log-format *can* fail to parse. Applying their
+    // env fallback up front like the fields above would make a malformed env
+    // value raise an error even when a valid CLI flag was about to override
+    // it — a precedence violation. Keep presence tracking for just these four
+    // so env is only consulted when CLI never supplies the field.
     var cli_port = false;
     var cli_workers = false;
-    var cli_script = false;
-    var cli_tls_cert = false;
-    var cli_tls_key = false;
     var cli_log_level = false;
     var cli_log_format = false;
-    var cli_enable_bpf = false;
-    var cli_watch = false;
 
-    // Parse CLI arguments
     var args = try args_ctx.iterateAllocator(allocator);
     defer args.deinit();
 
@@ -62,7 +73,6 @@ pub fn parse(allocator: std.mem.Allocator, args_ctx: std.process.Args) (ParseErr
             return config;
         } else if (std.mem.eql(u8, arg, "--host")) {
             config.host = args.next() orelse return ParseError.MissingValue;
-            cli_host = true;
         } else if (std.mem.eql(u8, arg, "--port")) {
             const val = args.next() orelse return ParseError.MissingValue;
             config.port = std.fmt.parseInt(u16, val, 10) catch return ParseError.InvalidPort;
@@ -73,13 +83,10 @@ pub fn parse(allocator: std.mem.Allocator, args_ctx: std.process.Args) (ParseErr
             cli_workers = true;
         } else if (std.mem.eql(u8, arg, "--script")) {
             config.script = args.next() orelse return ParseError.MissingValue;
-            cli_script = true;
         } else if (std.mem.eql(u8, arg, "--tls-cert")) {
             config.tls_cert_path = args.next() orelse return ParseError.MissingValue;
-            cli_tls_cert = true;
         } else if (std.mem.eql(u8, arg, "--tls-key")) {
             config.tls_key_path = args.next() orelse return ParseError.MissingValue;
-            cli_tls_key = true;
         } else if (std.mem.eql(u8, arg, "--log-level")) {
             const val = args.next() orelse return ParseError.MissingValue;
             config.log_level = parseLogLevel(val) orelse return ParseError.InvalidLogLevel;
@@ -90,19 +97,13 @@ pub fn parse(allocator: std.mem.Allocator, args_ctx: std.process.Args) (ParseErr
             cli_log_format = true;
         } else if (std.mem.eql(u8, arg, "--enable-bpf")) {
             config.enable_bpf = true;
-            cli_enable_bpf = true;
         } else if (std.mem.eql(u8, arg, "--watch")) {
             config.watch = true;
-            cli_watch = true;
         } else {
             return ParseError.UnknownOption;
         }
     }
 
-    // Apply environment variable fallbacks for fields not set by CLI
-    if (!cli_host) {
-        if (helpers.getenv("KEYWAY_HOST")) |val| config.host = val;
-    }
     if (!cli_port) {
         if (helpers.getenv("KEYWAY_PORT")) |val| {
             config.port = std.fmt.parseInt(u16, val, 10) catch return ParseError.InvalidPort;
@@ -112,15 +113,6 @@ pub fn parse(allocator: std.mem.Allocator, args_ctx: std.process.Args) (ParseErr
         if (helpers.getenv("KEYWAY_WORKERS")) |val| {
             config.workers = std.fmt.parseInt(u16, val, 10) catch return ParseError.InvalidWorkers;
         }
-    }
-    if (!cli_script) {
-        if (helpers.getenv("KEYWAY_SCRIPT")) |val| config.script = val;
-    }
-    if (!cli_tls_cert) {
-        if (helpers.getenv("KEYWAY_TLS_CERT")) |val| config.tls_cert_path = val;
-    }
-    if (!cli_tls_key) {
-        if (helpers.getenv("KEYWAY_TLS_KEY")) |val| config.tls_key_path = val;
     }
     if (!cli_log_level) {
         if (helpers.getenv("KEYWAY_LOG_LEVEL")) |val| {
@@ -132,32 +124,16 @@ pub fn parse(allocator: std.mem.Allocator, args_ctx: std.process.Args) (ParseErr
             config.log_format = parseLogFormat(val) orelse return ParseError.InvalidLogFormat;
         }
     }
-    if (!cli_enable_bpf) {
-        if (helpers.getenv("KEYWAY_ENABLE_BPF")) |val| {
-            config.enable_bpf = std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
-        }
-    }
-    if (!cli_watch) {
-        if (helpers.getenv("KEYWAY_WATCH")) |val| {
-            config.watch = std.mem.eql(u8, val, "1") or std.mem.eql(u8, val, "true");
-        }
-    }
 
     return config;
 }
 
 fn parseLogFormat(val: []const u8) ?Config.LogFormat {
-    if (std.mem.eql(u8, val, "logfmt")) return .logfmt;
-    if (std.mem.eql(u8, val, "json")) return .json;
-    return null;
+    return std.meta.stringToEnum(Config.LogFormat, val);
 }
 
 fn parseLogLevel(val: []const u8) ?std.log.Level {
-    if (std.mem.eql(u8, val, "err")) return .err;
-    if (std.mem.eql(u8, val, "warn")) return .warn;
-    if (std.mem.eql(u8, val, "info")) return .info;
-    if (std.mem.eql(u8, val, "debug")) return .debug;
-    return null;
+    return std.meta.stringToEnum(std.log.Level, val);
 }
 
 /// Write formatted output to stderr, propagating write errors instead of

@@ -348,15 +348,7 @@ test "picohttpparser websocket upgrade headers" {
 
 /// Encode data as a chunked transfer encoding chunk: "{hex_len}\r\n{data}\r\n"
 pub fn encodeChunk(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
-    // Format: hex_length\r\ndata\r\n
-    const hex_len = std.fmt.count("{x}", .{data.len});
-    const total = hex_len + 2 + data.len + 2;
-    const buf = try allocator.alloc(u8, total);
-    var w = std.Io.Writer.fixed(buf);
-    w.print("{x}\r\n", .{data.len}) catch unreachable;
-    w.writeAll(data) catch unreachable;
-    w.writeAll("\r\n") catch unreachable;
-    return buf;
+    return std.fmt.allocPrint(allocator, "{x}\r\n{s}\r\n", .{ data.len, data });
 }
 
 /// Terminal chunk for chunked transfer encoding.

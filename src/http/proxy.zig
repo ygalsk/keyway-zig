@@ -227,8 +227,7 @@ fn buildUpstreamRequest(
     try w.writeAll("\r\n");
     if (request.body.len > 0) try w.writeAll(request.body);
 
-    var list = aw.toArrayList();
-    return try list.toOwnedSlice(allocator);
+    return aw.toOwnedSlice();
 }
 
 /// Connect completed — start sending the upstream request.
