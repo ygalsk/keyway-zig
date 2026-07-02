@@ -4,11 +4,12 @@ const PROJECT_ROOT = resolve(import.meta.dir, "..");
 const BINARY = resolve(PROJECT_ROOT, "zig-out/bin/keyway");
 const SCRIPT = resolve(PROJECT_ROOT, "tests/fixtures.lua");
 
-/// Send a raw HTTP request over its own socket and return the response status
-/// code. Bypasses fetch()'s connection pooling — needed when a test wants a
+/// Send a raw HTTP request over its own socket and return the full response
+/// text (status line + headers, and body if it arrived before the deadline).
+/// Bypasses fetch()'s connection pooling — needed when a test wants a
 /// guaranteed-fresh connection (e.g. checking behavior after a response that
 /// advertises `Connection: close`, see #180).
-export async function rawStatus(port: number, request: string): Promise<number> {
+export async function rawResponse(port: number, request: string): Promise<string> {
   let buf = "";
   const { promise, resolve } = Promise.withResolvers<string>();
   const socket = await Bun.connect({
@@ -34,6 +35,12 @@ export async function rawStatus(port: number, request: string): Promise<number> 
   socket.flush();
   const resp = await Promise.race([promise, Bun.sleep(1500).then(() => "")]);
   socket.end();
+  return resp;
+}
+
+/// Same as `rawResponse`, but returns just the status code.
+export async function rawStatus(port: number, request: string): Promise<number> {
+  const resp = await rawResponse(port, request);
   return Number(resp.split(" ")[1]);
 }
 
