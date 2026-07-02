@@ -111,7 +111,7 @@ zig build run      # Build and run the server
 zig build test     # Run all unit tests
 ```
 
-Requires Zig 0.15.0+. Dependencies (libxev, zig-luajit) are fetched automatically via `build.zig.zon`.
+See `build.zig.zon` for the required Zig version (source of truth). Dependencies (libxev, zig-luajit) are fetched automatically via `build.zig.zon`.
 
 ## Configuration
 
@@ -199,10 +199,10 @@ docker compose up
 zig build test
 
 # Integration tests (requires bun, starts server automatically)
-bun test
+cd tests && bun run test
 
 # CI / agent mode — bail on first failure
-CLAUDECODE=1 bun test --bail --timeout 10000
+cd tests && bun run test:ci
 ```
 
 Integration tests use native `fetch`, `WebSocket`, and `EventSource` against a real server instance. Test suites cover routing, headers, body handling, streaming, WebSocket, SSE, and the dashboard API.
