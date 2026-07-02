@@ -90,4 +90,15 @@ describe("reverse proxy", () => {
     const res = await fetch(`${base()}/__keyway/test-proxy-dead/whatever`);
     expect(res.status).toBe(502);
   });
+
+  // Regression target for #73: the proxy used to hardcode status 200 in its
+  // access log / metrics regardless of what the upstream actually returned.
+  test("relays and logs the real upstream status (500)", async () => {
+    const res = await fetch(`${base()}/__keyway/test-proxy/status500`);
+    expect(res.status).toBe(500);
+    expect(await res.text()).toBe("upstream error");
+
+    const metrics = await (await fetch(`${base()}/metrics`)).text();
+    expect(metrics).toMatch(/keyway_http_requests_total\{[^}]*status="500"[^}]*\}/);
+  });
 });
