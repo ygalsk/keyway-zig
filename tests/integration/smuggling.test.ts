@@ -1,43 +1,13 @@
 import { describe, expect, test } from "bun:test";
+import { rawStatus } from "../harness";
 
 const port = () => globalThis.__KEYWAY_PORT;
-
-async function rawStatus(request: string): Promise<number> {
-  let buf = "";
-  const { promise, resolve } = Promise.withResolvers<string>();
-  const socket = await Bun.connect({
-    hostname: "127.0.0.1",
-    port: port(),
-    socket: {
-      data(s, data) {
-        buf += data.toString();
-        if (buf.includes("\r\n\r\n")) {
-          resolve(buf);
-          s.end();
-        }
-      },
-      close() {
-        resolve(buf);
-      },
-      error(_socket, error) {
-        resolve(buf || String(error));
-      },
-    },
-  });
-  socket.write(request);
-  socket.flush();
-  const resp = await Promise.race([
-    promise,
-    Bun.sleep(1500).then(() => ""),
-  ]);
-  socket.end();
-  return Number(resp.split(" ")[1]);
-}
 
 describe("request smuggling regressions", () => {
   // (#169)
   test("rejects requests with both Content-Length and Transfer-Encoding", async () => {
     const status = await rawStatus(
+      port(),
       `POST /test/echo HTTP/1.1\r\n` +
         `Host: 127.0.0.1:${port()}\r\n` +
         `Content-Length: 4\r\n` +
@@ -51,6 +21,7 @@ describe("request smuggling regressions", () => {
   // (#169)
   test("rejects duplicate Content-Length headers", async () => {
     const status = await rawStatus(
+      port(),
       `POST /test/echo HTTP/1.1\r\n` +
         `Host: 127.0.0.1:${port()}\r\n` +
         `Content-Length: 4\r\n` +
@@ -64,6 +35,7 @@ describe("request smuggling regressions", () => {
   // (#169)
   test("rejects malformed Content-Length", async () => {
     const status = await rawStatus(
+      port(),
       `POST /test/echo HTTP/1.1\r\n` +
         `Host: 127.0.0.1:${port()}\r\n` +
         `Content-Length: abc\r\n` +
@@ -76,6 +48,7 @@ describe("request smuggling regressions", () => {
   // (#169)
   test("rejects signed Content-Length", async () => {
     const status = await rawStatus(
+      port(),
       `POST /test/echo HTTP/1.1\r\n` +
         `Host: 127.0.0.1:${port()}\r\n` +
         `Content-Length: +4\r\n` +

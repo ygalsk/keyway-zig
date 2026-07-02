@@ -388,9 +388,8 @@ fn onProxyUpstreamRecv(
         return .disarm;
     };
     // Cap accumulated upstream response (#129): an adversarial/huge upstream
-    // otherwise grows this buffer unbounded on base_allocator. Reuses
-    // MAX_BODY_SIZE (the request-body cap) rather than adding a new constant.
-    if (ps.response.items.len > config.MAX_BODY_SIZE) {
+    // otherwise grows this buffer unbounded on base_allocator.
+    if (ps.response.items.len > config.MAX_PROXY_RESPONSE_SIZE) {
         proxyFail(self, 502, "proxy upstream response too large");
         return .disarm;
     }

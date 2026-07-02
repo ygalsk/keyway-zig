@@ -58,7 +58,6 @@ pub const HttpState = struct {
     request_method: []const u8 = "",
     request_path: []const u8 = "",
     request_raw_len: usize = 0, // total bytes consumed by current request (headers + body)
-    body_bytes_received: u64 = 0,
     route_pattern: []const u8 = "", // matched route pattern for Prometheus labels (e.g. "/users/{id}")
 };
 
@@ -425,7 +424,10 @@ pub const Connection = struct {
             // deciding the buffer is full (writeSlice no longer auto-compacts).
             self.read_buffer.compact();
             if (self.read_buffer.availableWrite() == 0) {
-                self.send400BadRequest();
+                // READ_BUFFER_SIZE caps the whole request (headers + body); a
+                // still-incomplete parse with a full buffer means the request
+                // doesn't fit, not that it's malformed.
+                error_response.sendErrorStatus(self, 413, "request exceeds buffer");
                 return;
             }
             break :blk self.read_buffer.writeSlice();
@@ -492,9 +494,6 @@ pub const Connection = struct {
         // Plaintext path
         self.read_buffer.commitWrite(bytes_read);
 
-        // Streaming body size enforcement (not WebSocket or SSE, which are long-lived).
-        if (self.state == .reading and self.checkBodySizeExceeded(bytes_read)) return .disarm;
-
         self.handleRequest();
         return .disarm;
     }
@@ -527,15 +526,6 @@ pub const Connection = struct {
         self.http_state.request_method = request.method;
         self.http_state.request_path = clean_path;
         self.http_state.request_raw_len = request.raw_len;
-
-        // Reject oversized Content-Length before routing
-        if (http.getContentLength(&request)) |content_length| {
-            if (content_length > config.MAX_BODY_SIZE) {
-                self.logAccess(413);
-                error_response.sendErrorStatus(self, 413, "body exceeds size limit");
-                return error.HttpContentLengthOverflow;
-            }
-        }
 
         // Parse query string and clear param cache for route matching
         self.query_cache.clear();
@@ -843,16 +833,6 @@ pub const Connection = struct {
         error_response.sendError(self, .server_error, "internal error");
     }
 
-    /// Check if accumulated body bytes exceed MAX_BODY_SIZE. Sends 413 if so.
-    pub fn checkBodySizeExceeded(self: *Connection, bytes_read: usize) bool {
-        self.http_state.body_bytes_received += bytes_read;
-        if (self.http_state.body_bytes_received > config.MAX_BODY_SIZE) {
-            error_response.sendErrorStatus(self, 413, "streaming body exceeds size limit");
-            return true;
-        }
-        return false;
-    }
-
     /// Zig-native liveness endpoint. 200 when ready, 503 when draining.
     /// Request/latency stats live in Prometheus (/metrics), not here.
     fn serveHealth(self: *Connection, alloc: std.mem.Allocator) void {
@@ -1009,8 +989,7 @@ pub const Connection = struct {
 
         // After kTLS, ciphertext_buffer is null — nothing to reset
 
-        // Reset body tracking and timeout flags for next request on keep-alive
-        self.http_state.body_bytes_received = 0;
+        // Reset timeout flags for next request on keep-alive
         self.timed_out = false;
         self.timer_armed = false;
         self.header_timer_armed = false;
