@@ -2,7 +2,7 @@
 
 import { createSignal, createEffect, For, Show, onMount, onCleanup } from "solid-js";
 import {
-  type MetricsSnapshot, api, sendWS, fetchEffectiveConfig, startStream,
+  type MetricsSnapshot, api, sendWS, startStream,
   classifyStatus, INVOCATION_LABELS, formatTime,
 } from "../main";
 
@@ -20,14 +20,10 @@ function timeGreeting(): string {
 const COMMANDS: { label: string; cmds: { name: string; desc: string }[] }[] = [
   { label: "inspect", cmds: [
     { name: "ping", desc: "Check server connection" },
-    { name: "routes", desc: "List routes" }, { name: "scripts", desc: "List scripts" },
     { name: "config", desc: "Show running config" }, { name: "taxonomy", desc: "Traffic by status category" },
   ]},
   { label: "test", cmds: [
     { name: "lua <code>", desc: "Run Lua on the server" }, { name: "stream", desc: "Test SSE streaming" },
-  ]},
-  { label: "control", cmds: [
-    { name: "scripts:toggle <id>", desc: "Enable or disable a script" }, { name: "scripts:test <id>", desc: "Run a script's test handler" },
   ]},
 ];
 
@@ -75,13 +71,9 @@ function JsonHighlight(props: { text: string }) {
   );
 }
 
-function isJson(text: string): boolean { try { JSON.parse(text); return true; } catch { return false; } }
-
 export function ConsoleCore(props: {
   metrics: () => MetricsSnapshot | null;
   wsMessages: () => Record<string, unknown>[];
-  pendingCmd: () => string | null;
-  setPendingCmd: (v: string | null) => void;
 }) {
   const [entries, setEntries] = createSignal<LogEntry[]>([]);
   const [showHelp, setShowHelp] = createSignal(false);
@@ -103,11 +95,6 @@ export function ConsoleCore(props: {
   function reply(text: string) { addEntry({ type: "response", text, ts: Date.now() }); }
   function err(text: string) { addEntry({ type: "error", text, ts: Date.now() }); }
 
-  async function apiCmd(path: string, opts: RequestInit = {}) {
-    try { reply(JSON.stringify(await api<Record<string, unknown>>(path, opts))); }
-    catch (e) { err(String(e)); }
-  }
-
   // WS response handler
   let lastIdx = 0;
   createEffect(() => {
@@ -115,7 +102,7 @@ export function ConsoleCore(props: {
     if (!msgs.length) { lastIdx = 0; return; }
     for (let i = Math.max(lastIdx, 0); i < msgs.length; i++) {
       const msg = msgs[i];
-      if (msg.cmd || msg.error || msg.routes || msg.scripts || msg.result) {
+      if (msg.cmd || msg.error || msg.result) {
         addEntry({ type: "response", text: JSON.stringify(msg), ts: Date.now() });
       }
     }
@@ -126,11 +113,7 @@ export function ConsoleCore(props: {
   const handlers: Record<string, CmdFn> = {
     help:             () => setShowHelp(true),
     ping:             () => sendWS({ cmd: "ping" }),
-    scripts:          () => sendWS({ cmd: "scripts" }),
-    routes:           () => sendWS({ cmd: "routes" }),
     lua:              (a) => { if (a) sendWS({ cmd: "lua", code: a }); else err("Usage: lua <code>  —  e.g. lua print('hello')"); },
-    "scripts:toggle": (a) => { if (a) apiCmd(`/__keyway/api/scripts/${a}/toggle`, { method: "POST" }); else err("Usage: scripts:toggle <id>"); },
-    "scripts:test":   (a) => { if (a) apiCmd(`/__keyway/api/scripts/${a}/test`, { method: "POST", body: JSON.stringify({ method: "GET", path: "/test", headers: {}, body: "" }) }); else err("Usage: scripts:test <id>"); },
     stream:           () => {
       if (activeStreamCancel) { activeStreamCancel(); activeStreamCancel = null; reply("Stream cancelled."); return; }
       reply("Streaming...");
@@ -140,7 +123,7 @@ export function ConsoleCore(props: {
       );
     },
     config:           async () => {
-      try { reply(JSON.stringify(await fetchEffectiveConfig())); } catch (e) { err(String(e)); }
+      try { reply(JSON.stringify(await api<object>("/__keyway/api/config/effective"))); } catch (e) { err(String(e)); }
     },
     taxonomy:         () => {
       const m = props.metrics();
@@ -166,16 +149,6 @@ export function ConsoleCore(props: {
     else if (raw.trimStart().startsWith("{")) { try { sendWS(JSON.parse(raw)); } catch { err("Invalid JSON: " + raw); } }
     else { err(`"${cmd}" isn't a command I know — try help to see what's available`); }
   }
-
-  // Pending command from other views
-  createEffect(() => {
-    const pending = props.pendingCmd();
-    if (pending) {
-      props.setPendingCmd(null);
-      input.value = pending.includes(" ") ? pending : pending + " ";
-      input.focus();
-    }
-  });
 
   function onInputKeydown(e: KeyboardEvent) {
     if (e.key === "Enter") {
@@ -264,7 +237,7 @@ export function ConsoleCore(props: {
         {/* Log entries */}
         <For each={entries()}>
           {(entry) => {
-            const ts = formatTime(entry.ts, false);
+            const ts = formatTime(entry.ts);
             return (
               <div class="text-detail flex gap-2 console-entry">
                 <span class="text-base-content/60 shrink-0">{ts}</span>
@@ -272,10 +245,8 @@ export function ConsoleCore(props: {
                   <span class="text-primary">{">"} {entry.text}</span>
                 ) : entry.type === "error" ? (
                   <span class="text-error">{entry.text}</span>
-                ) : isJson(entry.text) ? (
-                  <JsonHighlight text={entry.text} />
                 ) : (
-                  <pre class="text-base-content/80 whitespace-pre-wrap">{entry.text}</pre>
+                  <JsonHighlight text={entry.text} />
                 )}
               </div>
             );

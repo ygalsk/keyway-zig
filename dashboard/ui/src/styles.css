@@ -34,12 +34,9 @@
 @layer base {
   :root {
     --kw-accent: #73B44C;
-    --kw-accent-light: #9CCC65;
-    --kw-accent-dim: #4a7a2e;
     --kw-blue: #5b9cf5;
     --kw-yellow: #eab308;
     --kw-red: #ee5555;
-    --kw-purple: #c084fc;
     --kw-bg: #0a0f0a;
     --kw-surface: #141a14;
     --kw-border: #1a221a;
@@ -77,16 +74,14 @@
   .method-POST { color: var(--kw-blue); }
   .method-PUT, .method-PATCH { color: var(--kw-yellow); }
   .method-DELETE { color: var(--kw-red); }
-  .method-WS { color: var(--kw-purple); }
-  .method-MW { color: var(--kw-text); opacity: 0.5; }
   .method-HEAD { color: var(--kw-accent); }
   .method-OPTIONS { color: var(--kw-yellow); }
 
-  .json-key { color: var(--kw-json-key, #6b9e3e); }
-  .json-string { color: var(--kw-json-string, rgba(255,255,255,0.55)); }
-  .json-number { color: var(--kw-json-number, var(--kw-blue)); }
-  .json-boolean { color: var(--kw-json-boolean, var(--kw-yellow)); }
-  .json-null { color: var(--kw-json-null, rgba(255,255,255,0.3)); }
+  .json-key { color: #6b9e3e; }
+  .json-string { color: rgba(255,255,255,0.55); }
+  .json-number { color: var(--kw-blue); }
+  .json-boolean { color: var(--kw-yellow); }
+  .json-null { color: rgba(255,255,255,0.3); }
 
   /* Tree guide lines */
   .tree-guide {
@@ -183,15 +178,6 @@
     to { opacity: 1; }
   }
 
-  /* Console prompt caret blink */
-  .prompt-caret {
-    animation: caret-pulse 1.2s step-end infinite;
-  }
-  @keyframes caret-pulse {
-    0%, 100% { opacity: 1; }
-    50% { opacity: 0; }
-  }
-
   /* Connected status dot — subtle breathe when first connected */
   .status-connected-enter {
     animation: status-breathe 600ms cubic-bezier(0.16, 1, 0.3, 1);
@@ -257,7 +243,6 @@
   .toast-enter { animation: none; }
   .feedback-flash { animation: none; }
   .console-entry { animation: none; }
-  .prompt-caret { animation: none; }
   .status-connected-enter { animation: none; }
   .console-btn:hover { transform: none; }
   .console-btn:active { transform: none; }

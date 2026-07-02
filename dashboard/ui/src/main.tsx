@@ -9,7 +9,7 @@ import { createSignal, createEffect, onCleanup, For, Show, Switch, Match } from 
 export type ConnStatus = "connected" | "connecting" | "disconnected";
 
 export interface Route {
-  method: string; pattern: string; handler: string; middleware: string[]; type?: string;
+  method: string; pattern: string; handler: string; middleware: string[];
 }
 
 // ─── Utilities ──────────────────────────────────────────
@@ -36,10 +36,8 @@ export function formatLatency(us: number): string {
   return (us / 1000000).toFixed(2) + "s";
 }
 
-export function formatTime(ts: number, showMs = true): string {
-  const d = new Date(ts);
-  const base = d.toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
-  return showMs ? base + "." + String(d.getMilliseconds()).padStart(3, "0") : base;
+export function formatTime(ts: number): string {
+  return new Date(ts).toLocaleTimeString("en-US", { hour12: false, hour: "2-digit", minute: "2-digit", second: "2-digit" });
 }
 
 export function getHashParams(): URLSearchParams {
@@ -77,7 +75,6 @@ export async function api<T>(path: string, opts: RequestInit = {}): Promise<T> {
   } finally { clearTimeout(t); }
 }
 
-export async function fetchEffectiveConfig() { return api<object>("/__keyway/api/config/effective"); }
 export function startStream(onChunk: (s: string) => void, onDone: () => void): () => void {
   const ctrl = new AbortController();
   fetch("/__keyway/api/stream", { signal: ctrl.signal })
@@ -206,10 +203,8 @@ function App() {
   const [metrics, setMetrics] = createSignal<MetricsSnapshot | null>(null);
   const [prevMetrics, setPrevMetrics] = createSignal<MetricsSnapshot | null>(null);
   const [drawerOpen, setDrawerOpen] = createSignal(false);
-  const [pendingCmd, setPendingCmd] = createSignal<string | null>(null);
   const [errors, setErrors] = createSignal<ToastError[]>([]);
   const [currentPath, setCurrentPath] = createSignal(parseHash(location.hash));
-  const [consoleMounted, setConsoleMounted] = createSignal(false);
   const [showWelcome, setShowWelcome] = createSignal(!localStorage.getItem("kw_onboarded"));
   let viewRef!: HTMLDivElement;
 
@@ -272,9 +267,6 @@ function App() {
   function dismissWelcome() { localStorage.setItem("kw_onboarded", "1"); setShowWelcome(false); }
 
   window.onhashchange = () => setCurrentPath(parseHash(location.hash));
-
-  // Mark console as mounted once drawer opens
-  createEffect(() => { if (drawerOpen() && !consoleMounted()) setConsoleMounted(true); });
 
   // Restart view-enter animation on navigation
   createEffect(() => {
@@ -445,14 +437,7 @@ function App() {
           class="border-t border-base-300 bg-base-200 overflow-hidden shrink-0"
           style={{ height: `${consoleHeight()}px` }}
         >
-          <Show when={consoleMounted() || drawerOpen()}>
-            <ConsoleCore
-              metrics={metrics}
-              wsMessages={wsMessages}
-              pendingCmd={pendingCmd}
-              setPendingCmd={setPendingCmd}
-            />
-          </Show>
+          <ConsoleCore metrics={metrics} wsMessages={wsMessages} />
         </div>
       </Show>
     </div>
