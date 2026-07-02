@@ -86,8 +86,13 @@ pub fn main(init: std.process.Init.Minimal) !void {
     var pool = try ThreadPool.init(allocator, server_config, cli_config.workers, &coordinator, &reload_coordinator, cli_config.script, cli_config.watch);
     defer pool.deinit();
 
-    // Block until all workers have bound sockets and are accepting connections
-    pool.waitUntilReady();
+    // Block until all workers have bound sockets and are accepting connections.
+    // If every worker died during startup (e.g. the entry script failed to
+    // load), fail fast instead of leaving a zombie server — see #114.
+    pool.waitUntilReady() catch {
+        log.err().string("msg", "all workers failed to start — exiting").log();
+        std.process.exit(1);
+    };
     log.info().string("msg", "Keyway - Ready").stringSafe("host", server_config.host).int("port", server_config.port).log();
 
     // Wait for all workers (runs until Ctrl+C)

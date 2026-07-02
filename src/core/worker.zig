@@ -66,6 +66,7 @@ pub const Worker = struct {
         reload_coordinator: ?*ReloadCoordinator,
         metrics: *WorkerMetrics,
         ready_count: *std.atomic.Value(usize),
+        live_count: *std.atomic.Value(usize),
         script_path: []const u8,
         watch: bool,
     };
@@ -100,6 +101,11 @@ pub const Worker = struct {
         prom.worker_id = @intCast(ctx.worker_id);
 
         defer ctx.allocator.destroy(ctx);
+
+        // Mark this worker as exited (success or error) so waitUntilReady can
+        // detect "every worker died during startup" instead of spinning
+        // forever — see #114.
+        defer _ = ctx.live_count.fetchSub(1, .release);
 
         if (pinned) {
             log.debug().string("msg", "worker pinned to core").int("core", ctx.worker_id).log();
@@ -365,6 +371,7 @@ pub const ThreadPool = struct {
     reload_coordinator: ?*ReloadCoordinator = null,
     worker_metrics: []WorkerMetrics,
     ready_count: *std.atomic.Value(usize),
+    live_count: *std.atomic.Value(usize),
 
     /// Create thread pool with the given number of workers.
     /// Pass worker_count=0 to auto-detect (one worker per CPU core).
@@ -401,6 +408,13 @@ pub const ThreadPool = struct {
         ready_count.* = std.atomic.Value(usize).init(0);
         errdefer allocator.destroy(ready_count);
 
+        // Create worker liveness counter (decremented as each worker thread
+        // exits, success or failure). Lets waitUntilReady detect "zero
+        // survivors" instead of spinning forever — see #114.
+        const live_count = try allocator.create(std.atomic.Value(usize));
+        live_count.* = std.atomic.Value(usize).init(num_workers);
+        errdefer allocator.destroy(live_count);
+
         // Create SSE broadcast bus (shared across all workers)
         const sse_bus = SseBroadcastBus.init(allocator, num_workers) catch null;
 
@@ -417,6 +431,7 @@ pub const ThreadPool = struct {
                 .reload_coordinator = reload_coordinator,
                 .metrics = &worker_metrics[i],
                 .ready_count = ready_count,
+                .live_count = live_count,
                 .script_path = script_path,
                 .watch = watch,
             });
@@ -431,12 +446,18 @@ pub const ThreadPool = struct {
             .reload_coordinator = reload_coordinator,
             .worker_metrics = worker_metrics,
             .ready_count = ready_count,
+            .live_count = live_count,
         };
     }
 
-    /// Block until all workers have bound their sockets and are accepting connections.
-    pub fn waitUntilReady(self: *ThreadPool) void {
+    /// Block until all workers have bound their sockets and are accepting
+    /// connections. Returns error.AllWorkersFailed if every worker thread
+    /// exited before any reached readiness (e.g. the entry script failed to
+    /// load) — without this check the caller spins forever on a zombie
+    /// server. See #114.
+    pub fn waitUntilReady(self: *ThreadPool) error{AllWorkersFailed}!void {
         while (self.ready_count.load(.acquire) < self.workers.len) {
+            if (self.live_count.load(.acquire) == 0) return error.AllWorkersFailed;
             std.atomic.spinLoopHint();
         }
     }
@@ -453,6 +474,7 @@ pub const ThreadPool = struct {
         if (self.sse_bus) |bus| bus.deinit();
         self.allocator.destroy(self.bpf_ready);
         self.allocator.destroy(self.ready_count);
+        self.allocator.destroy(self.live_count);
         self.allocator.free(self.worker_metrics);
         self.allocator.free(self.workers);
     }
