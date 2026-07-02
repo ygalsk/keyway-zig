@@ -44,7 +44,8 @@ const parseQueryString = params.parseQueryString;
 /// Suspend state for a coroutine yielded on WS/SSE/stream flow control.
 /// Non-null means a handler is yielded waiting to be resumed.
 pub const SuspendedState = struct {
-    exchange: *HttpExchange,
+    // ponytail: WebSocket resumes do not serialize an HTTP response; null beats a dummy exchange.
+    exchange: ?*HttpExchange,
     coroutine_ref: i32,
     coroutine_thread: *anyopaque,
 };
@@ -689,7 +690,7 @@ pub const Connection = struct {
             return;
         }
 
-        const exchange = s.exchange;
+        const exchange = s.exchange.?;
         self.logAccess(exchange.status);
         self.writeResponse(exchange) catch {
             self.send500InternalError();

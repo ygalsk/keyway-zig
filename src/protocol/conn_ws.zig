@@ -5,7 +5,6 @@ const http = @import("../http/http.zig");
 const ws = @import("ws.zig");
 const handler_mod = @import("../core/handler.zig");
 const Connection = handler_mod.Connection;
-const params = @import("../http/params.zig");
 const HttpExchange = @import("../http/http_exchange.zig").HttpExchange;
 const castUserdata = @import("../util/helpers.zig").castUserdata;
 const Lua = @import("luajit").Lua;
@@ -306,29 +305,8 @@ fn dispatchWsMessage(conn: *Connection, payload: []const u8) void {
             startWsRead(conn);
         },
         .yielded => {
-            // Bundle suspended state with a dummy exchange for the resumeHandler interface
-            const alloc = conn.arena.allocator();
-            const dummy_exchange = alloc.create(HttpExchange) catch {
-                conn.close();
-                return;
-            };
-            const response_headers = std.ArrayList(http.Header).initCapacity(alloc, 0) catch {
-                conn.close();
-                return;
-            };
-            dummy_exchange.* = .{
-                .method = "WS",
-                .path = "",
-                .headers = &[_]http.Header{},
-                .params = &params.ParamArray{},
-                .query = &params.QueryArray{},
-                .body = "",
-                .response_headers = response_headers,
-                .allocator = alloc,
-            };
-
             conn.suspended = .{
-                .exchange = dummy_exchange,
+                .exchange = null,
                 .coroutine_ref = conn.lua_state.coroutine_ref,
                 .coroutine_thread = @ptrCast(conn.lua_state.coroutine_thread.?),
             };
