@@ -1,4 +1,5 @@
 const std = @import("std");
+const config = @import("../util/config.zig");
 
 pub const Opcode = enum(u4) {
     continuation = 0x0,
@@ -45,14 +46,18 @@ pub fn parseFrame(data: []u8) !ParseResult {
         pos += 8;
     }
 
+    if (payload_len > @as(u64, config.WS_MAX_MESSAGE_SIZE)) return error.FrameTooLarge;
+    const payload_len_usize: usize = @intCast(payload_len);
+
     if (masked) {
         if (data.len < pos + 4) return .incomplete;
         const mask_key = data[pos..][0..4];
         pos += 4;
 
-        if (data.len < pos + payload_len) return .incomplete;
+        const end = std.math.add(usize, pos, payload_len_usize) catch return error.FrameTooLarge;
+        if (data.len < end) return .incomplete;
 
-        const payload = data[pos..][0..@intCast(payload_len)];
+        const payload = data[pos..end];
         // Unmask in-place
         for (payload, 0..) |*b, i| {
             b.* ^= mask_key[i % 4];
@@ -60,15 +65,16 @@ pub fn parseFrame(data: []u8) !ParseResult {
 
         return .{ .frame = .{
             .frame = .{ .fin = fin, .opcode = opcode, .payload = payload },
-            .consumed = pos + @as(usize, @intCast(payload_len)),
+            .consumed = end,
         } };
     } else {
-        if (data.len < pos + payload_len) return .incomplete;
+        const end = std.math.add(usize, pos, payload_len_usize) catch return error.FrameTooLarge;
+        if (data.len < end) return .incomplete;
 
-        const payload = data[pos..][0..@intCast(payload_len)];
+        const payload = data[pos..end];
         return .{ .frame = .{
             .frame = .{ .fin = fin, .opcode = opcode, .payload = payload },
-            .consumed = pos + @as(usize, @intCast(payload_len)),
+            .consumed = end,
         } };
     }
 }
@@ -155,6 +161,11 @@ test "parseFrame - incomplete" {
     var data = [_]u8{0x81};
     const result = try parseFrame(&data);
     try std.testing.expectEqual(ParseResult.incomplete, result);
+}
+
+test "parseFrame - rejects oversized 64-bit length" {
+    var data = [_]u8{ 0x81, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff };
+    try std.testing.expectError(error.FrameTooLarge, parseFrame(&data));
 }
 
 test "parseFrame - unmasked ping" {
