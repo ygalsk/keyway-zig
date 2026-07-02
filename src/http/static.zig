@@ -97,6 +97,39 @@ fn formatHttpDate(buf: *[29]u8, epoch_secs: i64) void {
     }) catch {};
 }
 
+/// Parse an RFC 7231 IMF-fixdate ("Sun, 06 Nov 1994 08:49:37 GMT") to epoch
+/// seconds. Returns null on any deviation (caller then serves 200).
+// ponytail: IMF-fixdate only (the format we emit); other HTTP-date forms fall through to 200
+fn parseHttpDate(s: []const u8) ?i64 {
+    // "Www, DD Mon YYYY HH:MM:SS GMT"
+    if (s.len < 29) return null;
+    const day = std.fmt.parseInt(u32, std.mem.trim(u8, s[5..7], " "), 10) catch return null;
+    const month = monthIndex(s[8..11]) orelse return null;
+    const year = std.fmt.parseInt(i64, s[12..16], 10) catch return null;
+    const hour = std.fmt.parseInt(i64, s[17..19], 10) catch return null;
+    const min = std.fmt.parseInt(i64, s[20..22], 10) catch return null;
+    const sec = std.fmt.parseInt(i64, s[23..25], 10) catch return null;
+    const days = daysFromCivil(year, month, day);
+    return days * 86400 + hour * 3600 + min * 60 + sec;
+}
+
+fn monthIndex(m: []const u8) ?u32 {
+    const names = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+    for (names, 1..) |name, i| if (std.mem.eql(u8, m, name)) return @intCast(i);
+    return null;
+}
+
+/// Days since 1970-01-01 for a civil date (Howard Hinnant's algorithm).
+fn daysFromCivil(y_in: i64, m: u32, d: u32) i64 {
+    const y = y_in - @as(i64, if (m <= 2) 1 else 0);
+    const era = @divFloor(if (y >= 0) y else y - 399, 400);
+    const yoe = y - era * 400; // [0, 399]
+    const mp: i64 = @intCast((m + (if (m > 2) @as(u32, 0) else 12) - 3)); // Mar=0..Feb=11
+    const doy = @divTrunc(153 * mp + 2, 5) + @as(i64, d) - 1; // [0, 365]
+    const doe = yoe * 365 + @divTrunc(yoe, 4) - @divTrunc(yoe, 100) + doy; // [0, 146096]
+    return era * 146097 + doe - 719468;
+}
+
 /// Map a static-file I/O error to an HTTP response.
 /// A missing entry is the client's problem (404); permissions, I/O, fd
 /// exhaustion, etc. are the server failing to read its own files (500).
@@ -122,6 +155,13 @@ const StaticPath = struct {
     /// Symlink-resolved absolute path — used to open the file.
     real: []const u8,
 };
+
+/// True if `path` is `root` itself or a descendant — startsWith plus a segment
+/// boundary, so "/x/public-secret" is NOT within "/x/public".
+fn isWithinRoot(path: []const u8, root: []const u8) bool {
+    if (!std.mem.startsWith(u8, path, root)) return false;
+    return path.len == root.len or path[root.len] == std.fs.path.sep;
+}
 
 /// Resolve `suffix` against `route` to an absolute, symlink-resolved path
 /// verified to stay within the route root. Returns null after sending an
@@ -163,7 +203,7 @@ fn resolveStaticPath(
         self.send500InternalError();
         return null;
     };
-    if (!std.mem.startsWith(u8, resolved, root_resolved)) {
+    if (!isWithinRoot(resolved, root_resolved)) {
         self.logAccess(403);
         error_response.sendErrorStatus(self, 403, "path traversal blocked");
         return null;
@@ -186,7 +226,7 @@ fn resolveStaticPath(
             return null;
         };
     };
-    if (!std.mem.startsWith(u8, real_resolved, route.real_root)) {
+    if (!isWithinRoot(real_resolved, route.real_root)) {
         self.logAccess(403);
         error_response.sendErrorStatus(self, 403, "symlink traversal blocked");
         return null;
@@ -276,13 +316,24 @@ pub fn serveStaticFile(
         file_size,
     }) catch "";
 
-    // Check If-None-Match (use already-parsed headers, not raw buffer)
+    // Check If-None-Match (use already-parsed headers, not raw buffer).
+    // If-None-Match takes precedence over If-Modified-Since (RFC 7232 §6):
+    // when present but not matching, serve full — do not consult IMS.
     if (http.Parser.getHeader(request, "If-None-Match")) |inm| {
         if (std.mem.eql(u8, inm, etag)) {
             helpers.closeFd(fd);
             self.logAccess(304);
             self.sendRawResponse("HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\n\r\n");
             return;
+        }
+    } else if (http.Parser.getHeader(request, "If-Modified-Since")) |ims| {
+        if (parseHttpDate(ims)) |ims_secs| {
+            if (mtime_sec <= ims_secs) {
+                helpers.closeFd(fd);
+                self.logAccess(304);
+                self.sendRawResponse("HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\n\r\n");
+                return;
+            }
         }
     }
 
@@ -296,8 +347,8 @@ pub fn serveStaticFile(
 
     self.logAccess(200);
 
-    if (file_size == 0) {
-        // Empty file — just send headers
+    if (std.mem.eql(u8, request.method, "HEAD") or file_size == 0) {
+        // HEAD: RFC 7231 §4.3.2 — identical headers to GET, no message body.
         helpers.closeFd(fd);
         self.sendRawResponse(headers_text);
         return;
@@ -461,4 +512,25 @@ test "buildStaticHeaders formats status line and cache headers" {
     try std.testing.expect(std.mem.indexOf(u8, headers, "Content-Length: 42\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, headers, "ETag: \"abc\"\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, headers, "Last-Modified: Thu, 01 Jan 1970 00:00:00 GMT\r\n") != null);
+}
+
+test "isWithinRoot enforces a segment boundary, not just a string prefix" {
+    try std.testing.expect(isWithinRoot("/x/public", "/x/public"));
+    try std.testing.expect(isWithinRoot("/x/public/a.css", "/x/public"));
+    try std.testing.expect(!isWithinRoot("/x/public-secret/s.txt", "/x/public"));
+    try std.testing.expect(!isWithinRoot("/x/pub", "/x/public"));
+}
+
+test "parseHttpDate round-trips formatHttpDate" {
+    // 784111777 = Sun, 06 Nov 1994 08:49:37 GMT
+    var buf: [29]u8 = undefined;
+    formatHttpDate(&buf, 784111777);
+    try std.testing.expectEqualStrings("Sun, 06 Nov 1994 08:49:37 GMT", &buf);
+    try std.testing.expectEqual(@as(?i64, 784111777), parseHttpDate(&buf));
+
+    var epoch_buf: [29]u8 = undefined;
+    formatHttpDate(&epoch_buf, 0);
+    try std.testing.expectEqual(@as(?i64, 0), parseHttpDate(&epoch_buf));
+
+    try std.testing.expectEqual(@as(?i64, null), parseHttpDate("not a date"));
 }

@@ -122,6 +122,18 @@ pub fn sendErrorStatus(conn: *Connection, status: u16, internal_msg: []const u8)
     }
 }
 
+/// Send 405 Method Not Allowed with an Allow header (RFC 7231 §6.5.5).
+/// `allow` is the header value, e.g. "GET, HEAD".
+pub fn send405(conn: *Connection, allow: []const u8) void {
+    logError(.client_error, 405, conn.http_state.request_method, conn.http_state.request_path, "method not allowed");
+    const body = "Method Not Allowed";
+    const resp = std.fmt.allocPrint(conn.arena.allocator(), "HTTP/1.1 405 Method Not Allowed\r\nAllow: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ allow, body.len, body }) catch {
+        conn.sendRawResponse(statusResponse(400).?);
+        return;
+    };
+    conn.sendRawResponse(resp);
+}
+
 // =============================================================================
 // Tests
 // =============================================================================

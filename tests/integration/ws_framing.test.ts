@@ -341,8 +341,9 @@ describe("websocket handshake validation (#175)", () => {
   });
 
   // The router only registers GET for /test/ws (tests/fixtures.lua), so a
-  // POST 404s before conn_ws.handleWsUpgrade's own method check ever runs —
-  // this still proves a non-GET request is never upgraded.
+  // POST hits the router's 405 Method Not Allowed path (#176) before
+  // conn_ws.handleWsUpgrade's own method check ever runs — this still
+  // proves a non-GET request is never upgraded.
   test("does not upgrade a non-GET request", async () => {
     await withServer(async ({ port }) => {
       const status = await rawStatus(
@@ -354,7 +355,7 @@ describe("websocket handshake validation (#175)", () => {
           `Sec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\n` +
           `Sec-WebSocket-Version: 13\r\n\r\n`,
       );
-      expect(status).toBe(404);
+      expect(status).toBe(405);
     });
   });
 });

@@ -390,6 +390,31 @@ pub const Router = struct {
         return null;
     }
 
+    /// Cold-path 405 helper: after `match` returns null, report whether `path`
+    /// resolves to a routed node that has *some* method registered (→ 405 + Allow)
+    /// vs no such path (→ 404). Walks the trie again — only on the miss path, so
+    /// `match`'s hot path is untouched. Returns the leaf's method map, or null.
+    pub fn methodsForPath(self: *Router, path: []const u8) ?*const std.StringHashMap(i32) {
+        var node = self.root;
+        var start: usize = 1; // skip leading '/'
+        while (start < path.len) {
+            const end = std.mem.indexOfScalarPos(u8, path, start, '/') orelse path.len;
+            const segment = path[start..end];
+            if (node.children.get(segment)) |child| {
+                node = child;
+            } else if (node.param_child) |param| {
+                node = param.node;
+            } else {
+                return null;
+            }
+            start = end + 1;
+        }
+        if (node.methods) |*mt| {
+            if (mt.count() > 0) return mt;
+        }
+        return null;
+    }
+
     /// Collect all lua_ref values from the trie (for unreffing before reset).
     pub fn collectLuaRefs(self: *const Router, alloc: std.mem.Allocator, refs: *std.ArrayListUnmanaged(i32)) !void {
         try collectNodeRefs(self.root, alloc, refs);

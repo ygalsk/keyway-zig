@@ -1,6 +1,7 @@
 const std = @import("std");
 const http = @import("http.zig");
 const params_mod = @import("params.zig");
+const log = @import("../observability/log.zig");
 
 /// HttpExchange - The ONLY object Lua touches
 /// Represents a complete HTTP request/response exchange
@@ -72,6 +73,13 @@ pub const HttpExchange = struct {
     /// them immediately after this returns. The copies live for the exchange's
     /// lifetime (freed via `toResponse` transfer or `deinit`).
     pub fn addResponseHeader(self: *HttpExchange, name: []const u8, value: []const u8) !void {
+        // CRLF in a header name/value would split into forged response headers
+        // (response-splitting). Drop + log rather than raise. Tenant bug, not a crash.
+        if (containsCrlf(name) or containsCrlf(value)) {
+            log.warn().stringSafe("scope", "http_exchange").string("header", name).string("msg", "dropped response header with CR/LF in name or value").log();
+            return;
+        }
+
         // Copy strings from Lua memory into arena (Lua strings are temporary)
         const name_copy = try self.allocator.dupe(u8, name);
         const value_copy = try self.allocator.dupe(u8, value);
@@ -102,3 +110,7 @@ pub const HttpExchange = struct {
         self.response_headers.deinit(self.allocator);
     }
 };
+
+fn containsCrlf(s: []const u8) bool {
+    return std.mem.indexOfAny(u8, s, "\r\n") != null;
+}
