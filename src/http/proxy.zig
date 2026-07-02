@@ -201,8 +201,48 @@ fn onProxyCancelComplete(
     return .disarm;
 }
 
+/// Headers stripped before forwarding upstream, per RFC 7230 §6.1: hop-by-hop
+/// headers plus framing headers (Content-Length/Transfer-Encoding, which we
+/// regenerate below rather than forward — request.body is already decoded,
+/// so a forwarded Transfer-Encoding: chunked would corrupt the upstream read).
+/// `host` isn't actually hop-by-hop — it's stripped because the request line
+/// above already re-emits a rewritten Host for the upstream.
+const HOP_BY_HOP_HEADERS = [_][]const u8{
+    "host",
+    "connection",
+    "content-length",
+    "transfer-encoding",
+    "te",
+    "trailer",
+    "upgrade",
+    "keep-alive",
+    "proxy-authenticate",
+    "proxy-authorization",
+};
+
+/// True if `name` is a hop-by-hop header: one of HOP_BY_HOP_HEADERS, or named
+/// as a connection-option token in any of the client's Connection headers
+/// (RFC 7230 §6.1, e.g. `Connection: keep-alive, X-Hop`). Checks every header
+/// named `connection` rather than just one — RFC 7230 §3.2.2 allows repeated
+/// headers to be combined, and a header nominated by an earlier Connection
+/// header must not leak upstream just because a later one didn't repeat it.
+fn isHopByHop(name: []const u8, headers: []const http.Header) bool {
+    for (HOP_BY_HOP_HEADERS) |hop| {
+        if (std.ascii.eqlIgnoreCase(name, hop)) return true;
+    }
+    for (headers) |h| {
+        if (!std.ascii.eqlIgnoreCase(h.name, "connection")) continue;
+        var it = std.mem.splitScalar(u8, h.value, ',');
+        while (it.next()) |token| {
+            if (std.ascii.eqlIgnoreCase(name, std.mem.trim(u8, token, " \t"))) return true;
+        }
+    }
+    return false;
+}
+
 /// Build the HTTP/1.1 request to send upstream: request line, rewritten Host,
-/// forced `Connection: close`, forwarded client headers, then the body.
+/// forced `Connection: close`, forwarded client headers (minus hop-by-hop),
+/// regenerated framing, then the body.
 fn buildUpstreamRequest(
     allocator: std.mem.Allocator,
     request: *const http.Request,
@@ -219,10 +259,22 @@ fn buildUpstreamRequest(
         route.upstream_host,
         route.upstream_port,
     });
+
+    // Whether the original request carried framing, checked before the write
+    // loop below strips/emits headers.
+    var had_framing = false;
     for (request.headers) |h| {
-        if (std.ascii.eqlIgnoreCase(h.name, "host")) continue;
-        if (std.ascii.eqlIgnoreCase(h.name, "connection")) continue;
+        if (std.ascii.eqlIgnoreCase(h.name, "content-length") or std.ascii.eqlIgnoreCase(h.name, "transfer-encoding")) had_framing = true;
+    }
+
+    for (request.headers) |h| {
+        if (isHopByHop(h.name, request.headers)) continue;
         try w.print("{s}: {s}\r\n", .{ h.name, h.value });
+    }
+    // Regenerate framing rather than forwarding the client's CL/TE (already
+    // stripped above): request.body is always the fully-decoded payload.
+    if (request.body.len > 0 or had_framing) {
+        try w.print("Content-Length: {d}\r\n", .{request.body.len});
     }
     try w.writeAll("\r\n");
     if (request.body.len > 0) try w.writeAll(request.body);
@@ -432,4 +484,117 @@ test "parseUpstreamStatus: malformed status line" {
 test "parseUpstreamStatus: short buffer" {
     try std.testing.expectEqual(@as(?u16, null), parseUpstreamStatus(""));
     try std.testing.expectEqual(@as(?u16, null), parseUpstreamStatus("HTTP/1.1 2"));
+}
+
+fn testRoute() router_mod.ProxyRoute {
+    return .{
+        .prefix = "/api",
+        .upstream_host = "127.0.0.1",
+        .upstream_port = 3000,
+        .upstream_addr = std.Io.net.IpAddress.parse("127.0.0.1", 0) catch unreachable,
+    };
+}
+
+test "buildUpstreamRequest: regenerates Content-Length for a decoded chunked body" {
+    var headers = [_]http.Header{
+        .{ .name = "Transfer-Encoding", .value = "chunked" },
+    };
+    const request = http.Request{
+        .method = "POST",
+        .path = "/upload",
+        .headers = &headers,
+        .body = "hello world",
+        .raw_len = 0,
+    };
+    const built = try buildUpstreamRequest(std.testing.allocator, &request, testRoute(), "/upload");
+    defer std.testing.allocator.free(built);
+
+    try std.testing.expect(std.mem.indexOf(u8, built, "Content-Length: 11\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, built, "Transfer-Encoding") == null);
+    try std.testing.expectEqual(@as(usize, 1), std.mem.count(u8, built, "hello world"));
+}
+
+test "buildUpstreamRequest: strips hop-by-hop headers, keeps ordinary ones" {
+    var headers = [_]http.Header{
+        .{ .name = "TE", .value = "trailers" },
+        .{ .name = "Trailer", .value = "X-Foo" },
+        .{ .name = "Upgrade", .value = "websocket" },
+        .{ .name = "Keep-Alive", .value = "timeout=5" },
+        .{ .name = "Proxy-Authorization", .value = "Basic xyz" },
+        .{ .name = "X-Custom", .value = "keep-me" },
+        .{ .name = "Accept", .value = "*/*" },
+    };
+    const request = http.Request{
+        .method = "GET",
+        .path = "/",
+        .headers = &headers,
+        .body = "",
+        .raw_len = 0,
+    };
+    const built = try buildUpstreamRequest(std.testing.allocator, &request, testRoute(), "/");
+    defer std.testing.allocator.free(built);
+
+    for ([_][]const u8{ "TE:", "Trailer:", "Upgrade:", "Keep-Alive:", "Proxy-Authorization:" }) |hop| {
+        try std.testing.expect(std.mem.indexOf(u8, built, hop) == null);
+    }
+    try std.testing.expect(std.mem.indexOf(u8, built, "X-Custom: keep-me\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, built, "Accept: */*\r\n") != null);
+}
+
+test "buildUpstreamRequest: strips headers named as Connection tokens, keeps unnamed ones" {
+    var headers = [_]http.Header{
+        .{ .name = "Connection", .value = "keep-alive, X-Hop" },
+        .{ .name = "X-Hop", .value = "strip-me" },
+        .{ .name = "X-Hop2", .value = "keep-me" },
+    };
+    const request = http.Request{
+        .method = "GET",
+        .path = "/",
+        .headers = &headers,
+        .body = "",
+        .raw_len = 0,
+    };
+    const built = try buildUpstreamRequest(std.testing.allocator, &request, testRoute(), "/");
+    defer std.testing.allocator.free(built);
+
+    try std.testing.expect(std.mem.indexOf(u8, built, "X-Hop:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, built, "X-Hop2: keep-me\r\n") != null);
+}
+
+test "buildUpstreamRequest: honors every Connection header, not just the last" {
+    var headers = [_]http.Header{
+        .{ .name = "Connection", .value = "X-First" },
+        .{ .name = "X-First", .value = "strip-me" },
+        .{ .name = "Connection", .value = "X-Second" },
+        .{ .name = "X-Second", .value = "strip-me-too" },
+    };
+    const request = http.Request{
+        .method = "GET",
+        .path = "/",
+        .headers = &headers,
+        .body = "",
+        .raw_len = 0,
+    };
+    const built = try buildUpstreamRequest(std.testing.allocator, &request, testRoute(), "/");
+    defer std.testing.allocator.free(built);
+
+    try std.testing.expect(std.mem.indexOf(u8, built, "X-First:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, built, "X-Second:") == null);
+}
+
+test "buildUpstreamRequest: GET with no body and no framing headers emits no Content-Length" {
+    var headers = [_]http.Header{
+        .{ .name = "Accept", .value = "*/*" },
+    };
+    const request = http.Request{
+        .method = "GET",
+        .path = "/",
+        .headers = &headers,
+        .body = "",
+        .raw_len = 0,
+    };
+    const built = try buildUpstreamRequest(std.testing.allocator, &request, testRoute(), "/");
+    defer std.testing.allocator.free(built);
+
+    try std.testing.expect(std.mem.indexOf(u8, built, "Content-Length") == null);
 }
