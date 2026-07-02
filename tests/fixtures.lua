@@ -17,8 +17,6 @@ end
 keyway.middleware.register("mw_before", mw_before)
 keyway.middleware.register("mw_after", mw_after)
 
-keyway.proxy = keyway.proxy or {}
-
 -- Integration-test upstreams (see tests/integration/proxy.test.ts).
 keyway.proxy["/__keyway/test-proxy"] = { host = "127.0.0.1", port = 38291, strip_prefix = true }
 keyway.proxy["/__keyway/test-proxy-dead"] = { host = "127.0.0.1", port = 1, strip_prefix = true }

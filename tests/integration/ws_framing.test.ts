@@ -1,33 +1,8 @@
 import { describe, expect, test } from "bun:test";
-import { resolve } from "path";
+import { withServer } from "../harness";
 
-const PROJECT_ROOT = resolve(import.meta.dir, "../..");
-const BINARY = resolve(PROJECT_ROOT, "zig-out/bin/keyway");
-const SCRIPT = resolve(PROJECT_ROOT, "tests/fixtures.lua");
 const encoder = new TextEncoder();
 const decoder = new TextDecoder();
-
-async function withServer(fn: (port: number) => Promise<void>) {
-  const port = 10000 + Math.floor(Math.random() * 50000);
-  const proc = Bun.spawn(
-    [BINARY, "--script", SCRIPT, "--workers", "1", "--port", String(port)],
-    { cwd: PROJECT_ROOT, stdout: "ignore", stderr: "pipe" },
-  );
-  const stderr = new Response(proc.stderr).text();
-
-  try {
-    const base = `http://127.0.0.1:${port}`;
-    for (let i = 0; i < 50; i++) {
-      const res = await fetch(`${base}/health`).catch(() => null);
-      if (res?.ok) return await fn(port);
-      await Bun.sleep(100);
-    }
-    throw new Error(`isolated keyway did not start: ${await stderr}`);
-  } finally {
-    proc.kill("SIGKILL");
-    await Promise.race([proc.exited.catch(() => {}), Bun.sleep(500)]);
-  }
-}
 
 async function openRawWs(port: number) {
   let bytes: number[] = [];
@@ -109,7 +84,7 @@ function readFrame(bytes: number[], opcode: number): string | null {
     pos = 4;
   } else if (len === 127) {
     if (bytes.length < 10) return null;
-    len = Number((BigInt(bytes[2]) << 56n) | (BigInt(bytes[3]) << 48n) | (BigInt(bytes[4]) << 40n) | (BigInt(bytes[5]) << 32n) | (BigInt(bytes[6]) << 24n) | (BigInt(bytes[7]) << 16n) | (BigInt(bytes[8]) << 8n) | BigInt(bytes[9]));
+    len = Number(new DataView(Uint8Array.from(bytes.slice(2, 10)).buffer).getBigUint64(0));
     pos = 10;
   }
   if (bytes.length < pos + len) return null;
@@ -142,7 +117,7 @@ function clientFrame(opcode: number, data: string, fin = true): Uint8Array {
 describe("websocket adversarial framing", () => {
   // (#165)
   test.failing("echoes a frame whose header and payload arrive in separate writes", async () => {
-    await withServer(async (port) => {
+    await withServer(async ({ port }) => {
       const ws = await openRawWs(port);
       const frame = clientFrame(0x1, "x".repeat(4096));
       const payloadOffset = frame.length - 4096;
@@ -158,7 +133,7 @@ describe("websocket adversarial framing", () => {
 
   // (#166)
   test.failing("rejects a 127-length frame declaring more than 1MB", async () => {
-    await withServer(async (port) => {
+    await withServer(async ({ port }) => {
       const ws = await openRawWs(port);
       const frame = new Uint8Array(14);
       frame[0] = 0x81;
@@ -174,7 +149,7 @@ describe("websocket adversarial framing", () => {
 
   // (#167)
   test.failing("echoes a text message sent as three continuation frames", async () => {
-    await withServer(async (port) => {
+    await withServer(async ({ port }) => {
       const ws = await openRawWs(port);
       ws.socket.write(clientFrame(0x1, "he", false));
       ws.socket.write(clientFrame(0x0, "llo", false));
