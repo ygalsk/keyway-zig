@@ -13,6 +13,7 @@ const xev = @import("xev");
 const log = @import("../observability/log.zig");
 const LuaState = @import("../lua/lua_state.zig").LuaState;
 const Router = @import("../http/router.zig").Router;
+const prom = @import("../observability/prom.zig");
 
 const DEBOUNCE_MS = 200;
 
@@ -196,7 +197,9 @@ pub const FileWatcher = struct {
         if (self.draining) return .disarm;
 
         log.info().string("msg", "file change detected — reloading").log();
-        self.lua_state.reload(self.router, self.script_path);
+        if (self.lua_state.reload(self.router, self.script_path)) {
+            prom.scriptReloadSucceeded();
+        }
 
         return .disarm;
     }

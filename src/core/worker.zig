@@ -383,7 +383,9 @@ fn onReloadSignal(
     }
 
     log.info().string("msg", "performing hot reload").log();
-    ctx.lua_state.reload(ctx.router, ctx.script_path);
+    if (ctx.lua_state.reload(ctx.router, ctx.script_path)) {
+        prom.scriptReloadSucceeded();
+    }
 
     return .rearm;
 }

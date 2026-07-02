@@ -37,6 +37,12 @@ pub const Metrics = struct {
     lua_coroutines_active: ConnectionGauge,
     lua_script_duration_seconds: LuaScriptDuration,
 
+    // -- Hot reload --
+    // Per-worker generation counter, incremented only on a successful reload
+    // (#117). A client polls this before/after POST /__keyway/reload: no
+    // advance means that worker's reload failed; workers disagreeing means skew.
+    script_generation: ConnectionGauge,
+
     // Bucket bounds (must live inside the struct so HistogramVec comptime refs resolve)
     const latency_buckets = [_]f64{ 0.0005, 0.001, 0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1.0, 5.0, 10.0 };
     const body_size_buckets = [_]u64{ 64, 256, 1_024, 4_096, 16_384, 65_536, 262_144, 1_048_576, 4_194_304 };
@@ -86,6 +92,9 @@ pub fn init(allocator: Allocator) !void {
         .lua_script_duration_seconds = try Metrics.LuaScriptDuration.init(allocator, io, "keyway_lua_script_duration_seconds", .{
             .help = "Lua script execution time in seconds",
         }, .{}),
+        .script_generation = try Metrics.ConnectionGauge.init(allocator, io, "keyway_script_generation", .{
+            .help = "Per-worker Lua script generation, incremented on each successful hot reload",
+        }, .{}),
     };
 }
 
@@ -97,6 +106,7 @@ pub fn deinit() void {
     global.connections_rejected_total.deinit();
     global.lua_coroutines_active.deinit();
     global.lua_script_duration_seconds.deinit();
+    global.script_generation.deinit();
     metrics_io.deinit();
 }
 
@@ -160,6 +170,11 @@ pub fn luaCoroutineFinished() void {
 pub fn luaScriptDuration(route: []const u8, duration_us: i64) void {
     const duration_seconds: f64 = @as(f64, @floatFromInt(duration_us)) / 1_000_000.0;
     global.lua_script_duration_seconds.observe(.{ .worker_id = worker_id, .route = route }, duration_seconds) catch {};
+}
+
+/// Hot reload succeeded — advance this worker's script generation (#117).
+pub fn scriptReloadSucceeded() void {
+    global.script_generation.incr(wlabels()) catch {};
 }
 
 // =============================================================================
