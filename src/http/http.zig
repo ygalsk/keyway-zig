@@ -73,6 +73,9 @@ pub const Response = struct {
 
         if (self.headers) |h| {
             for (h.items) |header| {
+                if (isEngineOwnedHeader(header.name)) continue;
+                if (std.mem.indexOfAny(u8, header.name, "\r\n") != null) continue;
+                if (std.mem.indexOfAny(u8, header.value, "\r\n") != null) continue;
                 try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
             }
         }
@@ -89,6 +92,16 @@ pub const Response = struct {
         // Headers (only if ArrayList was initialized)
         if (self.headers) |h| {
             for (h.items) |header| {
+                // A 101 handshake (conn_ws.zig) carries an engine-authored
+                // "Connection: Upgrade" that RFC 6455 §4.2.2 requires — exempt
+                // Connection at 101 the same way Content-Length is exempted below.
+                // A Lua handler that sets ctx.status=101 itself also routes here;
+                // that degenerate 101+body framing case is tracked as a follow-up,
+                // not resolved by this header-safety pass.
+                const is_protected_connection = self.status == 101 and std.ascii.eqlIgnoreCase(header.name, "connection");
+                if (isEngineOwnedHeader(header.name) and !is_protected_connection) continue;
+                if (std.mem.indexOfAny(u8, header.name, "\r\n") != null) continue;
+                if (std.mem.indexOfAny(u8, header.value, "\r\n") != null) continue;
                 try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
             }
         }
@@ -111,6 +124,17 @@ pub const Header = struct {
     name: []const u8,
     value: []const u8,
 };
+
+/// Headers the engine owns and emits itself — a tenant setting these could
+/// desync framing (request smuggling) or hijack keep-alive. Case-insensitive,
+/// and whitespace-trimmed so "Content-Length " (a lenient-intermediary
+/// smuggling obfuscation) is still recognized and stripped.
+fn isEngineOwnedHeader(name: []const u8) bool {
+    const n = std.mem.trim(u8, name, " \t");
+    return std.ascii.eqlIgnoreCase(n, "content-length") or
+        std.ascii.eqlIgnoreCase(n, "transfer-encoding") or
+        std.ascii.eqlIgnoreCase(n, "connection");
+}
 
 /// True if `s` is a valid HTTP field-value integer: 1*DIGIT, nothing else.
 /// `std.fmt.parseInt` alone also accepts a leading '+', '-', and Zig's '_'
@@ -299,6 +323,43 @@ test "response serialization" {
 
     const expected = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!";
     try std.testing.expectEqualStrings(expected, buf.writer.buffered());
+}
+
+test "isEngineOwnedHeader matches content-length, transfer-encoding, connection case-insensitively" {
+    try std.testing.expect(isEngineOwnedHeader("Content-Length"));
+    try std.testing.expect(isEngineOwnedHeader("content-length"));
+    try std.testing.expect(isEngineOwnedHeader("CONTENT-LENGTH"));
+    try std.testing.expect(isEngineOwnedHeader("Transfer-Encoding"));
+    try std.testing.expect(isEngineOwnedHeader("transfer-encoding"));
+    try std.testing.expect(isEngineOwnedHeader("Connection"));
+    try std.testing.expect(isEngineOwnedHeader("connection"));
+    try std.testing.expect(!isEngineOwnedHeader("X-Foo"));
+    // Whitespace-padded framing names are the classic smuggling obfuscation —
+    // still recognized so they can't ride alongside the engine's own header.
+    try std.testing.expect(isEngineOwnedHeader("Content-Length "));
+    try std.testing.expect(isEngineOwnedHeader(" content-length"));
+    try std.testing.expect(isEngineOwnedHeader("\tTransfer-Encoding"));
+}
+
+test "serialize drops a tenant-set Content-Length and a CRLF-injected header" {
+    const allocator = std.testing.allocator;
+
+    var response = Response.init(allocator);
+    defer response.deinit();
+    response.status = 200;
+    response.body = "ok";
+    try response.addHeader("Content-Length", "999");
+    try response.addHeader("X-Bad", "a\r\nX-Injected: evil");
+
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    defer buf.deinit();
+    try response.serialize(&buf.writer);
+
+    const result = buf.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, result, "X-Injected") == null);
+    try std.testing.expect(std.mem.indexOf(u8, result, "Content-Length: 999") == null);
+    // Engine's own Content-Length for the real 2-byte body is still present.
+    try std.testing.expect(std.mem.indexOf(u8, result, "Content-Length: 2\r\n") != null);
 }
 
 test "status_lines: known phrase and unmapped-code fallback" {

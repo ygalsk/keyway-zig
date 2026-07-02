@@ -764,7 +764,8 @@ pub const Connection = struct {
         // Static file routes: handled before Lua routing (zero Lua overhead)
         if (self.router.matchStatic(clean_path)) |match| {
             if (!std.mem.eql(u8, request.method, "GET") and !std.mem.eql(u8, request.method, "HEAD")) {
-                error_response.sendErrorStatus(self, 405, "method not allowed for static file");
+                self.logAccess(405);
+                error_response.send405(self, "GET, HEAD");
                 return null;
             }
             static_mod.serveStaticFile(self, request, match.route, match.suffix);
@@ -777,6 +778,19 @@ pub const Connection = struct {
         };
 
         if (route_match == null) {
+            if (self.router.methodsForPath(clean_path)) |methods| {
+                var allow: std.ArrayListUnmanaged(u8) = .empty;
+                var it = methods.keyIterator();
+                var first = true;
+                while (it.next()) |k| {
+                    if (!first) allow.appendSlice(self.arena.allocator(), ", ") catch break;
+                    allow.appendSlice(self.arena.allocator(), k.*) catch break;
+                    first = false;
+                }
+                self.logAccess(405);
+                error_response.send405(self, allow.items);
+                return null;
+            }
             self.logAccess(404);
             self.send404NotFound();
         }

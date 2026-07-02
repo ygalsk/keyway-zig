@@ -111,6 +111,20 @@ keyway.routes["/test/broadcast"] = {
     end,
 }
 
+-- (#176) Response header CRLF injection regression: a response header value
+-- containing a literal CRLF + a fake header name must not split into a
+-- second, real response header at serialize time (src/http/http.zig
+-- Response.serialize). Set directly here rather than via a request header,
+-- since fetch()/picohttpparser both refuse literal CRLF in a header value
+-- before it would ever reach Lua as a single value.
+keyway.routes["/test/header-injection"] = {
+    GET = function(ctx)
+        ctx.status = 200
+        ctx.headers["X-Bad"] = "a\r\nX-Injected: evil"
+        ctx.body = "ok"
+    end,
+}
+
 keyway.routes["/test/mw"] = {
     middleware = { mw_before, mw_after },
     GET = function(ctx)
