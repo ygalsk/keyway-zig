@@ -242,6 +242,17 @@ pub const Connection = struct {
             if (wss.on_close_ref != 0) self.lua_state.lua.unref(Lua.PseudoIndex.Registry, wss.on_close_ref);
             if (wss.fragment_buf) |*fb| fb.deinit(self.arena.allocator());
         }
+        // Clean up stream state if connection closes while a stream coroutine
+        // is still suspended mid-yield (never reached sendTerminalChunk or the
+        // Lua-error path, which both already unref + decrement themselves).
+        // Unref the pinned coroutine (Lua registry leak) and match
+        // dispatchCoroutine's start-of-request increment (#173).
+        if (self.stream_state) |*ss| {
+            prom.luaCoroutineFinished();
+            if (ss.coroutine_ref != 0) {
+                self.lua_state.lua.unref(Lua.PseudoIndex.Registry, ss.coroutine_ref);
+            }
+        }
         // Clean up SSE state
         if (self.sse_state) |*ss| ss.deinit(self);
         // Clean up static file state

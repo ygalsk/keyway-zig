@@ -58,6 +58,11 @@ pub const STATIC_MAX_SIZE: u64 = 100 * 1024 * 1024;
 /// combined, not per-op). Requests exceeding this get 504.
 pub const PROXY_UPSTREAM_TIMEOUT_MS: u64 = 30_000;
 
+/// Maximum bytes queued for a single SSE subscriber awaiting drain (1 MB, #173).
+/// A slow consumer that exceeds this is disconnected rather than buffered
+/// further — dropping individual events would silently corrupt the stream.
+pub const SSE_MAX_QUEUED_BYTES: usize = 1_048_576;
+
 comptime {
     // Buffer sizes must be at least 4096 for reasonable HTTP operation
     if (READ_BUFFER_SIZE < 4096)

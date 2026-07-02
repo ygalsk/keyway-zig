@@ -5,6 +5,7 @@ const Connection = handler.Connection;
 const castUserdata = @import("../util/helpers.zig").castUserdata;
 const HttpExchange = @import("../http/http_exchange.zig").HttpExchange;
 const SseRegistry = @import("../protocol/sse.zig").SseRegistry;
+const config = @import("../util/config.zig");
 
 /// SSE connection state — set after successful SSE upgrade.
 /// Holds all SSE-specific fields; Connection.sse_state is ?SseState = null.
@@ -16,12 +17,20 @@ pub const SseState = struct {
     drain_index: usize,
     writing: bool,
     disconnect_completion: xev.Completion,
+    // Buffer currently owned by the in-flight async send (base_allocator),
+    // freed by onSseSendComplete once the write finishes. (#173)
+    in_flight: ?[]const u8 = null,
+    // Bytes queued but not yet sent, not counting in_flight. Caps memory for
+    // a slow consumer — see SSE_MAX_QUEUED_BYTES. (#173)
+    queued_bytes: usize = 0,
 
     /// Clean up SSE state on connection close.
-    /// Order: unsubscribe first (uses room as key), free room, free queue items, deinit queue.
+    /// Order: unsubscribe first (uses room as key), free room, free in-flight
+    /// send buffer, free queue items, deinit queue.
     pub fn deinit(self: *SseState, conn: *Connection) void {
         if (self.registry) |reg| reg.unsubscribe(self.room, conn);
         conn.base_allocator.free(self.room);
+        if (self.in_flight) |buf| conn.base_allocator.free(buf);
         for (self.send_queue.items[self.drain_index..]) |queued| conn.base_allocator.free(queued);
         self.send_queue.deinit(conn.base_allocator);
     }
@@ -115,9 +124,17 @@ fn onSseDisconnect(
 }
 
 /// Queue an SSE event for sending. Called by SseRegistry.broadcast.
+/// A subscriber that isn't draining fast enough (queued_bytes exceeds the
+/// cap) is disconnected rather than buffered further — dropping individual
+/// events would silently corrupt the stream. (#173)
 pub fn submitSseSend(self: *Connection, data: []const u8) void {
     if (self.state == .closing) return;
     const ss = &self.sse_state.?;
+
+    if (ss.queued_bytes + data.len > config.SSE_MAX_QUEUED_BYTES) {
+        self.close();
+        return;
+    }
 
     // Dupe data into base_allocator (caller's data is temporary)
     const duped = self.base_allocator.dupe(u8, data) catch return;
@@ -125,6 +142,7 @@ pub fn submitSseSend(self: *Connection, data: []const u8) void {
         self.base_allocator.free(duped);
         return;
     };
+    ss.queued_bytes += duped.len;
     if (!ss.writing) {
         drainSseQueue(self);
     }
@@ -145,12 +163,17 @@ pub fn drainSseQueue(self: *Connection) void {
     const data = ss.send_queue.items[ss.drain_index];
     ss.drain_index += 1;
     ss.writing = true;
+    ss.queued_bytes -= data.len;
 
-    self.submitSend(data, onSseSendComplete, true);
-    self.base_allocator.free(data);
+    // No arena dupe: the SSE connection's arena is never reset for its
+    // lifetime (long-lived), so an arena copy per event would leak. Send the
+    // base_allocator buffer directly and free it once the write completes. (#173)
+    ss.in_flight = data;
+    self.submitSend(data, onSseSendComplete, false);
 }
 
-/// Callback after SSE event chunk is sent — drain next from queue.
+/// Callback after SSE event chunk is sent — free the in-flight buffer, then
+/// drain next from queue.
 fn onSseSendComplete(
     userdata: ?*anyopaque,
     loop: *xev.Loop,
@@ -160,6 +183,13 @@ fn onSseSendComplete(
     _ = loop;
     _ = completion;
     const self = castUserdata(Connection, userdata);
+    const ss = &self.sse_state.?;
+    // Free before handleSendCompletion: on error it may close+deinit self
+    // synchronously, after which self is no longer safe to touch.
+    if (ss.in_flight) |buf| {
+        self.base_allocator.free(buf);
+        ss.in_flight = null;
+    }
     _ = self.handleSendCompletion(result) orelse return .disarm;
     drainSseQueue(self);
     return .disarm;
