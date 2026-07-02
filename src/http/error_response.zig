@@ -45,17 +45,24 @@ fn comptimeErrorResponse(comptime status: u16, comptime reason: []const u8, comp
         "\r\n" ++ body;
 }
 
-/// Pre-serialized error responses for each category's default status.
-const response_400 = comptimeErrorResponse(400, "Bad Request", "Bad Request");
-const response_500 = comptimeErrorResponse(500, "Internal Server Error", "Internal Server Error");
-const response_502 = comptimeErrorResponse(502, "Bad Gateway", "Bad Gateway");
-const response_504 = comptimeErrorResponse(504, "Gateway Timeout", "Gateway Timeout");
+/// Pre-serialized error responses. Reason phrase (and body) come from
+/// std.http.Status, so the numeric code and phrase can't desync — registering
+/// a status is one line and there's no hand-typed table (a missing row is
+/// exactly what caused #161).
+fn cannedResponse(comptime s: std.http.Status) []const u8 {
+    return comptimeErrorResponse(@intFromEnum(s), s.phrase().?, s.phrase().?);
+}
 
-/// Pre-serialized 413 response for oversized request bodies.
+const response_400 = cannedResponse(.bad_request);
+const response_403 = cannedResponse(.forbidden);
+const response_404 = cannedResponse(.not_found);
+const response_500 = cannedResponse(.internal_server_error);
+const response_502 = cannedResponse(.bad_gateway);
+const response_504 = cannedResponse(.gateway_timeout);
+
+// 413: std's phrase is the older "Payload Too Large"; keep the RFC 9110 name
+// "Content Too Large" deliberately, so this one stays explicit.
 const response_413 = comptimeErrorResponse(413, "Content Too Large", "Content Too Large");
-
-/// Pre-serialized 404 response for route misses.
-const response_404 = comptimeErrorResponse(404, "Not Found", "Not Found");
 
 /// Get pre-serialized response bytes for a specific status code.
 /// Returns null if no pre-serialized response exists for that status.
@@ -64,6 +71,7 @@ const response_404 = comptimeErrorResponse(404, "Not Found", "Not Found");
 fn statusResponse(status: u16) ?[]const u8 {
     return switch (status) {
         400 => response_400,
+        403 => response_403,
         404 => response_404,
         413 => response_413,
         500 => response_500,
@@ -131,7 +139,7 @@ test "ErrorCategory.logLevel maps correctly" {
 }
 
 test "pre-serialized responses are valid HTTP" {
-    const responses = [_][]const u8{ response_400, response_404, response_413, response_500, response_502, response_504 };
+    const responses = [_][]const u8{ response_400, response_403, response_404, response_413, response_500, response_502, response_504 };
     for (responses) |resp| {
         try std.testing.expect(std.mem.startsWith(u8, resp, "HTTP/1.1"));
         try std.testing.expect(std.mem.indexOf(u8, resp, "Content-Length:") != null);
