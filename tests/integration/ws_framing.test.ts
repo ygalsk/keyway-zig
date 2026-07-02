@@ -116,7 +116,7 @@ function clientFrame(opcode: number, data: string, fin = true): Uint8Array {
 
 describe("websocket adversarial framing", () => {
   // (#165)
-  test.failing("echoes a frame whose header and payload arrive in separate writes", async () => {
+  test("echoes a frame whose header and payload arrive in separate writes", async () => {
     await withServer(async ({ port }) => {
       const ws = await openRawWs(port);
       const frame = clientFrame(0x1, "x".repeat(4096));
@@ -132,7 +132,7 @@ describe("websocket adversarial framing", () => {
   });
 
   // (#166)
-  test.failing("rejects a 127-length frame declaring more than 1MB", async () => {
+  test("rejects a 127-length frame declaring more than 1MB", async () => {
     await withServer(async ({ port }) => {
       const ws = await openRawWs(port);
       const frame = new Uint8Array(14);
@@ -148,7 +148,7 @@ describe("websocket adversarial framing", () => {
   });
 
   // (#167)
-  test.failing("echoes a text message sent as three continuation frames", async () => {
+  test("echoes a text message sent as three continuation frames", async () => {
     await withServer(async ({ port }) => {
       const ws = await openRawWs(port);
       ws.socket.write(clientFrame(0x1, "he", false));
