@@ -1,5 +1,8 @@
 -- keyway.lua — Admin dashboard + file management control plane
 -- Lua files on disk control the runtime. The dashboard is a file editor.
+-- Run from the repo root (as `zig build run` does): this example's static
+-- and file-API paths are resolved relative to the current working directory,
+-- not to this script's location.
 
 local response = require("keyway.response")
 local json = require("keyway.json")
