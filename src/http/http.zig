@@ -92,24 +92,18 @@ pub const Response = struct {
         // Headers (only if ArrayList was initialized)
         if (self.headers) |h| {
             for (h.items) |header| {
-                // A 101 handshake (conn_ws.zig) carries an engine-authored
-                // "Connection: Upgrade" that RFC 6455 §4.2.2 requires — exempt
-                // Connection at 101 the same way Content-Length is exempted below.
-                // A Lua handler that sets ctx.status=101 itself also routes here;
-                // that degenerate 101+body framing case is tracked as a follow-up,
-                // not resolved by this header-safety pass.
-                const is_protected_connection = self.status == 101 and std.ascii.eqlIgnoreCase(header.name, "connection");
-                if (isEngineOwnedHeader(header.name) and !is_protected_connection) continue;
+                if (isEngineOwnedHeader(header.name)) continue;
                 if (std.mem.indexOfAny(u8, header.name, "\r\n") != null) continue;
                 if (std.mem.indexOfAny(u8, header.value, "\r\n") != null) continue;
                 try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
             }
         }
 
-        // Content-Length (skip for 101 Switching Protocols — no body follows)
-        if (self.status != 101) {
-            try writer.print("Content-Length: {d}\r\n", .{self.body.len});
-        }
+        // Content-Length. The 101 handshake is emitted as a raw response by
+        // conn_ws (not via serialize), so serialize has no status==101 special
+        // case: every response it produces is framed with an explicit length —
+        // a tenant that sets ctx.status=101 can no longer desync framing (#194).
+        try writer.print("Content-Length: {d}\r\n", .{self.body.len});
 
         // Blank line
         try writer.writeAll("\r\n");
@@ -479,22 +473,33 @@ test "http parser - rejects Transfer-Encoding with non-chunked final coding" {
     try std.testing.expectError(error.InvalidRequest, result);
 }
 
-test "101 switching protocols serialization" {
+test "serialize no longer special-cases 101 — a tenant ctx.status=101 is framed, not desynced (#194)" {
+    // The real WebSocket 101 handshake is now emitted as a raw response by
+    // conn_ws (verified end-to-end by the WS integration tests), so serialize
+    // only ever sees a 101 from a misused Lua handler. That must be well-framed:
+    // an explicit Content-Length, and the engine-owned Connection header stripped
+    // — no framing desync, no Connection leak.
     const allocator = std.testing.allocator;
 
     var resp = Response.init(allocator);
     defer resp.deinit();
     resp.status = 101;
-    try resp.addHeader("Upgrade", "websocket");
-    try resp.addHeader("Connection", "Upgrade");
-    try resp.addHeader("Sec-WebSocket-Accept", "s3pPLMBiTxaQ9kYGzzhZRbK+xOo=");
+    resp.body = "oops";
+    try resp.addHeader("Connection", "Upgrade"); // engine-owned → stripped
+    try resp.addHeader("X-Keep", "1");
 
     var buf: std.Io.Writer.Allocating = .init(allocator);
     defer buf.deinit();
     try resp.serialize(&buf.writer);
 
-    const expected = "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: s3pPLMBiTxaQ9kYGzzhZRbK+xOo=\r\n\r\n";
-    try std.testing.expectEqualStrings(expected, buf.writer.buffered());
+    const out = buf.writer.buffered();
+    try std.testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 101 Switching Protocols\r\n"));
+    // Content-Length now present (no 101 skip) → framing intact.
+    try std.testing.expect(std.mem.indexOf(u8, out, "Content-Length: 4\r\n") != null);
+    // Engine-owned Connection stripped even at 101 (exemption removed).
+    try std.testing.expect(std.mem.indexOf(u8, out, "Connection:") == null);
+    // A non-engine tenant header is still emitted.
+    try std.testing.expect(std.mem.indexOf(u8, out, "X-Keep: 1\r\n") != null);
 }
 
 test "picohttpparser websocket upgrade headers" {

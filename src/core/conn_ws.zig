@@ -58,12 +58,11 @@ pub fn handleWsUpgrade(conn: *Connection, exchange: *HttpExchange, request: *con
     const version_hdr = http.Parser.getHeader(request, "Sec-WebSocket-Version");
     const version = if (version_hdr) |v| std.mem.trim(u8, v, " \t") else null;
     if (version == null or !std.mem.eql(u8, version.?, "13")) {
-        var resp = http.Response.init(alloc);
-        resp.status = 426;
-        try resp.addHeader("Sec-WebSocket-Version", "13");
-        try resp.addHeader("Connection", "close");
+        // Raw response: the engine authors this handshake reply and it carries an
+        // engine-owned Connection header that Response.serialize strips from
+        // tenant output — so emit it verbatim here (#194).
         conn.logAccess(426);
-        try conn.writeResponseDirect(&resp);
+        conn.sendRawResponse("HTTP/1.1 426 Upgrade Required\r\nSec-WebSocket-Version: 13\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
         return;
     }
 
@@ -90,12 +89,11 @@ pub fn handleWsUpgrade(conn: *Connection, exchange: *HttpExchange, request: *con
     ws.computeAcceptKey(sec_key_trimmed, &accept_key);
     log.debug().string("msg", "ws accept_key").string("val", &accept_key).log();
 
-    // Build 101 response
-    var resp = http.Response.init(alloc);
-    resp.status = 101;
-    try resp.addHeader("Upgrade", "websocket");
-    try resp.addHeader("Connection", "Upgrade");
-    try resp.addHeader("Sec-WebSocket-Accept", &accept_key);
+    // Build the 101 handshake as a raw response. It carries engine-owned
+    // Upgrade/Connection headers that Response.serialize strips from tenant
+    // output, so serialize must not see it — which also lets serialize drop its
+    // status==101 special-cases entirely (#194).
+    const raw_101 = try std.fmt.allocPrint(alloc, "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {s}\r\n\r\n", .{&accept_key});
 
     // Store WsState on connection (copy refs from exchange)
     conn.ws_state = .{
@@ -108,9 +106,9 @@ pub fn handleWsUpgrade(conn: *Connection, exchange: *HttpExchange, request: *con
 
     conn.logAccess(101);
 
-    // Send 101 — writeResponseDirect sets state to .writing, so we set .websocket
-    // AFTER so onWrite dispatches to handleWsPostWrite (starts WS frame read loop).
-    try conn.writeResponseDirect(&resp);
+    // sendRawResponse sets state to .writing; set .websocket AFTER so onWrite
+    // dispatches to handleWsPostWrite (starts the WS frame read loop).
+    conn.sendRawResponse(raw_101);
     conn.state = .websocket;
 }
 
