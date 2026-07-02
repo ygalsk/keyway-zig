@@ -1,7 +1,7 @@
 import type { Config } from "tailwindcss";
 
 export default {
-  content: ["./src/**/*.{ts,tsx}", "./index.html"],
+  content: ["./src/**/*.{ts,tsx}", "../public/index.html"],
   theme: {
     fontFamily: {
       mono: ['"JetBrains Mono"', "monospace"],
@@ -10,12 +10,9 @@ export default {
       colors: {
         accent: {
           DEFAULT: "#73B44C",
-          light: "#9CCC65",
-          dim: "#4a7a2e",
         },
       },
       fontSize: {
-        micro: ["8px", { lineHeight: "1.2" }],
         tiny: ["9px", { lineHeight: "1.2" }],
         detail: ["10px", { lineHeight: "1.3" }],
         body: ["11px", { lineHeight: "1.4" }],

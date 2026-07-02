@@ -412,6 +412,22 @@ export function RoutesView(props: {
             const hasRouteMw = () => routeMw().length > 0;
             const routeKey = () => `${r.method} ${r.pattern}`;
             const isExpanded = () => expandedRoutes().has(routeKey());
+            // Shared between the mobile (stacked) and desktop (inline) layouts below.
+            const mwBadgesAndToggle = () => (<>
+              <For each={routeMw()}>{(m, i) => (
+                <button
+                  class="badge badge-xs badge-primary text-tiny cursor-pointer hover:bg-primary/20 hover:text-primary transition-colors focus-visible:ring-1 focus-visible:ring-primary"
+                  onClick={(e) => { e.stopPropagation(); treeProps.onNavigate("/files"); }}
+                  title={`Route middleware #${i() + 1} — click to edit source`}
+                >{m}</button>
+              )}</For>
+              <button
+                class="text-base-content/30 text-detail cursor-pointer hover:text-primary bg-transparent border-none p-0 font-inherit"
+                onClick={(e) => { e.stopPropagation(); toggleRouteExpand(routeKey()); }}
+                title="Show full middleware chain"
+                aria-label="Show middleware chain"
+              >{isExpanded() ? "▾" : "▸"}</button>
+            </>);
             return (<>
               <tr class="hover:bg-base-300/30 group">
                 <td class="relative py-1.5">
@@ -434,23 +450,11 @@ export function RoutesView(props: {
                     <div class="sm:hidden mt-0.5">
                       <button
                         class="text-primary/70 text-detail cursor-pointer hover:text-primary hover:underline bg-transparent border-none p-0 font-inherit focus-visible:ring-1 focus-visible:ring-primary rounded"
-                        onClick={(e) => { e.stopPropagation(); treeProps.onNavigate("/files", { navigate_to_script_name: r.handler }); }}
+                        onClick={(e) => { e.stopPropagation(); treeProps.onNavigate("/files"); }}
                       >{r.handler}</button>
                       <Show when={hasRouteMw()}>
                         <div class="flex items-center gap-1.5 mt-1 flex-wrap">
-                          <For each={routeMw()}>{(m, i) => (
-                            <button
-                              class="badge badge-xs badge-primary text-tiny cursor-pointer hover:bg-primary/20 hover:text-primary transition-colors focus-visible:ring-1 focus-visible:ring-primary"
-                              onClick={(e) => { e.stopPropagation(); treeProps.onNavigate("/files", { navigate_to_script_name: r.handler }); }}
-                              title={`Route middleware #${i() + 1} — click to edit source`}
-                            >{m}</button>
-                          )}</For>
-                          <button
-                            class="text-base-content/30 text-detail cursor-pointer hover:text-primary bg-transparent border-none p-0 font-inherit"
-                            onClick={(e) => { e.stopPropagation(); toggleRouteExpand(routeKey()); }}
-                            title="Show full middleware chain"
-                            aria-label="Show middleware chain"
-                          >{isExpanded() ? "\u25BE" : "\u25B8"}</button>
+                          {mwBadgesAndToggle()}
                         </div>
                       </Show>
                     </div>
@@ -460,22 +464,10 @@ export function RoutesView(props: {
                   <div class="flex items-center gap-2 flex-wrap">
                     <button
                       class="text-primary/70 cursor-pointer hover:text-primary hover:underline bg-transparent border-none p-0 font-inherit focus-visible:ring-1 focus-visible:ring-primary rounded"
-                      onClick={(e) => { e.stopPropagation(); treeProps.onNavigate("/files", { navigate_to_script_name: r.handler }); }}
+                      onClick={(e) => { e.stopPropagation(); treeProps.onNavigate("/files"); }}
                     >{r.handler}</button>
                     <Show when={hasRouteMw()}>
-                      <For each={routeMw()}>{(m, i) => (
-                        <button
-                          class="badge badge-xs badge-primary text-tiny cursor-pointer hover:bg-primary/20 hover:text-primary transition-colors focus-visible:ring-1 focus-visible:ring-primary"
-                          onClick={(e) => { e.stopPropagation(); treeProps.onNavigate("/files", { navigate_to_script_name: r.handler }); }}
-                          title={`Route middleware #${i() + 1} — click to edit source`}
-                        >{m}</button>
-                      )}</For>
-                      <button
-                        class="text-base-content/30 text-detail cursor-pointer hover:text-primary bg-transparent border-none p-0 font-inherit"
-                        onClick={(e) => { e.stopPropagation(); toggleRouteExpand(routeKey()); }}
-                        title="Show full middleware chain"
-                        aria-label="Show middleware chain"
-                      >{isExpanded() ? "\u25BE" : "\u25B8"}</button>
+                      {mwBadgesAndToggle()}
                     </Show>
                   </div>
                 </td>
@@ -534,7 +526,7 @@ export function RoutesView(props: {
                       })()}
                       <button
                         class="btn btn-xs btn-ghost text-primary/60 w-fit"
-                        onClick={(e) => { e.stopPropagation(); treeProps.onNavigate("/files", { navigate_to_script_name: r.handler }); }}
+                        onClick={(e) => { e.stopPropagation(); treeProps.onNavigate("/files"); }}
                       >Edit in source</button>
                     </div>
                   </td>
@@ -643,7 +635,7 @@ export function RoutesView(props: {
                       </Show>
                       <button
                         class="btn btn-xs btn-ghost text-primary/50 mt-1"
-                        onClick={() => props.onNavigate("/files", { navigate_to_script_name: "keyway.lua" })}
+                        onClick={() => props.onNavigate("/files")}
                         title="Edit global middleware in source"
                       >Edit in keyway.lua</button>
                     </>;
