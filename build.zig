@@ -13,6 +13,15 @@ pub fn build(b: *std.Build) void {
         .target = target,
         .optimize = optimize,
     });
+    // Typed C API (lua_resume/lua_yield) — the veneer marks coroutine resume/yield
+    // private, so we call the raw translate-C module directly. See zig-gotchas.md.
+    // link_as must match zig-luajit's own internal luajit_build dependency args
+    // exactly, or Zig instantiates it twice and errors on the duplicate module.
+    const luajit_build_dep = b.dependency("luajit_build", .{
+        .target = target,
+        .optimize = optimize,
+        .link_as = .static,
+    });
     const metrics_dep = b.dependency("metrics", .{
         .target = target,
         .optimize = optimize,
@@ -41,7 +50,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    addSharedDeps(b, exe, libxev_dep, luajit_dep, metrics_dep, logz_dep, openssl_mod);
+    addSharedDeps(b, exe, libxev_dep, luajit_dep, luajit_build_dep, metrics_dep, logz_dep, openssl_mod);
 
     // Export all symbols so LuaRocks C modules can find Lua API functions
     // This is required for dynamically loaded .so modules to resolve symbols like lua_getmetatable
@@ -69,7 +78,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    addSharedDeps(b, exe_unit_tests, libxev_dep, luajit_dep, metrics_dep, logz_dep, openssl_mod);
+    addSharedDeps(b, exe_unit_tests, libxev_dep, luajit_dep, luajit_build_dep, metrics_dep, logz_dep, openssl_mod);
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
     const test_step = b.step("test", "Run unit tests");
@@ -83,12 +92,14 @@ fn addSharedDeps(
     compile: *std.Build.Step.Compile,
     libxev_dep: *std.Build.Dependency,
     luajit_dep: *std.Build.Dependency,
+    luajit_build_dep: *std.Build.Dependency,
     metrics_dep: *std.Build.Dependency,
     logz_dep: *std.Build.Dependency,
     openssl_mod: *std.Build.Module,
 ) void {
     compile.root_module.addImport("xev", libxev_dep.module("xev"));
     compile.root_module.addImport("luajit", luajit_dep.module("luajit"));
+    compile.root_module.addImport("luajit_c", luajit_build_dep.module("luajit-build"));
     compile.root_module.addImport("metrics", metrics_dep.module("metrics"));
     compile.root_module.addImport("logz", logz_dep.module("logz"));
     compile.root_module.addImport("openssl", openssl_mod);
