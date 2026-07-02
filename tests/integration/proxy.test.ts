@@ -1,6 +1,6 @@
 // Reverse proxy — exercises the async connect/send/recv path (issue #29).
 //
-// The dashboard config (dashboard/keyway.lua) registers three proxy routes:
+// The integration fixtures (tests/fixtures.lua) register three proxy routes:
 //   /__keyway/test-proxy       -> 127.0.0.1:38291 (the upstream spawned below)
 //   /__keyway/test-proxy-dead  -> 127.0.0.1:1     (closed port -> 502)
 //   /__keyway/test-proxy-hung  -> 127.0.0.1:38292 (accepts, never responds -> 504)

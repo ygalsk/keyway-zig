@@ -31,9 +31,10 @@ WORKDIR /app
 
 COPY --from=build /build/zig-out/bin/keyway .
 COPY dashboard/ dashboard/
+COPY examples/ examples/
 COPY lua/ lua/
 
 EXPOSE 8080
 
 ENTRYPOINT ["./keyway"]
-CMD ["--script", "dashboard/keyway.lua"]
+CMD ["--script", "examples/minimal.lua"]
