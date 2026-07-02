@@ -277,7 +277,10 @@ pub const Connection = struct {
 
     /// Cancel the per-request deadline timer on normal response completion.
     /// Safe to call if timer already fired or was never started.
-    fn cancelRequestTimer(self: *Connection) void {
+    /// pub: also cancels proxy.zig's upstream deadline (#72), which reuses this
+    /// same timer_completion — the request timer is never armed on the proxy
+    /// path, so the field is idle and safe to share.
+    pub fn cancelRequestTimer(self: *Connection) void {
         if (!self.timer_armed) return; // no timer to cancel (e.g. health endpoint)
         if (self.timed_out) return; // already fired, nothing to cancel
         self.timer_armed = false;

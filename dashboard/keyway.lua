@@ -197,9 +197,12 @@ keyway.proxy = {
     ["/__keyway/grafana"] = { host = "127.0.0.1", port = 3000, redirect = "/__keyway/dashboard/grafana.html", strip_prefix = false },
     -- Integration-test upstreams (see tests/integration/proxy.test.ts).
     -- The live upstream is spawned by the test on this fixed port; the dead
-    -- one points at a closed port to exercise the 502 connect-failure path.
+    -- one points at a closed port to exercise the 502 connect-failure path;
+    -- the hung one accepts but never responds, exercising the upstream
+    -- deadline (#72).
     ["/__keyway/test-proxy"] = { host = "127.0.0.1", port = 38291, strip_prefix = true },
     ["/__keyway/test-proxy-dead"] = { host = "127.0.0.1", port = 1, strip_prefix = true },
+    ["/__keyway/test-proxy-hung"] = { host = "127.0.0.1", port = 38292, strip_prefix = true },
 }
 
 -- ─── Routes ──────────────────────────────────────────────────────────
