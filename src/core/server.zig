@@ -328,6 +328,13 @@ pub const Server = struct {
             it = node.next;
             const conn: *Connection = @alignCast(@fieldParentPtr("link", node));
             helpers.shutdownBoth(conn.socket);
+            // A proxied request's in-flight op is armed on the upstream fd, not
+            // the client socket above — shutting down only the client fd never
+            // completes it, leaving pending_io_ops > 0 forever. proxy_state is
+            // only ever set once its xev.TCP owns a live socket (see
+            // proxy.zig's serveProxy), so its presence alone is the "valid fd"
+            // guard here.
+            if (conn.proxy_state) |ps| helpers.shutdownBoth(ps.tcp.fd);
         }
     }
 
