@@ -125,16 +125,12 @@ describe("static file serving", () => {
   });
 
   // resolveStaticPath (src/http/static.zig) rejects a resolved path that
-  // escapes route.root and logs status 403 ("path traversal blocked") via
-  // error_response.sendErrorStatus. But error_response.zig's statusResponse()
-  // switch has no 403 entry, so sendErrorStatus falls through to the
-  // client_error category default and the client actually receives 400 Bad
-  // Request over the wire — pinning that REAL observed status, not the 403
-  // the access log claims. Tracked in #161; when that lands, this assertion
-  // and the symlink-escape one below flip to 403.
+  // escapes route.root, returning 403 via error_response.sendErrorStatus
+  // (the 403 arm was added in #161). fetch() collapses ".." client-side, so
+  // this uses the raw-socket helper to get a literal ".." onto the wire.
   test("blocks a literal path traversal out of the mount root (403)", async () => {
     const status = await rawGetStatus("/__keyway/dashboard/../keyway.lua");
-    expect(status).toBe(400);
+    expect(status).toBe(403);
   });
 
   // Percent-encoded dot segments are never decoded before static path
@@ -149,12 +145,11 @@ describe("static file serving", () => {
 
   // dashboard/public/test-symlink-escape -> ../../README.md, resolving
   // outside dashboard/public. No dot segments in the request path, so plain
-  // fetch() is fine here (unlike the traversal cases above). Same
-  // statusResponse() gap: logged as 403 "symlink traversal blocked", wire
-  // status is 400 — see the note above.
+  // fetch() is fine here (unlike the traversal cases above). Rejected with
+  // 403 "symlink traversal blocked" (the 403 arm was added in #161).
   test("blocks a symlink that escapes the mount root (403)", async () => {
     const res = await fetch(`${base()}/__keyway/dashboard/test-symlink-escape`);
-    expect(res.status).toBe(400);
+    expect(res.status).toBe(403);
   });
 
   // dashboard/public/test-symlink-alias.css -> main.js, both inside
