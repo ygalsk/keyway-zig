@@ -4,7 +4,7 @@ const config = @import("../util/config.zig");
 const log = @import("../observability/log.zig");
 const handler_mod = @import("../core/handler.zig");
 const Connection = handler_mod.Connection;
-const conn_sse = @import("conn_sse.zig");
+const conn_sse = @import("../core/conn_sse.zig");
 
 /// Per-worker registry mapping room names to lists of SSE connections.
 /// No cross-thread sharing — each worker has its own SseRegistry.

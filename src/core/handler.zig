@@ -28,9 +28,10 @@ const params = @import("../http/params.zig");
 const conn_tls = @import("../tls/conn_tls.zig");
 const castUserdata = @import("../util/helpers.zig").castUserdata;
 const helpers = @import("../util/helpers.zig");
-const conn_sse = @import("../protocol/conn_sse.zig");
-const conn_ws = @import("../protocol/conn_ws.zig");
-const conn_stream = @import("../protocol/conn_stream.zig");
+// ponytail: conn_* are Connection adapters; action objects would just wrap these calls.
+const conn_sse = @import("conn_sse.zig");
+const conn_ws = @import("conn_ws.zig");
+const conn_stream = @import("conn_stream.zig");
 const error_response = @import("../http/error_response.zig");
 const ErrorCategory = error_response.ErrorCategory;
 const Server = @import("server.zig").Server;
@@ -465,7 +466,10 @@ pub const Connection = struct {
         self.pending_io_ops -= 1;
 
         const bytes_read = result.recv catch |err| {
-            if (self.state == .closing) { self.maybeFinishClose(); return .disarm; }
+            if (self.state == .closing) {
+                self.maybeFinishClose();
+                return .disarm;
+            }
             if (err != error.EOF) {
                 log.err().string("msg", "recv failed").int("fd", self.socket).err(err).log();
             }
@@ -473,7 +477,10 @@ pub const Connection = struct {
             return .disarm;
         };
 
-        if (self.state == .closing) { self.maybeFinishClose(); return .disarm; }
+        if (self.state == .closing) {
+            self.maybeFinishClose();
+            return .disarm;
+        }
 
         if (bytes_read == 0) {
             self.close();
@@ -1068,7 +1075,10 @@ pub const Connection = struct {
             }
             return null;
         };
-        if (self.state == .closing) { self.maybeFinishClose(); return null; }
+        if (self.state == .closing) {
+            self.maybeFinishClose();
+            return null;
+        }
         return bytes;
     }
 
