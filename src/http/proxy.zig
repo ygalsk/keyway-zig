@@ -15,8 +15,7 @@
 //! Zig 0.16's std.Io migration no longer exposes to callers. xev.TCP is the
 //! only public surface that can bridge std.Io.net.IpAddress into a connect op.
 //!
-//! Known gaps tracked as follow-ups: no upstream deadline (#72), access status
-//! always logged as 200 (#73).
+//! Known gaps tracked as follow-ups: no upstream deadline (#72).
 
 const std = @import("std");
 const xev = @import("xev");
@@ -250,6 +249,17 @@ fn onProxyUpstreamRecv(
     return .disarm;
 }
 
+/// Parse the 3-digit status code from a buffered upstream response's status
+/// line (e.g. "HTTP/1.1 502 Bad Gateway\r\n" -> 502). Returns null if the
+/// buffer is too short or doesn't start with a well-formed status line.
+/// Never allocates.
+fn parseUpstreamStatus(response: []const u8) ?u16 {
+    if (response.len < 12) return null;
+    if (!std.mem.startsWith(u8, response, "HTTP/1.")) return null;
+    if (!std.ascii.isDigit(response[7]) or response[8] != ' ') return null;
+    return std.fmt.parseInt(u16, response[9..12], 10) catch null;
+}
+
 /// Relay the buffered upstream response to the client.
 fn forwardProxyResponse(self: *Connection) void {
     const ps = &self.proxy_state.?;
@@ -257,7 +267,11 @@ fn forwardProxyResponse(self: *Connection) void {
         proxyFail(self, 502, "proxy upstream empty response");
         return;
     }
-    self.logAccess(200);
+    // Log the real upstream status rather than a hardcoded 200 (#73). The
+    // response bytes are relayed to the client verbatim regardless; if the
+    // status line doesn't parse, the upstream didn't send valid HTTP, so we
+    // log 502 (bad gateway) rather than lie with 200.
+    self.logAccess(parseUpstreamStatus(ps.response.items) orelse 502);
     // Send directly from proxy_state's base_allocator buffer (arena_dupe=false)
     // rather than through sendRawResponse: that buffer must stay valid until
     // the write completion actually fires (io_uring reads it asynchronously),
@@ -284,4 +298,32 @@ pub fn cleanupProxy(self: *Connection) void {
         ps.deinit(self.base_allocator);
         self.proxy_state = null;
     }
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+test "parseUpstreamStatus: well-formed status lines" {
+    try std.testing.expectEqual(@as(?u16, 200), parseUpstreamStatus("HTTP/1.1 200 OK\r\n\r\n"));
+    try std.testing.expectEqual(@as(?u16, 404), parseUpstreamStatus("HTTP/1.1 404 Not Found\r\n\r\n"));
+    try std.testing.expectEqual(@as(?u16, 502), parseUpstreamStatus("HTTP/1.0 502 Bad Gateway\r\n\r\n"));
+}
+
+test "parseUpstreamStatus: 3-digit boundary codes" {
+    try std.testing.expectEqual(@as(?u16, 100), parseUpstreamStatus("HTTP/1.1 100 Continue\r\n\r\n"));
+    try std.testing.expectEqual(@as(?u16, 999), parseUpstreamStatus("HTTP/1.1 999 X\r\n\r\n"));
+    try std.testing.expectEqual(@as(?u16, 200), parseUpstreamStatus("HTTP/1.1 200")); // exact len == 12, no trailing bytes
+}
+
+test "parseUpstreamStatus: malformed status line" {
+    try std.testing.expectEqual(@as(?u16, null), parseUpstreamStatus("not an http response at all"));
+    try std.testing.expectEqual(@as(?u16, null), parseUpstreamStatus("HTTP/1.1-200 OK\r\n\r\n"));
+    try std.testing.expectEqual(@as(?u16, null), parseUpstreamStatus("HTTP/1.1 abc OK\r\n\r\n"));
+    try std.testing.expectEqual(@as(?u16, null), parseUpstreamStatus("HTTP/2 200 OK\r\n\r\n")); // not HTTP/1.x
+}
+
+test "parseUpstreamStatus: short buffer" {
+    try std.testing.expectEqual(@as(?u16, null), parseUpstreamStatus(""));
+    try std.testing.expectEqual(@as(?u16, null), parseUpstreamStatus("HTTP/1.1 2"));
 }
