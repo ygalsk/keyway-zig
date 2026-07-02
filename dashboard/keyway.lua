@@ -31,79 +31,22 @@ end
 
 -- ─── Helpers ──────────────────────────────────────────────────────────
 
-local function format_latency(us)
-    if not us or us == 0 then return "-" end
-    if us < 1000 then return us .. "us" end
-    if us < 1000000 then return string.format("%.1fms", us / 1000) end
-    return string.format("%.2fs", us / 1000000)
+-- Resolve a middleware function's name via the registry (reverse lookup);
+-- anonymous middleware not in the registry falls back to "mw_<index>".
+local function mw_name(mw, index)
+    for name, fn in pairs(keyway.middleware._registry) do
+        if fn == mw then return name end
+    end
+    return "mw_" .. index
 end
 
--- Resolve a middleware function's name by scanning known scopes.
--- debug.getinfo(fn, "n") doesn't work for function values in LuaJIT,
--- so we scan the global table and the script's upvalue locals.
-local _mw_name_cache = setmetatable({}, { __mode = "k" })
-local function mw_name(mw, index, prefix)
-    local cached = _mw_name_cache[mw]
-    if cached then return cached end
-
-    -- Try middleware registry first (reverse lookup fn→name)
-    if keyway.middleware and keyway.middleware._registry then
-        for name, fn in pairs(keyway.middleware._registry) do
-            if fn == mw then
-                _mw_name_cache[mw] = name
-                return name
-            end
-        end
-    end
-
-    -- Try debug.getinfo first (works for C functions and some named funcs)
-    local info = debug.getinfo(mw, "nS")
-    if info and info.name and info.name ~= "" then
-        _mw_name_cache[mw] = info.name
-        return info.name
-    end
-
-    -- Scan globals
-    for k, v in pairs(_G) do
-        if v == mw and type(k) == "string" then
-            _mw_name_cache[mw] = k
-            return k
-        end
-    end
-
-    -- Scan upvalues of the calling function (2 levels up)
-    for level = 2, 5 do
-        local caller = debug.getinfo(level, "f")
-        if not caller or not caller.func then break end
-        local i = 1
-        while true do
-            local uname, uval = debug.getupvalue(caller.func, i)
-            if not uname then break end
-            if uval == mw and uname ~= "" and not uname:match("^%(") then
-                _mw_name_cache[mw] = uname
-                return uname
-            end
-            i = i + 1
-        end
-    end
-
-    -- Fallback: source:line
-    if info and info.short_src and info.linedefined then
-        local fallback = info.short_src:match("([^/]+)$") .. ":" .. info.linedefined
-        _mw_name_cache[mw] = fallback
-        return fallback
-    end
-
-    return (prefix or "mw_") .. index
-end
-
-local function each_static_route(cb, mw_prefix)
+local function each_static_route(cb)
     for pattern, methods in pairs(keyway.routes) do
         if type(methods) == "table" and pattern ~= "middleware" then
             local mw_names = {}
             if methods.middleware then
                 for j, mw in ipairs(methods.middleware) do
-                    mw_names[#mw_names + 1] = mw_name(mw, j, mw_prefix)
+                    mw_names[#mw_names + 1] = mw_name(mw, j)
                 end
             end
             local http_methods = {}
@@ -252,7 +195,7 @@ keyway.routes = {
             local global_mw = {}
             if keyway.routes.middleware then
                 for i, mw in ipairs(keyway.routes.middleware) do
-                    global_mw[#global_mw + 1] = { name = mw_name(mw, i, "global_mw_"), index = i }
+                    global_mw[#global_mw + 1] = { name = mw_name(mw, i), index = i }
                 end
             end
             local routes = {}
@@ -283,7 +226,7 @@ keyway.routes = {
             }
             if keyway.routes.middleware then
                 for i, mw in ipairs(keyway.routes.middleware) do
-                    effective.global_middleware[#effective.global_middleware + 1] = mw_name(mw, i, "global_mw_")
+                    effective.global_middleware[#effective.global_middleware + 1] = mw_name(mw, i)
                 end
             end
             each_static_route(function(pattern, _, mw_names, http_methods)
@@ -292,7 +235,7 @@ keyway.routes = {
                     methods = http_methods,
                     middleware = mw_names,
                 }
-            end, "route_mw_")
+            end)
             table.sort(effective.routes, function(a, b) return a.pattern < b.pattern end)
             response.json_response(ctx, 200, effective)
         end,
@@ -350,9 +293,6 @@ keyway.routes = {
             end
             route_entry.middleware = resolved
 
-            -- Clear mw_name cache so names re-resolve on next API call
-            _mw_name_cache = setmetatable({}, { __mode = "k" })
-
             response.json_response(ctx, 200, { ok = true, pattern = pattern })
         end,
     },
@@ -380,9 +320,6 @@ keyway.routes = {
                 resolved[#resolved + 1] = keyway.middleware.resolve(name)
             end
             keyway.routes.middleware = resolved
-
-            -- Clear mw_name cache
-            _mw_name_cache = setmetatable({}, { __mode = "k" })
 
             response.json_response(ctx, 200, { ok = true })
         end,

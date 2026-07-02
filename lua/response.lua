@@ -19,21 +19,6 @@ function M.get_header(ctx, name)
     return nil
 end
 
---- Trim leading/trailing whitespace
-function M.trim(s)
-    return (s:match("^%s*(.-)%s*$"))
-end
-
---- Split comma-separated string into table
-function M.split_csv(str)
-    if not str or str == "" then return {} end
-    local t = {}
-    for v in str:gmatch("[^,]+") do
-        t[#t + 1] = M.trim(v)
-    end
-    return t
-end
-
 --- Monotonic clock in microseconds (cached timespec)
 local ffi = require("ffi")
 pcall(ffi.cdef, [[
@@ -51,29 +36,5 @@ end
 function M.broadcast_event(room, data)
     __keyway_sse_broadcast(room, "data: " .. json.encode(data) .. "\n")
 end
-
---- Broadcast a typed SSE event with raw data (e.g. pre-rendered HTML)
-function M.broadcast_html(room, event_type, html)
-    __keyway_sse_broadcast(room, "event: " .. event_type .. "\ndata: " .. html .. "\n")
-end
-
---- 404 JSON shorthand
-function M.json_not_found(ctx)
-    M.json_response(ctx, 404, { error = "not found" })
-end
-
---- Parse JSON body, send 400 on failure. Returns (data, nil) or (nil, true).
-function M.parse_json_body(ctx)
-    local ok, data = pcall(json.decode, ctx.body)
-    if not ok then
-        M.json_response(ctx, 400, { error = "invalid JSON" })
-        return nil, true
-    end
-    return data, nil
-end
-
--- Upgrade type constants
-M.UPGRADE_SSE = "sse"
-M.UPGRADE_WS  = "websocket"
 
 return M
