@@ -66,10 +66,7 @@ fn encodeValue(lua: *Lua, idx: i32, buf: *Buf, depth: u32) EncodeError!void {
 fn encodeNumber(lua: *Lua, idx: i32, buf: *Buf) EncodeError!void {
     const n = lua.toNumber(idx);
     if (std.math.isNan(n) or std.math.isInf(n)) return error.InvalidNumber;
-
-    var num_buf: [64]u8 = undefined;
-    const formatted = std.fmt.bufPrint(&num_buf, "{d}", .{n}) catch return error.OutOfMemory;
-    buf.writer.writeAll(formatted) catch return error.OutOfMemory;
+    buf.writer.print("{d}", .{n}) catch return error.OutOfMemory;
 }
 
 fn encodeString(str: []const u8, buf: *Buf) EncodeError!void {
