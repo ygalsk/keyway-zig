@@ -5,7 +5,8 @@ const Connection = @import("handler.zig").Connection;
 const Router = @import("../http/router.zig").Router;
 const LuaState = @import("../lua/lua_state.zig").LuaState;
 const bpf_reuseport = @import("../io/bpf_reuseport.zig");
-const TlsContext = @import("../tls/tls.zig").TlsContext;
+const tls_mod = @import("../tls/tls.zig");
+const TlsContext = tls_mod.TlsContext;
 const castUserdata = @import("../util/helpers.zig").castUserdata;
 const helpers = @import("../util/helpers.zig");
 const sse = @import("../protocol/sse.zig");
@@ -126,8 +127,16 @@ pub const Server = struct {
             try tcp.listen(DEFAULT_BACKLOG);
         }
 
-        // Initialize TLS context if cert+key are configured
-        const tls_ctx: ?TlsContext = if (config.tls_cert_path != null and config.tls_key_path != null)
+        // Initialize TLS context if cert+key are configured. The data path is
+        // kTLS-only (no userspace SSL_read/SSL_write), so refuse to boot with TLS
+        // configured on a host where the kernel `tls` ULP is missing — otherwise
+        // every HTTPS request would handshake and then be silently dropped (#168).
+        const tls_configured = config.tls_cert_path != null and config.tls_key_path != null;
+        if (tls_configured and !tls_mod.probeKtlsAvailable()) {
+            log.err().string("msg", "TLS configured but kernel kTLS is unavailable — keyway's TLS data path is kTLS-only. Load the module ('modprobe tls', needs Linux >= 4.13) or start without --tls-cert/--tls-key.").log();
+            return error.KtlsUnavailable;
+        }
+        const tls_ctx: ?TlsContext = if (tls_configured)
             try TlsContext.init(config.tls_cert_path.?, config.tls_key_path.?)
         else
             null;

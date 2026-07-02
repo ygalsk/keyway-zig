@@ -1,5 +1,6 @@
 const std = @import("std");
 const xev = @import("xev");
+const log = @import("../observability/log.zig");
 const tls_mod = @import("tls.zig");
 const TlsConn = tls_mod.TlsConn;
 const TlsContext = tls_mod.TlsContext;
@@ -37,7 +38,12 @@ pub fn handleTlsHandshake(self: *Connection, tc: *TlsConn) void {
 /// Handshake done: set up kTLS, free TLS state, start plaintext reads.
 fn completeHandshake(self: *Connection) void {
     const tc = &self.tls_state.tls_conn.?;
-    tc.setupKtls(self.socket) catch {
+    tc.setupKtls(self.socket) catch |err| {
+        // No userspace data-path fallback (#168): a fully-handshaked connection
+        // we can't offload to kTLS must be closed. Log loudly — the common cause
+        // (module absent) is refused at startup, so reaching here means an
+        // unsupported cipher/version on a host that otherwise has kTLS.
+        log.err().string("msg", "kTLS setup failed after handshake, closing connection").err(err).int("fd", self.socket).log();
         self.close();
         return;
     };

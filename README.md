@@ -74,7 +74,7 @@ No `send()`, no `write()`, no lifecycle calls — only state assignment. Zig com
 - **WebSocket** — upgrade via `ctx.upgrade = "websocket"`, frame encoding/decoding handled by Zig.
 - **SSE** — upgrade via `ctx.upgrade = "sse"`, cross-worker broadcast via `SseBroadcastBus`.
 - **Chunked streaming** — `ctx.upgrade = "stream"` with `coroutine.yield()` to flush chunks.
-- **TLS** — OpenSSL userspace handshake + optional kTLS kernel offload for the data path.
+- **TLS** — OpenSSL userspace handshake + kTLS kernel offload for the data path. kTLS is **required** (Linux ≥ 4.13 with the `tls` module): there is no userspace data path, so keyway refuses to start TLS when the module is absent rather than dropping every request.
 - **Radix router** — O(path-length) trie with `{param}` support, zero allocations per match.
 - **Middleware** — global and per-route chains with short-circuit support.
 - **Zero-copy parsing** — picohttpparser produces slices into the read buffer. No copies.

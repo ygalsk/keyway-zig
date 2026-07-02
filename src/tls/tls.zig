@@ -355,7 +355,10 @@ pub const TlsConn = struct {
 
     /// After handshake completes, extract negotiated keys and configure kTLS.
     /// On success, the kernel handles all encrypt/decrypt — TlsConn can be freed.
-    /// On failure, returns error (caller should keep TlsConn for userspace TLS).
+    /// On failure there is no fallback: keyway has no userspace SSL_read/SSL_write
+    /// data path, so the caller closes the connection. The startup probe
+    /// (`probeKtlsAvailable`) makes the common cause — module absent — a boot-time
+    /// refusal instead of a per-request drop.
     pub fn setupKtls(self: *TlsConn, fd: std.posix.socket_t) !void {
         const ssl_version = c.SSL_version(self.ssl);
 
@@ -607,6 +610,27 @@ pub const TlsConn = struct {
         @memset(&key_block, 0);
     }
 };
+
+/// Probe once, at startup, whether the kernel TLS ULP is available.
+///
+/// keyway's data path is kTLS-only: the handshake runs in userspace over memory
+/// BIOs, but application data is handed to the kernel — there is no userspace
+/// SSL_read/SSL_write path. So if the `tls` module is absent, every HTTPS
+/// connection would handshake and then be dropped. Refuse at boot instead.
+///
+/// Setting TCP_ULP="tls" on a fresh socket returns ENOENT iff the module isn't
+/// loaded; any other outcome (success, or ENOTCONN because the socket isn't
+/// established) means the ULP is registered. Keying only on ENOENT is
+/// deliberately conservative — it never false-blocks a host where kTLS works.
+pub fn probeKtlsAvailable() bool {
+    const sock_rc = std.os.linux.socket(std.os.linux.AF.INET, std.os.linux.SOCK.STREAM | std.os.linux.SOCK.CLOEXEC, 0);
+    if (helpers.syscallErrno(sock_rc) != .SUCCESS) return false;
+    const fd: i32 = @intCast(sock_rc);
+    defer _ = std.os.linux.close(fd);
+    const ulp = [4]u8{ 't', 'l', 's', 0 };
+    const rc = std.os.linux.setsockopt(fd, std.posix.IPPROTO.TCP, c.TCP_ULP, &ulp, ulp.len);
+    return helpers.syscallErrno(rc) != .NOENT;
+}
 
 // ============================================================================
 // Tests
