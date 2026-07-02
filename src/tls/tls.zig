@@ -1,7 +1,6 @@
 const std = @import("std");
 const log = @import("../observability/log.zig");
 const config = @import("../util/config.zig");
-const helpers = @import("../util/helpers.zig");
 const c = @cImport({
     @cInclude("openssl/ssl.h");
     @cInclude("openssl/err.h");
@@ -17,9 +16,6 @@ pub const TLS_RECORD_MAX_SIZE = config.TLS_RECORD_MAX_SIZE;
 
 // kTLS setsockopt constants
 const SOL_TLS: i32 = 282;
-
-// SSL_OP_NO_TICKET = SSL_OP_BIT(14) — Zig's C translator can't evaluate the macro.
-const SSL_OP_NO_TICKET: c_ulong = 1 << 14;
 
 /// Decode errno from a raw Linux syscall return value.
 /// Raw syscalls return -errno as usize on failure. std.posix.errno() doesn't
@@ -96,86 +92,6 @@ pub const TlsContext = struct {
     }
 
     pub fn deinit(self: *TlsContext) void {
-        c.SSL_CTX_free(self.ctx);
-    }
-};
-
-/// Options for creating a client TLS context.
-pub const ClientTlsOpts = struct {
-    verify: bool = true,
-    ca_path: ?[*:0]const u8 = null, // custom CA cert (e.g., Astra SCB ca.crt)
-    cert_path: ?[*:0]const u8 = null, // client certificate for mTLS
-    key_path: ?[*:0]const u8 = null, // client private key for mTLS
-};
-
-/// Per-worker client TLS context for outbound connections.
-/// One per worker — system CA store for verification, or SSL_VERIFY_NONE for insecure mode.
-/// Supports mTLS via optional client certificate + key.
-pub const ClientTlsContext = struct {
-    ctx: *c.SSL_CTX,
-
-    pub fn init(opts: ClientTlsOpts) !ClientTlsContext {
-        const method = c.TLS_client_method() orelse return error.TlsMethodFailed;
-        const ctx = c.SSL_CTX_new(method) orelse return error.SslCtxNewFailed;
-        errdefer c.SSL_CTX_free(ctx);
-
-        // Minimum TLS 1.2
-        if (c.SSL_CTX_set_min_proto_version(ctx, c.TLS1_2_VERSION) != 1) {
-            return error.SetMinProtoFailed;
-        }
-
-        if (opts.ca_path) |ca| {
-            // Custom CA (e.g., Astra Secure Connect Bundle)
-            if (c.SSL_CTX_load_verify_locations(ctx, ca, null) != 1) {
-                return error.LoadCaFailed;
-            }
-            c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_PEER, null);
-        } else if (opts.verify) {
-            // Load system CA store
-            if (c.SSL_CTX_load_verify_locations(ctx, "/etc/pki/tls/certs/ca-bundle.crt", "/etc/pki/tls/certs") != 1) {
-                if (c.SSL_CTX_load_verify_locations(ctx, "/etc/ssl/certs/ca-certificates.crt", "/etc/ssl/certs") != 1) {
-                    _ = c.SSL_CTX_set_default_verify_paths(ctx);
-                }
-            }
-            c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_PEER, null);
-        } else {
-            // Insecure mode: skip certificate verification (man-in-the-middle risk)
-            log.warn().string("msg", "TLS certificate verification disabled (SSL_VERIFY_NONE)").log();
-            c.SSL_CTX_set_verify(ctx, c.SSL_VERIFY_NONE, null);
-        }
-
-        // Client certificate for mTLS
-        if (opts.cert_path) |cert| {
-            if (c.SSL_CTX_use_certificate_chain_file(ctx, cert) != 1) {
-                return error.LoadClientCertFailed;
-            }
-        }
-        if (opts.key_path) |key| {
-            if (c.SSL_CTX_use_PrivateKey_file(ctx, key, c.SSL_FILETYPE_PEM) != 1) {
-                return error.LoadClientKeyFailed;
-            }
-        }
-        // Verify key matches cert if both provided
-        if (opts.cert_path != null and opts.key_path != null) {
-            if (c.SSL_CTX_check_private_key(ctx) != 1) {
-                return error.KeyCertMismatch;
-            }
-        }
-
-        // Disable TLS 1.2 session tickets — outbound connections are short-lived
-        // and don't benefit from session resumption. For TLS 1.3, this option has
-        // no effect (ticket emission is server-controlled); TLS 1.3 outbound
-        // connections use full userspace TLS instead of kTLS to handle
-        // post-handshake NewSessionTicket records gracefully.
-        _ = c.SSL_CTX_set_options(ctx, SSL_OP_NO_TICKET);
-
-        // Enable keylog callback for kTLS key extraction
-        c.SSL_CTX_set_keylog_callback(ctx, keylogCallback);
-
-        return ClientTlsContext{ .ctx = ctx };
-    }
-
-    pub fn deinit(self: *ClientTlsContext) void {
         c.SSL_CTX_free(self.ctx);
     }
 };
@@ -364,7 +280,7 @@ fn tls12Prf(
 // TlsConn — per-connection TLS state (handshake only after kTLS setup)
 // ============================================================================
 
-/// Unified per-connection TLS state (server or client mode).
+/// Per-connection TLS state (server mode only).
 /// After handshake, setupKtls() transfers keys to the kernel and this struct is freed.
 pub const TlsConn = struct {
     ssl: *c.SSL,
@@ -374,15 +290,13 @@ pub const TlsConn = struct {
     wbio: *c.BIO,
     state: State,
     encrypt_buf: []u8,
-    mode: Mode,
     ktls_secrets: KtlsSecrets = .{},
 
-    pub const Mode = enum { server, client };
     const State = enum { handshaking, established };
 
     pub const HandshakeResult = enum { complete, want_read, failed };
 
-    pub fn init(allocator: std.mem.Allocator, ssl_ctx: *c.SSL_CTX, mode: Mode) !TlsConn {
+    pub fn init(allocator: std.mem.Allocator, ssl_ctx: *c.SSL_CTX) !TlsConn {
         const ssl = c.SSL_new(ssl_ctx) orelse return error.SslNewFailed;
         errdefer c.SSL_free(ssl);
 
@@ -395,15 +309,7 @@ pub const TlsConn = struct {
 
         // Transfers ownership of both BIOs to SSL — SSL_free will free them
         c.SSL_set_bio(ssl, rbio, wbio);
-
-        switch (mode) {
-            .server => c.SSL_set_accept_state(ssl),
-            .client => {
-                c.SSL_set_connect_state(ssl);
-                // Disable renegotiation for safety (SSL_OP_NO_RENEGOTIATION = 1 << 30)
-                _ = c.SSL_set_options(ssl, @as(c_ulong, 1) << 30);
-            },
-        }
+        c.SSL_set_accept_state(ssl);
 
         const buf = try allocator.alloc(u8, ENCRYPT_BUF_SIZE);
 
@@ -413,7 +319,6 @@ pub const TlsConn = struct {
             .wbio = wbio,
             .state = .handshaking,
             .encrypt_buf = buf,
-            .mode = mode,
         };
     }
 
@@ -427,14 +332,6 @@ pub const TlsConn = struct {
     pub fn deinit(self: *TlsConn, allocator: std.mem.Allocator) void {
         allocator.free(self.encrypt_buf);
         c.SSL_free(self.ssl); // frees both BIOs
-    }
-
-    /// Set SNI hostname for the TLS handshake. Must be called before handshake().
-    pub fn setSni(self: *TlsConn, hostname: [:0]const u8) void {
-        // SSL_set_tlsext_host_name is a macro — use the underlying ctrl call
-        _ = c.SSL_ctrl(self.ssl, c.SSL_CTRL_SET_TLSEXT_HOSTNAME, c.TLSEXT_NAMETYPE_host_name, @ptrCast(@constCast(hostname.ptr)));
-        // Enable hostname verification
-        _ = c.SSL_set1_host(self.ssl, hostname);
     }
 
     /// Feed received ciphertext into the TLS engine (BIO_write to rbio).
@@ -476,52 +373,11 @@ pub const TlsConn = struct {
         if (err == c.SSL_ERROR_WANT_READ or err == c.SSL_ERROR_WANT_WRITE) {
             return .want_read;
         }
-        // Log errors in client mode for debugging outbound connections
-        if (self.mode == .client) {
-            const verify_result = c.SSL_get_verify_result(self.ssl);
-            if (verify_result != 0) {
-                log.err().string("msg", "outbound tls certificate verify failed").int("code", verify_result).log();
-            }
-            var errbuf: [256]u8 = undefined;
-            while (true) {
-                const e = c.ERR_get_error();
-                if (e == 0) break;
-                c.ERR_error_string_n(e, &errbuf, errbuf.len);
-                log.err().string("msg", "outbound tls error").string("detail", std.mem.sliceTo(&errbuf, 0)).log();
-            }
-        }
         return .failed;
-    }
-
-    pub fn isEstablished(self: *TlsConn) bool {
-        return self.state == .established;
     }
 
     pub fn needsWrite(self: *TlsConn) bool {
         return c.BIO_ctrl_pending(self.wbio) > 0;
-    }
-
-    // ========================================================================
-    // Userspace encrypt/decrypt — fallback when kTLS is unavailable
-    // ========================================================================
-
-    /// Encrypt plaintext via SSL_write and return the ciphertext slice
-    /// (points into encrypt_buf). Returns null on SSL error.
-    pub fn sslWrite(self: *TlsConn, plaintext: []const u8) ?[]const u8 {
-        const ret = c.SSL_write(self.ssl, plaintext.ptr, @intCast(plaintext.len));
-        if (ret <= 0) return null;
-        const total = self.drainAll();
-        if (total == 0) return null;
-        return self.encrypt_buf[0..total];
-    }
-
-    /// Decrypt ciphertext: feed it into the read BIO, then SSL_read plaintext
-    /// into the provided buffer. Returns the plaintext slice, or null on error.
-    pub fn sslRead(self: *TlsConn, ciphertext: []const u8, out: []u8) ?[]const u8 {
-        self.feedCiphertext(ciphertext);
-        const ret = c.SSL_read(self.ssl, out.ptr, @intCast(out.len));
-        if (ret <= 0) return null;
-        return out[0..@intCast(ret)];
     }
 
     // ========================================================================
@@ -533,16 +389,6 @@ pub const TlsConn = struct {
     /// On failure, returns error (caller should keep TlsConn for userspace TLS).
     pub fn setupKtls(self: *TlsConn, fd: std.posix.socket_t) !void {
         const ssl_version = c.SSL_version(self.ssl);
-
-        // TLS 1.3 client: skip kTLS entirely. Remote servers send NewSessionTicket
-        // post-handshake records that kTLS RX can't deliver via plain recv() — the
-        // kernel returns EIO for non-application-data records. SSL_OP_NO_TICKET only
-        // affects TLS 1.2; for 1.3, ticket emission is server-controlled. Draining
-        // via SSL_read before kTLS setup is racy (tickets may arrive later).
-        // Full userspace TLS handles post-handshake messages transparently.
-        if (ssl_version == c.TLS1_3_VERSION and self.mode == .client) {
-            return error.KtlsUnsupportedVersion;
-        }
 
         const cipher = c.SSL_get_current_cipher(self.ssl) orelse return error.KtlsNoCipher;
         const cipher_id = c.SSL_CIPHER_get_id(cipher);
@@ -570,8 +416,7 @@ pub const TlsConn = struct {
         // Record sequence numbers for kTLS.
         // TX: always 0 — we haven't sent any application records yet.
         // RX: TLS 1.2 Finished was at seq=0 under application keys → start at 1.
-        //     TLS 1.3 server: set_num_tickets(0) prevents post-handshake sends → 0.
-        //     TLS 1.3 client: excluded above (full userspace TLS).
+        //     TLS 1.3: set_num_tickets(0) prevents post-handshake sends → 0.
         var tx_rec_seq = [_]u8{0} ** 8;
         var rx_rec_seq = [_]u8{0} ** 8;
         if (ssl_version == c.TLS1_2_VERSION) {
@@ -720,16 +565,9 @@ pub const TlsConn = struct {
     ) !void {
         if (self.ktls_secrets.secret_len == 0) return error.KtlsNoSecrets;
 
-        // TX = sending direction: server sends with server_secret, client with client_secret
-        const tx_secret = if (self.mode == .server)
-            self.ktls_secrets.server_secret[0..self.ktls_secrets.secret_len]
-        else
-            self.ktls_secrets.client_secret[0..self.ktls_secrets.secret_len];
-
-        const rx_secret = if (self.mode == .server)
-            self.ktls_secrets.client_secret[0..self.ktls_secrets.secret_len]
-        else
-            self.ktls_secrets.server_secret[0..self.ktls_secrets.secret_len];
+        // TX = sending direction: server sends with server_secret
+        const tx_secret = self.ktls_secrets.server_secret[0..self.ktls_secrets.secret_len];
+        const rx_secret = self.ktls_secrets.client_secret[0..self.ktls_secrets.secret_len];
 
         try hkdfExpandLabel(params.evp_md, tx_secret, "key", tx_key[0..params.key_size]);
         try hkdfExpandLabel(params.evp_md, tx_secret, "iv", tx_iv);
@@ -782,85 +620,22 @@ pub const TlsConn = struct {
         off += iv_len;
         const server_iv_block = key_block[off .. off + iv_len];
 
-        // Assign TX/RX based on mode
-        if (self.mode == .server) {
-            @memcpy(tx_key[0..params.key_size], server_key);
-            @memcpy(rx_key[0..params.key_size], client_key);
-            if (fixed_iv_len > 0) {
-                // AES-GCM: salt = fixed_iv (4 bytes), iv = zeros (kernel manages explicit nonce)
-                @memcpy(tx_iv[0..fixed_iv_len], server_iv_block[0..fixed_iv_len]);
-                @memcpy(rx_iv[0..fixed_iv_len], client_iv_block[0..fixed_iv_len]);
-            } else {
-                // ChaCha20: full 12-byte IV
-                @memcpy(tx_iv, server_iv_block[0..12]);
-                @memcpy(rx_iv, client_iv_block[0..12]);
-            }
+        // Server: TX uses server_write_*, RX uses client_write_*
+        @memcpy(tx_key[0..params.key_size], server_key);
+        @memcpy(rx_key[0..params.key_size], client_key);
+        if (fixed_iv_len > 0) {
+            // AES-GCM: salt = fixed_iv (4 bytes), iv = zeros (kernel manages explicit nonce)
+            @memcpy(tx_iv[0..fixed_iv_len], server_iv_block[0..fixed_iv_len]);
+            @memcpy(rx_iv[0..fixed_iv_len], client_iv_block[0..fixed_iv_len]);
         } else {
-            @memcpy(tx_key[0..params.key_size], client_key);
-            @memcpy(rx_key[0..params.key_size], server_key);
-            if (fixed_iv_len > 0) {
-                @memcpy(tx_iv[0..fixed_iv_len], client_iv_block[0..fixed_iv_len]);
-                @memcpy(rx_iv[0..fixed_iv_len], server_iv_block[0..fixed_iv_len]);
-            } else {
-                @memcpy(tx_iv, client_iv_block[0..12]);
-                @memcpy(rx_iv, server_iv_block[0..12]);
-            }
+            // ChaCha20: full 12-byte IV
+            @memcpy(tx_iv, server_iv_block[0..12]);
+            @memcpy(rx_iv, client_iv_block[0..12]);
         }
 
         // Scrub
         @memset(&master_secret, 0);
         @memset(&key_block, 0);
-    }
-};
-
-/// Free a heap-allocated TlsConn (deinit + destroy). Used by handler cleanup, etc.
-pub fn freeTlsConn(allocator: std.mem.Allocator, tc: *TlsConn) void {
-    tc.deinit(allocator);
-    allocator.destroy(tc);
-}
-
-/// Per-worker TLS manager — owns the client TLS contexts for outbound handshakes.
-/// After kTLS setup, TlsConn is freed — no fd-to-TlsConn mapping needed.
-pub const TlsManager = struct {
-    allocator: std.mem.Allocator,
-    client_tls_ctx: ClientTlsContext,
-    insecure_tls_ctx: ClientTlsContext,
-    custom_tls_ctx: ?ClientTlsContext,
-
-    pub fn init(allocator: std.mem.Allocator) !TlsManager {
-        const client_tls_ctx = ClientTlsContext.init(.{ .verify = true }) catch return error.TlsInitFailed;
-        const insecure_tls_ctx = ClientTlsContext.init(.{ .verify = false }) catch return error.TlsInitFailed;
-
-        // Custom mTLS context from env vars (for any mTLS target)
-        const custom_tls_ctx: ?ClientTlsContext = blk: {
-            const ca = helpers.getenv("KEYWAY_MTLS_CA") orelse break :blk null;
-            const cert = helpers.getenv("KEYWAY_MTLS_CERT") orelse break :blk null;
-            const key = helpers.getenv("KEYWAY_MTLS_KEY") orelse break :blk null;
-            const ctx = ClientTlsContext.init(.{
-                .verify = true,
-                .ca_path = @ptrCast(ca.ptr),
-                .cert_path = @ptrCast(cert.ptr),
-                .key_path = @ptrCast(key.ptr),
-            }) catch |err| {
-                log.err().string("msg", "custom mTLS context init failed (KEYWAY_MTLS_*)").err(err).log();
-                break :blk null;
-            };
-            log.info().string("msg", "custom mTLS context loaded from KEYWAY_MTLS_CA/CERT/KEY").log();
-            break :blk ctx;
-        };
-
-        return TlsManager{
-            .allocator = allocator,
-            .client_tls_ctx = client_tls_ctx,
-            .insecure_tls_ctx = insecure_tls_ctx,
-            .custom_tls_ctx = custom_tls_ctx,
-        };
-    }
-
-    pub fn deinit(self: *TlsManager) void {
-        self.client_tls_ctx.deinit();
-        self.insecure_tls_ctx.deinit();
-        if (self.custom_tls_ctx) |*ctx| ctx.deinit();
     }
 };
 

@@ -12,7 +12,7 @@ const CIPHERTEXT_BUFFER_SIZE = config.CIPHERTEXT_BUFFER_SIZE;
 
 /// Initialize TLS on this connection. Called from onAccept when TLS is configured.
 pub fn initTls(self: *Connection, tls_ctx: *TlsContext) !void {
-    self.tls_state.tls_conn = try TlsConn.init(self.base_allocator, tls_ctx.ctx, .server);
+    self.tls_state.tls_conn = try TlsConn.init(self.base_allocator, tls_ctx.ctx);
     self.tls_state.tls_conn.?.fixupExData();
     self.tls_state.ciphertext_buffer = try LinearBuffer.init(self.base_allocator, CIPHERTEXT_BUFFER_SIZE);
 }

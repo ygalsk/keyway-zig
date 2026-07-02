@@ -2,9 +2,9 @@
 //!
 //! Each worker thread owns one LuaState containing: the Lua VM, cached coroutine thread,
 //! the async-yield bridge (pending WS send + suspended coroutine state, shared by WS/
-//! SSE/stream), an outbound TLS manager, and an SSE registry pointer.
+//! SSE/stream), and an SSE registry pointer.
 //!
-//! Init order: Lua VM → std libs → keyway module → embedded stdlib → cached thread → package paths → TLS manager.
+//! Init order: Lua VM → std libs → keyway module → embedded stdlib → cached thread → package paths.
 //! After init: registerAsyncApi → setWorkerGlobals → loadScript → processRouteTable.
 
 const std = @import("std");
@@ -16,10 +16,8 @@ const Router = @import("../http/router.zig").Router;
 const lua_api = @import("lua_api.zig");
 const io_request = @import("../io/io_request.zig");
 const Connection = @import("../core/handler.zig").Connection;
-const tls = @import("../tls/tls.zig");
 const castUserdata = @import("../util/helpers.zig").castUserdata;
 const helpers = @import("../util/helpers.zig");
-const TlsManager = tls.TlsManager;
 const SseRegistry = @import("../protocol/sse.zig").SseRegistry;
 const prom = @import("../observability/prom.zig");
 
@@ -74,9 +72,6 @@ pub const LuaState = struct {
 
     // SSE: per-worker registry for broadcast (set by worker.zig)
     sse_registry: ?*SseRegistry = null,
-
-    // Outbound TLS: per-worker context + fd→TLS mapping (persists across yields)
-    tls_manager: TlsManager,
 
     /// Initialize Lua state with standard libraries
     pub fn init(allocator: std.mem.Allocator) !LuaState {
@@ -144,14 +139,11 @@ pub const LuaState = struct {
             log.warn().string("msg", "failed to configure Lua package paths").err(err).log();
         };
 
-        const tls_manager = TlsManager.init(allocator) catch return error.TlsInitFailed;
-
         return LuaState{
             .lua = lua,
             .allocator = allocator,
             .cached_thread = cached_thread,
             .cached_thread_ref = cached_thread_ref,
-            .tls_manager = tls_manager,
         };
     }
 
@@ -359,10 +351,10 @@ pub const LuaState = struct {
     /// Set per-worker Lua globals (called once after init, before loadScript).
     /// Exposes keyway.worker_id so handlers can include it in page output.
     pub fn setWorkerGlobals(self: *LuaState, worker_id: usize) void {
-        _ = self.lua.getGlobal("keyway");          // push keyway table
+        _ = self.lua.getGlobal("keyway"); // push keyway table
         self.lua.pushInteger(@intCast(worker_id)); // push value
-        self.lua.setField(-2, "worker_id");        // keyway.worker_id = N
-        self.lua.pop(1);                           // pop keyway table
+        self.lua.setField(-2, "worker_id"); // keyway.worker_id = N
+        self.lua.pop(1); // pop keyway table
     }
 
     /// Record coroutine execution duration for Prometheus metrics.
@@ -651,7 +643,6 @@ pub const LuaState = struct {
 
     /// Clean up Lua state
     pub fn deinit(self: *LuaState) void {
-        self.tls_manager.deinit();
         if (self.cached_thread_ref != 0) {
             self.lua.unref(Lua.PseudoIndex.Registry, self.cached_thread_ref);
         }
