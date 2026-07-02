@@ -98,7 +98,7 @@ src/
 ├── observability/  # logging, metrics, Prometheus
 └── util/           # buffer, helpers, config, CLI
 dashboard/          # Solid.js admin dashboard + keyway.lua entry script
-lua/                # embedded Lua stdlib modules (keyway.form, keyway.response)
+lua/                # embedded Lua stdlib modules (keyway.response)
 tests/              # Integration tests (Bun)
 observability/      # Prometheus + Grafana config
 ```
@@ -161,8 +161,7 @@ Access is restricted to localhost (`127.0.0.1` / `::1`). Manual reload: `POST /_
 
 | Module | Purpose |
 |---|---|
-| `keyway.response` | `json_response`, `get_header`, `broadcast_event`, `broadcast_html`, `now_us` |
-| `keyway.form` | Form data parsing |
+| `keyway.response` | `json_response`, `get_header`, `broadcast_event`, `now_us` |
 
 ## Observability
 
