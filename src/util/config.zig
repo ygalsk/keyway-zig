@@ -60,6 +60,10 @@ pub const STATIC_READ_SIZE: usize = 65536;
 /// Maximum static file size (100 MB). Files larger than this get 413.
 pub const STATIC_MAX_SIZE: u64 = 100 * 1024 * 1024;
 
+/// Deadline for the whole reverse-proxy upstream exchange (connect+send+recv
+/// combined, not per-op). Requests exceeding this get 504.
+pub const PROXY_UPSTREAM_TIMEOUT_MS: u64 = 30_000;
+
 comptime {
     // Buffer sizes must be at least 4096 for reasonable HTTP operation
     if (READ_BUFFER_SIZE < 4096)
@@ -84,4 +88,6 @@ comptime {
         @compileError("HEADER_TIMEOUT_MS must be > 0");
     if (STATIC_READ_SIZE < 4096)
         @compileError("STATIC_READ_SIZE must be >= 4096");
+    if (PROXY_UPSTREAM_TIMEOUT_MS == 0)
+        @compileError("PROXY_UPSTREAM_TIMEOUT_MS must be > 0");
 }

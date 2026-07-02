@@ -1,8 +1,9 @@
 // Reverse proxy — exercises the async connect/send/recv path (issue #29).
 //
-// The dashboard config (dashboard/keyway.lua) registers two proxy routes:
+// The dashboard config (dashboard/keyway.lua) registers three proxy routes:
 //   /__keyway/test-proxy       -> 127.0.0.1:38291 (the upstream spawned below)
 //   /__keyway/test-proxy-dead  -> 127.0.0.1:1     (closed port -> 502)
+//   /__keyway/test-proxy-hung  -> 127.0.0.1:38292 (accepts, never responds -> 504)
 // strip_prefix=true, so /__keyway/test-proxy/small forwards as /small upstream.
 //
 // We spin up a tiny Bun upstream here so the proxy has something real to talk
@@ -11,14 +12,16 @@
 // corrupt or short the body.
 
 import { describe, test, expect, beforeAll, afterAll } from "bun:test";
-import type { Server } from "bun";
+import type { Server, TCPSocketListener } from "bun";
 
 const base = () => globalThis.__KEYWAY_BASE;
 const UPSTREAM_PORT = 38291;
+const HUNG_UPSTREAM_PORT = 38292;
 const LARGE_SIZE = 500_000; // ~32 chunks at a 16 KB recv buffer
 const LARGE_BODY = "x".repeat(LARGE_SIZE);
 
 let upstream: Server | null = null;
+let hungUpstream: TCPSocketListener | null = null;
 
 beforeAll(() => {
   upstream = Bun.serve({
@@ -44,11 +47,28 @@ beforeAll(() => {
       }
     },
   });
+
+  // Raw TCP listener (not Bun.serve, which always answers): accepts the
+  // connection and the request bytes, then never writes a response and
+  // never closes — the shape of a hung/non-compliant upstream (#72).
+  hungUpstream = Bun.listen({
+    hostname: "127.0.0.1",
+    port: HUNG_UPSTREAM_PORT,
+    socket: {
+      data() {},
+      open() {},
+      close() {},
+      drain() {},
+      error() {},
+    },
+  });
 });
 
 afterAll(() => {
   upstream?.stop(true);
   upstream = null;
+  hungUpstream?.stop(true);
+  hungUpstream = null;
 });
 
 describe("reverse proxy", () => {
@@ -101,4 +121,31 @@ describe("reverse proxy", () => {
     const metrics = await (await fetch(`${base()}/metrics`)).text();
     expect(metrics).toMatch(/keyway_http_requests_total\{[^}]*status="500"[^}]*\}/);
   });
+});
+
+describe("reverse proxy upstream deadline (#72)", () => {
+  // Runs against the real PROXY_UPSTREAM_TIMEOUT_MS (config.zig, 30s) — no
+  // test-only config surface for a shorter deadline (keyway.proxy routes
+  // don't take a timeout option, and adding one just for this test would be
+  // new production API surface for a value that's otherwise a fixed
+  // constant). The per-test timeout override below is local to this test and
+  // doesn't touch the suite's shared 10s default (see tests/preload.ts).
+  test(
+    "hung upstream (accepts, never responds) gets 504 after the deadline; server stays healthy after",
+    async () => {
+      const start = Date.now();
+      const res = await fetch(`${base()}/__keyway/test-proxy-hung/whatever`);
+      const elapsed = Date.now() - start;
+      expect(res.status).toBe(504);
+      // Sanity check this actually rode out the real deadline rather than
+      // failing fast on some other path (e.g. connect refused -> 502).
+      expect(elapsed).toBeGreaterThan(25_000);
+
+      // The connection must be usable afterward — not left half-torn-down —
+      // and the worker must still be accepting/serving other requests.
+      const health = await fetch(`${base()}/health`);
+      expect(health.status).toBe(200);
+    },
+    35_000,
+  );
 });
