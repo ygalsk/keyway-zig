@@ -112,25 +112,11 @@ pub const Worker = struct {
         }
         log.info().string("msg", "worker starting").log();
 
-        // === Worker Initialization Sequence ===
-        // 1. Pin thread to CPU core (NUMA locality, cache affinity)
-        // 2. Create xev event loop (per-core, no sharing)
-        // 3. Create Router (per-worker, lua_ref values are Lua-state-specific)
-        // 4. Create SseRegistry (per-worker subscriber tracking)
-        // 5. Wire SSE broadcast bus (cross-worker pub/sub, if enabled)
-        // 6. Create LuaState (Lua VM + std libs + metatables + cached thread)
-        // 7. Set SSE registry on LuaState (for broadcast C function)
-        // 8. Register async API (C closures with *LuaState upvalue)
-        // 9. Set worker globals (keyway.worker_id)
-        // 10. Load Lua script + process route table
-        // 11. Create Server (socket, bind, listen, TLS context)
-        // 12. Start accept loop → run event loop
-        //
-        // Invariants:
-        // - CPU pinning MUST happen before any allocations (NUMA locality)
-        // - registerAsyncApi needs stable *LuaState pointer (after init)
-        // - setWorkerGlobals must precede loadScript (scripts may read worker_id)
-        // - processRouteTable must follow loadScript (reads keyway.routes)
+        // Lifecycle vars below (loop, router, sse_registry, lua_state, server)
+        // are declared with `var x = try ...; defer x.deinit();` and must stay
+        // inline in this function: loop.run(.until_done) at the bottom uses
+        // all of them, so moving a declaration into a helper would free it
+        // (via the helper's defer) while the loop is still running.
 
         // Each worker has its own event loop
         var loop = try xev.Loop.init(.{});
@@ -192,53 +178,19 @@ pub const Worker = struct {
         );
         defer server.deinit();
 
-        // Register shutdown Async watcher (fires when coordinator signals drain)
+        // Completions below are registered with the event loop (xev keeps a
+        // pointer to them while outstanding), so they too must keep this
+        // exact stack address until loop.run returns — declared here even
+        // though setup itself is extracted into helpers.
         var shutdown_completion: xev.Completion = undefined;
         var drain_timer_completion: xev.Completion = .{};
-        if (ctx.coordinator) |coord| {
-            const async_watcher = coord.getAsync(ctx.worker_id);
-            const shutdown_ctx = try ctx.allocator.create(ShutdownContext);
-            shutdown_ctx.* = .{
-                .server = &server,
-                .coordinator = coord,
-                .drain_timer_completion = &drain_timer_completion,
-                .allocator = ctx.allocator,
-            };
-            async_watcher.wait(&loop, &shutdown_completion, ShutdownContext, shutdown_ctx, onShutdownSignal);
-            server.coordinator = coord;
-            server.worker_id = ctx.worker_id;
-            server.drain_timer_completion = &drain_timer_completion;
-        }
-        server.reload_coordinator = ctx.reload_coordinator;
+        try setupShutdownWatcher(ctx, &loop, &server, &shutdown_completion, &drain_timer_completion);
 
-        // Register reload Async watcher (fires when ReloadCoordinator signals reload)
         var reload_completion: xev.Completion = undefined;
-        if (ctx.reload_coordinator) |reload_coord| {
-            const reload_async = reload_coord.getAsync(ctx.worker_id);
-            const reload_ctx = try ctx.allocator.create(ReloadContext);
-            reload_ctx.* = .{
-                .lua_state = &lua_state,
-                .router = &router,
-                .script_path = ctx.script_path,
-                .server = &server,
-                .allocator = ctx.allocator,
-            };
-            reload_async.wait(&loop, &reload_completion, ReloadContext, reload_ctx, onReloadSignal);
-        }
+        try setupReloadWatcher(ctx, &loop, &server, &lua_state, &router, &reload_completion);
 
-        // Start file watcher if --watch enabled
         var file_watcher: ?FileWatcher = null;
-        if (ctx.watch) {
-            file_watcher = FileWatcher.init(ctx.allocator, ctx.script_path, &lua_state, &router) catch |err| blk: {
-                log.warn().string("msg", "file watcher init failed — continuing without watch").err(err).log();
-                break :blk null;
-            };
-            if (file_watcher) |*fw| {
-                fw.start(&loop);
-                server.file_watcher = fw;
-                log.info().string("msg", "file watcher started").string("script", ctx.script_path).log();
-            }
-        }
+        setupFileWatcher(ctx, &loop, &server, &lua_state, &router, &file_watcher);
         defer if (file_watcher) |*fw| fw.deinit();
 
         // Start accepting connections
@@ -251,6 +203,81 @@ pub const Worker = struct {
 
         // Run event loop
         try loop.run(.until_done);
+    }
+
+    /// Register the shutdown Async watcher (fires when coordinator signals drain).
+    /// `shutdown_completion`/`drain_timer_completion` are owned by the caller
+    /// (workerMain) — see the lifetime note above workerMain's lifecycle vars.
+    fn setupShutdownWatcher(
+        ctx: *Context,
+        loop: *xev.Loop,
+        server: *Server,
+        shutdown_completion: *xev.Completion,
+        drain_timer_completion: *xev.Completion,
+    ) !void {
+        if (ctx.coordinator) |coord| {
+            const async_watcher = coord.getAsync(ctx.worker_id);
+            const shutdown_ctx = try ctx.allocator.create(ShutdownContext);
+            shutdown_ctx.* = .{
+                .server = server,
+                .coordinator = coord,
+                .drain_timer_completion = drain_timer_completion,
+                .allocator = ctx.allocator,
+            };
+            async_watcher.wait(loop, shutdown_completion, ShutdownContext, shutdown_ctx, onShutdownSignal);
+            server.coordinator = coord;
+            server.worker_id = ctx.worker_id;
+            server.drain_timer_completion = drain_timer_completion;
+        }
+    }
+
+    /// Register the reload Async watcher (fires when ReloadCoordinator signals reload).
+    /// `reload_completion` is owned by the caller (workerMain).
+    fn setupReloadWatcher(
+        ctx: *Context,
+        loop: *xev.Loop,
+        server: *Server,
+        lua_state: *LuaState,
+        router: *Router,
+        reload_completion: *xev.Completion,
+    ) !void {
+        server.reload_coordinator = ctx.reload_coordinator;
+        if (ctx.reload_coordinator) |reload_coord| {
+            const reload_async = reload_coord.getAsync(ctx.worker_id);
+            const reload_ctx = try ctx.allocator.create(ReloadContext);
+            reload_ctx.* = .{
+                .lua_state = lua_state,
+                .router = router,
+                .script_path = ctx.script_path,
+                .server = server,
+                .allocator = ctx.allocator,
+            };
+            reload_async.wait(loop, reload_completion, ReloadContext, reload_ctx, onReloadSignal);
+        }
+    }
+
+    /// Start the file watcher if --watch is enabled. `file_watcher` is owned
+    /// by the caller (workerMain), which also keeps its `defer .deinit()` —
+    /// FileWatcher.start registers a self-pointer with the loop, so its
+    /// backing memory must not live in this helper's stack frame.
+    fn setupFileWatcher(
+        ctx: *Context,
+        loop: *xev.Loop,
+        server: *Server,
+        lua_state: *LuaState,
+        router: *Router,
+        file_watcher: *?FileWatcher,
+    ) void {
+        if (!ctx.watch) return;
+        file_watcher.* = FileWatcher.init(ctx.allocator, ctx.script_path, lua_state, router) catch |err| blk: {
+            log.warn().string("msg", "file watcher init failed — continuing without watch").err(err).log();
+            break :blk null;
+        };
+        if (file_watcher.*) |*fw| {
+            fw.start(loop);
+            server.file_watcher = fw;
+            log.info().string("msg", "file watcher started").string("script", ctx.script_path).log();
+        }
     }
 };
 
