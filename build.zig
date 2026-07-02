@@ -86,7 +86,7 @@ pub fn build(b: *std.Build) void {
 }
 
 /// Configure dependencies shared by both the main executable and test targets:
-/// libxev, luajit, picohttpparser (vendored C), libc, and linker workarounds.
+/// libxev, luajit, picohttpparser (vendored C), libc, OpenSSL.
 fn addSharedDeps(
     b: *std.Build,
     compile: *std.Build.Step.Compile,
