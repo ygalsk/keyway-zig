@@ -1,10 +1,10 @@
 const std = @import("std");
 const xev = @import("xev");
-const handler = @import("../core/handler.zig");
+const handler = @import("handler.zig");
 const Connection = handler.Connection;
 const castUserdata = @import("../util/helpers.zig").castUserdata;
 const HttpExchange = @import("../http/http_exchange.zig").HttpExchange;
-const SseRegistry = @import("sse.zig").SseRegistry;
+const SseRegistry = @import("../protocol/sse.zig").SseRegistry;
 
 /// SSE connection state — set after successful SSE upgrade.
 /// Holds all SSE-specific fields; Connection.sse_state is ?SseState = null.
@@ -97,13 +97,19 @@ fn onSseDisconnect(
     const self = castUserdata(Connection, userdata);
     self.pending_io_ops -= 1;
     const bytes = result.recv catch {
-        if (self.state == .closing) { self.maybeFinishClose(); return .disarm; }
+        if (self.state == .closing) {
+            self.maybeFinishClose();
+            return .disarm;
+        }
         self.close();
         return .disarm;
     };
     // EOF (0 bytes) or unexpected client data — close the SSE connection
     _ = bytes;
-    if (self.state == .closing) { self.maybeFinishClose(); return .disarm; }
+    if (self.state == .closing) {
+        self.maybeFinishClose();
+        return .disarm;
+    }
     self.close();
     return .disarm;
 }
@@ -180,4 +186,3 @@ fn onWrite(
 // Tests for conn_sse require a fully initialized Connection (xev.Loop, socket,
 // buffers, SSE registry) so unit tests are not feasible here. SSE upgrade and
 // broadcast are covered by integration tests against the running server.
-

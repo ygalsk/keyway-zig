@@ -2,8 +2,8 @@ const std = @import("std");
 const xev = @import("xev");
 const log = @import("../observability/log.zig");
 const http = @import("../http/http.zig");
-const ws = @import("ws.zig");
-const handler_mod = @import("../core/handler.zig");
+const ws = @import("../protocol/ws.zig");
+const handler_mod = @import("handler.zig");
 const Connection = handler_mod.Connection;
 const HttpExchange = @import("../http/http_exchange.zig").HttpExchange;
 const castUserdata = @import("../util/helpers.zig").castUserdata;
@@ -118,13 +118,19 @@ fn onWsRead(
     self.pending_io_ops -= 1;
 
     const bytes_read = result.recv catch |err| {
-        if (self.state == .closing) { self.maybeFinishClose(); return .disarm; }
+        if (self.state == .closing) {
+            self.maybeFinishClose();
+            return .disarm;
+        }
         log.err().string("msg", "ws recv failed").err(err).log();
         self.close();
         return .disarm;
     };
 
-    if (self.state == .closing) { self.maybeFinishClose(); return .disarm; }
+    if (self.state == .closing) {
+        self.maybeFinishClose();
+        return .disarm;
+    }
 
     log.debug().string("msg", "ws recv").int("bytes", bytes_read).log();
 
@@ -419,7 +425,10 @@ fn onWsCloseSent(
     _ = result;
     const self = castUserdata(Connection, userdata);
     self.pending_io_ops -= 1;
-    if (self.state == .closing) { self.maybeFinishClose(); return .disarm; }
+    if (self.state == .closing) {
+        self.maybeFinishClose();
+        return .disarm;
+    }
     self.close();
     return .disarm;
 }

@@ -32,7 +32,7 @@ Accept → Read → Parse → Route → Execute → Respond → Reuse
 3. **Parse** — picohttpparser (C FFI) yields a zero-copy `Request` — method/path/headers/body are slices into the buffer, no allocations.
 4. **Route** — `Router.match` does an O(path-length) trie lookup into inline `ParamArray`/`QueryArray` (zero heap).
 5. **Execute** — `LuaState.callLuaHandler` runs a Lua coroutine with the `HttpExchange` userdata. WS/SSE/stream handlers yield for flow control; Zig resumes them. All other handlers run to completion without yielding.
-6. **Respond** — `HttpExchange.toResponse` → `Response.serialize` → async send. Special paths: SSE (`conn_sse`), WebSocket (`conn_ws`), chunked (`conn_stream`). Static routes short-circuit before Lua (`static.zig`, ETag/Last-Modified).
+6. **Respond** — `HttpExchange.toResponse` → `Response.serialize` → async send. Special paths: SSE (`core/conn_sse`), WebSocket (`core/conn_ws`), chunked (`core/conn_stream`). Static routes short-circuit before Lua (`static.zig`, ETag/Last-Modified).
 7. **Reuse** — arena + buffer reset for keep-alive; if the response exceeded `LARGE_RESPONSE_THRESHOLD`, arena backing memory is freed to bound growth.
 
 ## 4. Memory Model
@@ -48,11 +48,11 @@ Source lives under `src/`, grouped by responsibility. Read the directory, not a 
 
 | Dir | Owns |
 |---|---|
-| `core/` | Per-core lifecycle: `main`→`ThreadPool`→`worker` (CPU-pinned, owns loop+LuaState+Router+Server), `server` (accept, SO_REUSEPORT, BPF, TLS init), `handler` (`Connection`: socket lifecycle, read/write completions, arena, coroutine suspend/resume), `shutdown`, `reload`. |
+| `core/` | Per-core lifecycle: `main`→`ThreadPool`→`worker` (CPU-pinned, owns loop+LuaState+Router+Server), `server` (accept, SO_REUSEPORT, BPF, TLS init), `handler` (`Connection`: socket lifecycle, read/write completions, arena, coroutine suspend/resume), protocol connection adapters (`conn_ws`, `conn_sse`, `conn_stream`), `shutdown`, `reload`. |
 | `http/` | HTTP path: `http` (Request/Response/parser bindings/serialize), `router` (zero-alloc trie), `route_loader`, `http_exchange` (the Lua-visible `ctx`), `params`, `static`, `error_response`. |
 | `io/` | Async-yield entry points for WS/SSE flow control: `io_request` (ws_send C function), `file_watcher`, `bpf_reuseport`. The yield/resume bridge itself lives on `core/handler`'s `Connection`. |
 | `lua/` | LuaJIT: `lua_state` (state, handler dispatch, coroutine lifecycle), `lua_api` (ctx/headers/params metatables, async API registration), `json`. |
-| `protocol/` | Upgraded protocols: `ws`/`conn_ws`, `sse`/`conn_sse` (SseRegistry + SseBroadcastBus), `conn_stream`. |
+| `protocol/` | Protocol helpers and registries: `ws` frame codec, `sse` registry + broadcast bus. Connection-bound protocol adapters live in `core/`. |
 | `tls/` | `tls` (TlsContext/TlsConn/kTLS), `conn_tls` (inbound handshake). |
 | `observability/` | `metrics` (per-worker atomics), `prom` (Prometheus export), `log`. |
 | `util/` | `buffer` (LinearBuffer), `config` (tunable constants), `cli`, `helpers` (`castUserdata`). |
