@@ -15,6 +15,7 @@ import { describe, test, expect, beforeAll, afterAll } from "bun:test";
 import type { Server, TCPSocketListener } from "bun";
 
 const base = () => globalThis.__KEYWAY_BASE;
+const port = () => globalThis.__KEYWAY_PORT;
 const UPSTREAM_PORT = 38291;
 const HUNG_UPSTREAM_PORT = 38292;
 const LARGE_SIZE = 500_000; // ~32 chunks at a 16 KB recv buffer
@@ -42,6 +43,16 @@ beforeAll(() => {
           return new Response(req.headers.get("X-Client-Header") ?? "(none)");
         case "/status500":
           return new Response("upstream error", { status: 500 });
+        case "/dump":
+          // Reflect what the upstream actually received (#170): body plus
+          // presence/value of the framing headers, so the test can assert
+          // the proxy regenerated Content-Length instead of forwarding a
+          // stale Transfer-Encoding alongside an already-de-chunked body.
+          return Response.json({
+            body: await req.text(),
+            contentLength: req.headers.get("content-length"),
+            transferEncoding: req.headers.get("transfer-encoding"),
+          });
         default:
           return new Response("not found", { status: 404 });
       }
@@ -71,7 +82,68 @@ afterAll(() => {
   hungUpstream = null;
 });
 
+// Raw-socket helper (mirrors smuggling.test.ts's rawStatus): fetch() can't
+// hand-roll chunked request framing, and we need that to reach the proxy
+// with a real Transfer-Encoding: chunked request. Resolves as soon as the
+// full response (headers + Content-Length body bytes) has arrived — keyway
+// keeps the client connection alive (only the upstream leg forces
+// Connection: close), so waiting on socket close would just burn the
+// fallback timeout on every run.
+async function rawRequest(request: string): Promise<string> {
+  let buf = "";
+  const { promise, resolve } = Promise.withResolvers<string>();
+  const socket = await Bun.connect({
+    hostname: "127.0.0.1",
+    port: port(),
+    socket: {
+      data(s, data) {
+        buf += data.toString();
+        const headerEnd = buf.indexOf("\r\n\r\n");
+        if (headerEnd === -1) return;
+        const match = buf.slice(0, headerEnd).match(/content-length:\s*(\d+)/i);
+        const bodyLen = match ? Number(match[1]) : 0;
+        if (buf.length >= headerEnd + 4 + bodyLen) {
+          resolve(buf);
+          s.end();
+        }
+      },
+      close() {
+        resolve(buf);
+      },
+      error(_socket, error) {
+        resolve(buf || String(error));
+      },
+    },
+  });
+  socket.write(request);
+  socket.flush();
+  const resp = await Promise.race([promise, Bun.sleep(2000).then(() => buf)]);
+  socket.end();
+  return resp;
+}
+
 describe("reverse proxy", () => {
+  // (#170) Regression: the parser decodes a chunked request body before
+  // proxy.zig ever sees it, but buildUpstreamRequest used to forward the
+  // client's original Transfer-Encoding: chunked header unchanged and append
+  // the already-decoded body — the upstream then saw a framing header that
+  // didn't match the bytes on the wire. It must regenerate Content-Length
+  // and never forward Transfer-Encoding/Content-Length from the client.
+  test("de-chunks a chunked request body and forwards Content-Length, not Transfer-Encoding", async () => {
+    const raw = await rawRequest(
+      `POST /__keyway/test-proxy/dump HTTP/1.1\r\n` +
+        `Host: 127.0.0.1:${port()}\r\n` +
+        `Transfer-Encoding: chunked\r\n` +
+        `Connection: close\r\n\r\n` +
+        `5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n`,
+    );
+    const bodyStart = raw.indexOf("\r\n\r\n") + 4;
+    const parsed = JSON.parse(raw.slice(bodyStart));
+    expect(parsed.body).toBe("hello world");
+    expect(parsed.contentLength).toBe("11");
+    expect(parsed.transferEncoding).toBeNull();
+  });
+
   test("forwards a small GET and relays the upstream body + headers", async () => {
     const res = await fetch(`${base()}/__keyway/test-proxy/small`);
     expect(res.status).toBe(200);
