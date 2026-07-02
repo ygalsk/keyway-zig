@@ -16,6 +16,7 @@ const http = @import("../http/http.zig");
 const castUserdata = @import("../util/helpers.zig").castUserdata;
 const Lua = @import("luajit").Lua;
 const c = @import("luajit_c");
+const prom = @import("../observability/prom.zig");
 
 /// Stream connection state — set after successful stream upgrade.
 pub const StreamState = struct {
@@ -130,6 +131,16 @@ pub fn handleStreamPostWrite(self: *Connection) void {
                     const err_msg = thread.toString(-1) catch "unknown error";
                     log.err().string("msg", "stream handler error").int("fd", self.socket).string("error", std.mem.span(err_msg)).log();
                 }
+                // Errored coroutine is permanently dead (not reusable) — unref
+                // it and match dispatchCoroutine's start-of-request increment.
+                // Must happen before close(), which can synchronously deinit
+                // (deinit would otherwise see stream_state still set and
+                // double-handle it).
+                prom.luaCoroutineFinished();
+                if (ss.coroutine_ref != 0) {
+                    self.lua_state.lua.unref(Lua.PseudoIndex.Registry, ss.coroutine_ref);
+                }
+                self.stream_state = null;
                 self.close();
                 return;
             },
@@ -141,6 +152,8 @@ pub fn handleStreamPostWrite(self: *Connection) void {
 fn sendTerminalChunk(self: *Connection) void {
     // Return coroutine to cache
     const ss = self.stream_state.?;
+    // Match dispatchCoroutine's start-of-request increment (prom.luaCoroutineStarted).
+    prom.luaCoroutineFinished();
     if (ss.coroutine_ref != 0) {
         if (self.lua_state.cached_thread_ref == 0) {
             self.lua_state.cached_thread_ref = ss.coroutine_ref;
