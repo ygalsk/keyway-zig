@@ -383,13 +383,13 @@ fn onStaticPreadComplete(
         return .disarm;
     }
 
-    const bytes_read = result.pread catch |err| {
-        if (err == error.EOF) {
-            // File truncated under us — stop, send what was already delivered.
-            finishStaticFile(self);
-        } else {
-            self.close();
-        }
+    const bytes_read = result.pread catch {
+        // pread failed, or hit EOF before file_size (file shrank mid-transfer):
+        // either way fewer bytes than the promised Content-Length were sent, so
+        // the client's framing is desynced and unrecoverable — close instead of
+        // returning to keep-alive. (A pread is only submitted while
+        // bytes_sent < file_size, so EOF here always means a short body.)
+        self.close();
         return .disarm;
     };
 
