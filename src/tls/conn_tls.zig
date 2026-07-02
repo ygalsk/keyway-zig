@@ -47,7 +47,10 @@ fn completeHandshake(self: *Connection) void {
         self.close();
         return;
     };
-    // Free TLS state — kernel handles crypto now
+    // Free TLS state — kernel handles crypto now. Mark kTLS active so the
+    // plaintext-socket recv path can recognize a control-record teardown
+    // (close_notify → EIO → error.Unexpected) as a normal TLS close (#198).
+    self.tls_state.ktls_active = true;
     tc.deinit(self.base_allocator);
     self.tls_state.tls_conn = null;
     if (self.tls_state.ciphertext_buffer) |*cb| {
