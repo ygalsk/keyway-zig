@@ -55,7 +55,7 @@ Source lives under `src/`, grouped by responsibility. Read the directory, not a 
 | `protocol/` | Upgraded protocols: `ws`/`conn_ws`, `sse`/`conn_sse` (SseRegistry + SseBroadcastBus), `conn_stream`. |
 | `tls/` | `tls` (TlsContext/TlsConn/kTLS), `conn_tls` (inbound handshake). |
 | `observability/` | `metrics` (per-worker atomics), `prom` (Prometheus export), `log`. |
-| `util/` | `buffer` (LinearBuffer), `config` (tunable constants), `cli`, `helpers` (`castUserdata`), `clock`. |
+| `util/` | `buffer` (LinearBuffer), `config` (tunable constants), `cli`, `helpers` (`castUserdata`). |
 
 ## 6. The Lua Contract
 
