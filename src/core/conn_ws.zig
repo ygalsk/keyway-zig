@@ -67,15 +67,19 @@ pub fn handleWsUpgrade(conn: *Connection, exchange: *HttpExchange, request: *con
 
 /// Start reading WebSocket frames from the client.
 pub fn startWsRead(conn: *Connection) void {
-    // Compact read buffer to reclaim consumed space before checking capacity
-    conn.read_buffer.compact();
-
     // If there's already data in the buffer (e.g., multiple frames in one TCP
     // segment), process it before blocking on recv.
     if (conn.read_buffer.availableRead() > 0) {
         processWsFrames(conn);
         return;
     }
+
+    armWsRecv(conn);
+}
+
+/// Arm a recv even when partial frame bytes are already buffered.
+fn armWsRecv(conn: *Connection) void {
+    conn.read_buffer.compact();
 
     // After kTLS, ciphertext_buffer is null — recv goes directly to read_buffer
     const buf = if (conn.tls_state.ciphertext_buffer) |*cb| blk: {
@@ -164,17 +168,21 @@ pub fn processWsFrames(conn: *Connection) void {
 
         // parseFrame needs mutable slice for in-place unmasking
         const mutable = @as([*]u8, @constCast(data.ptr))[0..data.len];
-        const parse_result = ws.parseFrame(mutable) catch {
-            log.err().string("msg", "ws frame parse error, sending close 1002").log();
-            // Send close 1002 (protocol error) and disconnect
-            sendWsClose(conn, 1002);
+        const parse_result = ws.parseFrame(mutable) catch |err| {
+            if (err == error.FrameTooLarge) {
+                log.err().string("msg", "ws frame too large, sending close 1009").log();
+                sendWsClose(conn, 1009);
+            } else {
+                log.err().string("msg", "ws frame parse error, sending close 1002").log();
+                sendWsClose(conn, 1002);
+            }
             return;
         };
 
         switch (parse_result) {
             .incomplete => {
                 // Need more data
-                startWsRead(conn);
+                armWsRecv(conn);
                 return;
             },
             .frame => |f| {
@@ -244,7 +252,14 @@ pub fn processWsFrames(conn: *Connection) void {
                     wss.fragment_buf = fb;
                     if (f.frame.fin) {
                         // Final fragment — dispatch the reassembled message
-                        const payload = fb.items;
+                        const payload = conn.base_allocator.dupe(u8, fb.items) catch {
+                            fb.deinit(conn.arena.allocator());
+                            wss.fragment_buf = null;
+                            sendWsClose(conn, 1011);
+                            return;
+                        };
+                        defer conn.base_allocator.free(payload);
+                        fb.deinit(conn.arena.allocator());
                         wss.fragment_buf = null;
                         dispatchWsMessage(conn, payload);
                         return;
