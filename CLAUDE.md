@@ -30,6 +30,7 @@ Work is tracked as **GitHub Issues** (the backlog, hand-driven via `gh`). Branch
 - **Per-core isolation:** one thread / one xev loop / one LuaState / one Router per core, `SO_REUSEPORT`. No sharing, no hot-path locks.
 - **Zero-copy default:** headers/path/body are slices into the read buffer. Copying is a failure mode.
 - **Surgical & minimal:** touch only what the task needs; simplest change that works; no speculative abstractions. Spot something incoherent? File an issue — don't fix it inline.
+- **Test-driven:** write the tests first and confirm they fail (red) against the current code — for the right reason, not a compile error — before writing the implementation that turns them green. Don't weaken a test to pass.
 - **Verify before done:** `zig build test` + the bun integration suite must pass.
 
 ## Testing & tone
