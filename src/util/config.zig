@@ -1,7 +1,9 @@
 /// Centralized tunable constants for the Keyway server.
 /// All buffer sizes, limits, and capacity values live here.
 
-/// Read buffer for inbound HTTP data (headers + body).
+/// Read buffer for inbound HTTP data (headers + body) — the hard cap on
+/// request size, since the buffer never grows. A request that doesn't fit
+/// gets 413.
 pub const READ_BUFFER_SIZE = 65536;
 
 /// Ciphertext receive buffer for inbound TLS connections.
@@ -33,8 +35,9 @@ pub const REQUEST_TIMEOUT_MS: u64 = 30_000;
 /// Graceful shutdown drain deadline in milliseconds. In-flight requests get this long to complete.
 pub const DRAIN_DEADLINE_MS: u64 = 30_000;
 
-/// Maximum HTTP request body size in bytes (1 MB). Bodies exceeding this get 413.
-pub const MAX_BODY_SIZE: u64 = 1_048_576;
+/// Maximum size of a buffered reverse-proxy upstream response (1 MB, #129).
+/// Exceeding this fails the proxy request with 502.
+pub const MAX_PROXY_RESPONSE_SIZE: u64 = 1_048_576;
 
 /// Maximum connections per worker before rejecting. Prevents OOM under connection flood.
 pub const MAX_CONNECTIONS_PER_WORKER: u32 = 10_000;
@@ -69,8 +72,8 @@ comptime {
         @compileError("REQUEST_TIMEOUT_MS must be > 0");
     if (DRAIN_DEADLINE_MS == 0)
         @compileError("DRAIN_DEADLINE_MS must be > 0");
-    if (MAX_BODY_SIZE < 1024)
-        @compileError("MAX_BODY_SIZE must be >= 1024");
+    if (MAX_PROXY_RESPONSE_SIZE < 1024)
+        @compileError("MAX_PROXY_RESPONSE_SIZE must be >= 1024");
     if (MAX_CONNECTIONS_PER_WORKER == 0)
         @compileError("MAX_CONNECTIONS_PER_WORKER must be > 0");
     if (HEADER_TIMEOUT_MS == 0)
