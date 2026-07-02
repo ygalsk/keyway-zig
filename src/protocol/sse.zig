@@ -1,6 +1,5 @@
 const std = @import("std");
 const xev = @import("xev");
-const config = @import("../util/config.zig");
 const log = @import("../observability/log.zig");
 const handler_mod = @import("../core/handler.zig");
 const Connection = handler_mod.Connection;
@@ -38,12 +37,6 @@ pub const SseRegistry = struct {
             gop.value_ptr.* = .empty;
         }
         try gop.value_ptr.append(self.allocator, conn);
-    }
-
-    /// Return the number of subscribers in a room (0 if room does not exist).
-    pub fn subscriberCount(self: *SseRegistry, room: []const u8) usize {
-        const list = self.rooms.getPtr(room) orelse return 0;
-        return list.items.len;
     }
 
     /// Remove a connection from a room's subscriber list.
@@ -90,8 +83,6 @@ pub const SseRegistry = struct {
 /// publish() pushes to all inboxes and notifies all workers.
 /// Workers drain their inbox in the event loop callback.
 pub const SseBroadcastBus = struct {
-    const MAX_WORKERS = config.SSE_MAX_WORKERS;
-
     const Message = struct {
         room: []const u8,
         data: []const u8,
@@ -271,13 +262,13 @@ test "SseRegistry subscribe and unsubscribe" {
 
     try reg.subscribe("chat", fake_conn_a);
     try reg.subscribe("chat", fake_conn_b);
-    try std.testing.expectEqual(@as(usize, 2), reg.subscriberCount("chat"));
+    try std.testing.expectEqual(@as(usize, 2), reg.rooms.getPtr("chat").?.items.len);
 
     reg.unsubscribe("chat", fake_conn_a);
-    try std.testing.expectEqual(@as(usize, 1), reg.subscriberCount("chat"));
+    try std.testing.expectEqual(@as(usize, 1), reg.rooms.getPtr("chat").?.items.len);
 
     reg.unsubscribe("chat", fake_conn_b);
-    try std.testing.expectEqual(@as(usize, 0), reg.subscriberCount("chat"));
+    try std.testing.expectEqual(@as(usize, 0), reg.rooms.getPtr("chat").?.items.len);
 }
 
 test "SseRegistry unsubscribe nonexistent is no-op" {
@@ -300,7 +291,7 @@ test "SseRegistry multiple rooms" {
     try reg.subscribe("room_a", fake_conn);
     try reg.subscribe("room_b", fake_conn);
 
-    try std.testing.expectEqual(@as(usize, 1), reg.subscriberCount("room_a"));
-    try std.testing.expectEqual(@as(usize, 1), reg.subscriberCount("room_b"));
-    try std.testing.expectEqual(@as(usize, 0), reg.subscriberCount("room_c"));
+    try std.testing.expectEqual(@as(usize, 1), reg.rooms.getPtr("room_a").?.items.len);
+    try std.testing.expectEqual(@as(usize, 1), reg.rooms.getPtr("room_b").?.items.len);
+    try std.testing.expectEqual(@as(usize, 0), if (reg.rooms.getPtr("room_c")) |l| l.items.len else 0);
 }

@@ -41,13 +41,6 @@ pub fn syscallErrno(rc: usize) std.posix.E {
     return .SUCCESS;
 }
 
-/// `std.posix.pipe` replacement (removed in 0.16).
-pub fn pipe() ![2]std.posix.fd_t {
-    var fds: [2]std.posix.fd_t = undefined;
-    if (syscallErrno(std.os.linux.pipe(&fds)) != .SUCCESS) return error.PipeFailed;
-    return fds;
-}
-
 /// Best-effort SHUT_RDWR; `std.posix.shutdown` was removed in 0.16.
 pub fn shutdownBoth(fd: std.posix.fd_t) void {
     _ = std.os.linux.shutdown(fd, 2); // 2 = SHUT_RDWR
@@ -64,13 +57,6 @@ pub fn inotifyInit1(flags: u32) !std.posix.fd_t {
 pub fn inotifyAddWatch(fd: std.posix.fd_t, path: [*:0]const u8, mask: u32) !i32 {
     const rc = std.os.linux.inotify_add_watch(fd, path, mask);
     if (syscallErrno(rc) != .SUCCESS) return error.InotifyAddWatchFailed;
-    return @intCast(rc);
-}
-
-/// `std.posix.socket` replacement (removed in 0.16).
-pub fn socket(domain: u32, sock_type: u32, protocol: u32) !std.posix.fd_t {
-    const rc = std.os.linux.socket(domain, sock_type, protocol);
-    if (syscallErrno(rc) != .SUCCESS) return error.SocketCreationFailed;
     return @intCast(rc);
 }
 

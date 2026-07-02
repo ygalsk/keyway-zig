@@ -50,11 +50,11 @@ Source lives under `src/`, grouped by responsibility. Read the directory, not a 
 |---|---|
 | `core/` | Per-core lifecycle: `main`→`ThreadPool`→`worker` (CPU-pinned, owns loop+LuaState+Router+Server), `server` (accept, SO_REUSEPORT, BPF, TLS init), `handler` (`Connection`: socket lifecycle, read/write completions, arena, coroutine suspend/resume), protocol connection adapters (`conn_ws`, `conn_sse`, `conn_stream`), `shutdown`, `reload`. |
 | `http/` | HTTP path: `http` (Request/Response/parser bindings/serialize), `router` (zero-alloc trie), `route_loader`, `http_exchange` (the Lua-visible `ctx`), `params`, `static`, `error_response`. |
-| `io/` | Async-yield entry points for WS/SSE flow control: `io_request` (ws_send C function), `file_watcher`, `bpf_reuseport`. The yield/resume bridge itself lives on `core/handler`'s `Connection`. |
-| `lua/` | LuaJIT: `lua_state` (state, handler dispatch, coroutine lifecycle), `lua_api` (ctx/headers/params metatables, async API registration), `lua_file_io` (admin file read/write/list C functions), `json`. |
+| `io/` | Async-yield entry points for WS/SSE flow control: `file_watcher`, `bpf_reuseport`. The yield/resume bridge itself lives on `core/handler`'s `Connection`; the `lua_yield`/`lua_resume` C decls and the `ws_send` C function live in `lua/lua_state.zig`. |
+| `lua/` | LuaJIT: `lua_state` (state, handler dispatch, coroutine lifecycle, async C functions: ws_send/sse_broadcast), `lua_api` (ctx/headers/params metatables), `lua_file_io` (admin file read/write/list C functions), `json`. |
 | `protocol/` | Protocol helpers and registries: `ws` frame codec, `sse` registry + broadcast bus. Connection-bound protocol adapters live in `core/`. |
 | `tls/` | `tls` (TlsContext/TlsConn/kTLS), `conn_tls` (inbound handshake). |
-| `observability/` | `metrics` (per-worker atomics), `prom` (Prometheus export), `log`. |
+| `observability/` | `prom` (Prometheus export, per-worker atomics), `log`. |
 | `util/` | `buffer` (LinearBuffer), `config` (tunable constants), `cli`, `helpers` (`castUserdata`). |
 
 ## 6. The Lua Contract

@@ -13,7 +13,6 @@ const c = @cImport({
 });
 
 const ENCRYPT_BUF_SIZE = config.TLS_ENCRYPT_BUF_SIZE;
-pub const TLS_RECORD_MAX_SIZE = config.TLS_RECORD_MAX_SIZE;
 
 // kTLS setsockopt constants
 const SOL_TLS: i32 = 282;

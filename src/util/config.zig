@@ -4,9 +4,6 @@
 /// Read buffer for inbound HTTP data (headers + body).
 pub const READ_BUFFER_SIZE = 65536;
 
-/// Write buffer for pre-serialized error responses.
-pub const WRITE_BUFFER_SIZE = 8192;
-
 /// Ciphertext receive buffer for inbound TLS connections.
 pub const CIPHERTEXT_BUFFER_SIZE = 8192;
 
@@ -23,12 +20,6 @@ pub const MAX_QUERY_PARAMS = 16;
 
 /// Encrypt buffer for draining wbio ciphertext (handshake, small sends).
 pub const TLS_ENCRYPT_BUF_SIZE = 20 * 1024;
-
-/// Max TLS record plaintext (RFC 8449).
-pub const TLS_RECORD_MAX_SIZE = 16384;
-
-/// Max workers for SSE broadcast bus.
-pub const SSE_MAX_WORKERS = 128;
 
 /// TCP listen backlog depth.
 pub const DEFAULT_BACKLOG: u31 = 128;
@@ -68,8 +59,6 @@ comptime {
     // Buffer sizes must be at least 4096 for reasonable HTTP operation
     if (READ_BUFFER_SIZE < 4096)
         @compileError("READ_BUFFER_SIZE must be >= 4096");
-    if (WRITE_BUFFER_SIZE < 4096)
-        @compileError("WRITE_BUFFER_SIZE must be >= 4096");
     // Param limits sanity check
     if (MAX_ROUTE_PARAMS > 8)
         @compileError("MAX_ROUTE_PARAMS must be <= 8");

@@ -20,8 +20,6 @@ const LuaState = @import("../lua/lua_state.zig").LuaState;
 const tls_mod = @import("../tls/tls.zig");
 const TlsContext = tls_mod.TlsContext;
 const Lua = @import("luajit").Lua;
-const ws = @import("../protocol/ws.zig");
-const lua_api = @import("../lua/lua_api.zig");
 const SseRegistry = @import("../protocol/sse.zig").SseRegistry;
 const config = @import("../util/config.zig");
 const params = @import("../http/params.zig");
@@ -1038,7 +1036,7 @@ pub const Connection = struct {
         if (self.state == .closing) return;
         self.state = .closing;
         // Decrement active connection counter
-        self.server.metrics.decrementActiveConnections();
+        _ = self.server.metrics.fetchSub(1, .monotonic);
         prom.connectionClosed();
         // If this was the last connection during drain, finish shutdown now
         // rather than waiting out the drain deadline.

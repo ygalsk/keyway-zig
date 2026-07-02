@@ -12,13 +12,8 @@ const log = @import("../observability/log.zig");
 const Lua = @import("luajit").Lua;
 const http = @import("../http/http.zig");
 const HttpExchange = @import("../http/http_exchange.zig").HttpExchange;
-const Router = @import("../http/router.zig").Router;
 const params = @import("../http/params.zig");
-const route_loader = @import("../http/route_loader.zig");
 const castUserdata = @import("../util/helpers.zig").castUserdata;
-
-// Re-export route table processing (now lives in route_loader.zig)
-pub const processRouteTable = route_loader.processRouteTable;
 
 // === HttpExchange Metatable ===
 
@@ -177,8 +172,7 @@ fn pushRequestHeadersTable(lua: *Lua, headers: []const http.Header) void {
 
 // === Headers Proxy (for ctx.headers["Key"] = "value") ===
 
-/// Public so LuaState can create cached instance
-pub const HeadersProxy = struct {
+const HeadersProxy = struct {
     exchange: *HttpExchange,
 };
 

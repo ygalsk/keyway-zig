@@ -15,16 +15,16 @@ const HttpExchange = @import("../http/http_exchange.zig").HttpExchange;
 const Router = @import("../http/router.zig").Router;
 const lua_api = @import("lua_api.zig");
 const lua_file_io = @import("lua_file_io.zig");
-const io_request = @import("../io/io_request.zig");
 const Connection = @import("../core/handler.zig").Connection;
 const castUserdata = @import("../util/helpers.zig").castUserdata;
 const helpers = @import("../util/helpers.zig");
 const SseRegistry = @import("../protocol/sse.zig").SseRegistry;
 const prom = @import("../observability/prom.zig");
 
-// zig-luajit marks resumeCoroutine as private — call C API directly.
-// Lua is an opaque type that maps 1:1 to lua_State*, so @ptrCast is safe.
+// zig-luajit marks resumeCoroutine/yieldCoroutine as private — call the C API
+// directly. Lua is an opaque type that maps 1:1 to lua_State*, so @ptrCast is safe.
 pub extern "c" fn lua_resume(L: *anyopaque, narg: c_int) c_int;
+extern "c" fn lua_yield(L: *anyopaque, nresults: c_int) c_int;
 
 // Embedded stdlib modules — compiled into the binary at build time.
 // Registered as package.preload["keyway.*"] so require() resolves without disk I/O.
@@ -173,7 +173,7 @@ pub const LuaState = struct {
     /// Process keyway.routes declarative table after script load.
     /// Walks the nested table and registers routes with the radix router.
     pub fn processRouteTable(self: *LuaState, router: *Router) !void {
-        try lua_api.processRouteTable(self.lua, router, self.allocator);
+        try @import("../http/route_loader.zig").processRouteTable(self.lua, router, self.allocator);
     }
 
     /// Process keyway.static declarative table after script load.
@@ -186,17 +186,6 @@ pub const LuaState = struct {
     /// Registers reverse proxy routes with the router.
     pub fn processProxyTable(self: *LuaState, router: *Router) !void {
         try @import("../http/route_loader.zig").processProxyTable(self.lua, router);
-    }
-
-    /// Call a Lua function by name
-    /// The function should be at the global scope
-    pub fn callGlobalFunction(self: *LuaState, name: [:0]const u8) !void {
-        _ = self.lua.getGlobal(name);
-        if (!self.lua.isFunction(-1)) {
-            self.lua.pop(1);
-            return error.NotAFunction;
-        }
-        try self.lua.callProtected(0, 0, 0); // 0 args, 0 results
     }
 
     /// Userdata variant for dispatchCoroutine — determines what gets pushed onto the thread stack.
@@ -376,7 +365,7 @@ pub const LuaState = struct {
     /// with *LuaState as upvalue. Must be called after init (needs stable *LuaState pointer).
     pub fn registerAsyncApi(self: *LuaState) void {
         const funcs = .{
-            .{ "__keyway_ws_send", io_request.keyway_ws_send },
+            .{ "__keyway_ws_send", keyway_ws_send },
             .{ "__keyway_sse_broadcast", keyway_sse_broadcast },
         };
 
@@ -385,6 +374,27 @@ pub const LuaState = struct {
             self.lua.pushCClosure(entry[1], 1);
             self.lua.setGlobal(entry[0]);
         }
+    }
+
+    /// __keyway_ws_send(data) → yields, resumes after WS frame is sent.
+    /// arg 1 = self (WsContext userdata, from ws:send() colon syntax), arg 2 = data string.
+    fn keyway_ws_send(lua: *Lua) callconv(.c) c_int {
+        const ud = lua.toUserdata(Lua.PseudoIndex.upvalue(1)) orelse {
+            lua.pushString("ws_send: expected LuaState upvalue");
+            lua.raiseError();
+            unreachable;
+        };
+        const state = castUserdata(LuaState, @as(?*anyopaque, ud));
+
+        const data = lua.toLString(2) catch {
+            lua.pushString("ws_send: data must be a string");
+            lua.raiseError();
+            return 0;
+        };
+
+        state.pending_ws_send = data;
+
+        return lua_yield(@ptrCast(lua), 0);
     }
 
     /// SSE broadcast C function: __keyway_sse_broadcast(room, data)
@@ -508,32 +518,6 @@ test "lua state initialization" {
     _ = state.lua.getGlobal("x");
     const value = state.lua.toInteger(-1);
     try std.testing.expectEqual(@as(i64, 42), value);
-    state.lua.pop(1);
-}
-
-test "lua function call" {
-    const allocator = std.testing.allocator;
-
-    var router = try Router.init(allocator);
-    defer router.deinit();
-
-    var state = try LuaState.init(allocator);
-    defer state.deinit();
-
-    // Define a simple function
-    try state.loadString(
-        \\function greet()
-        \\  message = "Hello from Lua"
-        \\end
-    );
-
-    // Call the function
-    try state.callGlobalFunction("greet");
-
-    // Verify it ran
-    _ = state.lua.getGlobal("message");
-    const msg = state.lua.toString(-1) catch unreachable;
-    try std.testing.expectEqualStrings("Hello from Lua", std.mem.span(msg));
     state.lua.pop(1);
 }
 

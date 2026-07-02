@@ -14,7 +14,6 @@ const SseBroadcastBus = sse.SseBroadcastBus;
 const ShutdownCoordinator = @import("shutdown.zig").ShutdownCoordinator;
 const FileWatcher = @import("../io/file_watcher.zig").FileWatcher;
 const tuning = @import("../util/config.zig");
-const WorkerMetrics = @import("../observability/metrics.zig").WorkerMetrics;
 const prom = @import("../observability/prom.zig");
 
 // TCP socket configuration
@@ -26,7 +25,6 @@ pub const Server = struct {
     allocator: std.mem.Allocator,
     loop: *xev.Loop,
     socket: std.posix.socket_t,
-    address: std.Io.net.IpAddress,
     accept_completion: xev.Completion,
     accept_cancel_completion: xev.Completion = .{},
     drain_timer_completion: ?*xev.Completion = null,
@@ -39,7 +37,7 @@ pub const Server = struct {
     lua_state: *LuaState,
     tls_ctx: ?TlsContext,
     sse_registry: ?*SseRegistry,
-    metrics: *WorkerMetrics,
+    metrics: *std.atomic.Value(u32),
     draining: bool = false,
     connections: Connection.List = .{},
 
@@ -63,7 +61,7 @@ pub const Server = struct {
         worker_id: u32,
         bpf_ready: ?*std.atomic.Value(bool),
         sse_registry: ?*SseRegistry,
-        metrics: *WorkerMetrics,
+        metrics: *std.atomic.Value(u32),
     ) !Server {
         // Parse address
         const addr = try std.Io.net.IpAddress.parse(config.host, config.port);
@@ -142,7 +140,6 @@ pub const Server = struct {
             .allocator = allocator,
             .loop = loop,
             .socket = socket,
-            .address = addr,
             .accept_completion = undefined,
             .router = router,
             .lua_state = lua_state,
@@ -196,7 +193,7 @@ pub const Server = struct {
         }
 
         // Connection limit: reject when over MAX_CONNECTIONS_PER_WORKER
-        if (self.metrics.active_connections.load(.monotonic) >= tuning.MAX_CONNECTIONS_PER_WORKER) {
+        if (self.metrics.load(.monotonic) >= tuning.MAX_CONNECTIONS_PER_WORKER) {
             helpers.closeFd(client_socket);
             prom.connectionRejected();
             self.acceptNext();
@@ -214,7 +211,7 @@ pub const Server = struct {
         };
 
         // Track active connections (for health endpoint and drain logging)
-        self.metrics.incrementActiveConnections();
+        _ = self.metrics.fetchAdd(1, .monotonic);
         prom.connectionAccepted();
 
         // Create connection handler
@@ -253,7 +250,7 @@ pub const Server = struct {
     /// instead of waiting out the full drain deadline. Cheap no-op otherwise.
     pub fn maybeFinishDrain(self: *Server) void {
         if (!self.draining or self.socket == -1) return;
-        if (self.metrics.active_connections.load(.monotonic) != 0) return;
+        if (self.metrics.load(.monotonic) != 0) return;
         if (self.coordinator) |coord| coord.getAsync(self.worker_id).notify() catch {};
     }
 
@@ -366,7 +363,7 @@ test "server init and deinit" {
         .port = 0, // Let OS assign port
     };
 
-    var test_metrics = WorkerMetrics.init();
+    var test_metrics = std.atomic.Value(u32).init(0);
     var server = try Server.init(allocator, &loop, server_config, &router, &lua_state, 1, 0, null, null, &test_metrics);
     defer server.deinit();
 }
