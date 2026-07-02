@@ -9,6 +9,7 @@
 
 const std = @import("std");
 const Lua = @import("luajit").Lua;
+const c = @import("luajit_c");
 const log = @import("../observability/log.zig");
 const http = @import("../http/http.zig");
 const HttpExchange = @import("../http/http_exchange.zig").HttpExchange;
@@ -20,11 +21,6 @@ const castUserdata = @import("../util/helpers.zig").castUserdata;
 const helpers = @import("../util/helpers.zig");
 const SseRegistry = @import("../protocol/sse.zig").SseRegistry;
 const prom = @import("../observability/prom.zig");
-
-// zig-luajit marks resumeCoroutine/yieldCoroutine as private — call the C API
-// directly. Lua is an opaque type that maps 1:1 to lua_State*, so @ptrCast is safe.
-pub extern "c" fn lua_resume(L: *anyopaque, narg: c_int) c_int;
-extern "c" fn lua_yield(L: *anyopaque, nresults: c_int) c_int;
 
 // Embedded stdlib modules — compiled into the binary at build time.
 // Registered as package.preload["keyway.*"] so require() resolves without disk I/O.
@@ -237,7 +233,7 @@ pub const LuaState = struct {
         } else {
             self.timing.route = "";
         }
-        const status = lua_resume(@ptrCast(thread), 1);
+        const status = c.lua_resume(@ptrCast(thread), 1);
 
         switch (status) {
             0 => {
@@ -311,7 +307,7 @@ pub const LuaState = struct {
         thread: *anyopaque,
         nresults: c_int,
     ) !HandlerResult {
-        const status = lua_resume(thread, nresults);
+        const status = c.lua_resume(@ptrCast(thread), nresults);
 
         switch (status) {
             0 => {
@@ -394,7 +390,7 @@ pub const LuaState = struct {
 
         state.pending_ws_send = data;
 
-        return lua_yield(@ptrCast(lua), 0);
+        return c.lua_yield(@ptrCast(lua), 0);
     }
 
     /// SSE broadcast C function: __keyway_sse_broadcast(room, data)

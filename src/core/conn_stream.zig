@@ -15,7 +15,7 @@ const HttpExchange = @import("../http/http_exchange.zig").HttpExchange;
 const http = @import("../http/http.zig");
 const castUserdata = @import("../util/helpers.zig").castUserdata;
 const Lua = @import("luajit").Lua;
-const lua_resume = @import("../lua/lua_state.zig").lua_resume;
+const c = @import("luajit_c");
 
 /// Stream connection state — set after successful stream upgrade.
 pub const StreamState = struct {
@@ -93,7 +93,7 @@ pub fn handleStreamPostWrite(self: *Connection) void {
     while (true) {
         // Resume coroutine (0 return values from yield)
         self.lua_state.current_connection = self;
-        const status = lua_resume(@ptrCast(thread), 0);
+        const status = c.lua_resume(@ptrCast(thread), 0);
         self.lua_state.current_connection = null;
 
         switch (status) {
