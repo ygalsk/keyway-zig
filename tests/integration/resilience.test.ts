@@ -4,7 +4,6 @@ import { resolve } from "path";
 const PROJECT_ROOT = resolve(import.meta.dir, "../..");
 const BINARY = resolve(PROJECT_ROOT, "zig-out/bin/keyway");
 const SCRIPT = resolve(PROJECT_ROOT, "tests/fixtures.lua");
-const base = () => globalThis.__KEYWAY_BASE;
 
 async function withServer(fn: (base: string) => Promise<void>) {
   const port = 10000 + Math.floor(Math.random() * 50000);
@@ -41,8 +40,10 @@ describe("worker resilience regressions", () => {
   // (#171)
   test.failing("POST /test/echo accepts a 100KB body", async () => {
     const body = "x".repeat(100 * 1024);
-    const res = await fetch(`${base()}/test/echo`, { method: "POST", body });
-    expect(res.status).toBe(200);
-    expect(await res.text()).toBe(body);
+    await withServer(async (url) => {
+      const res = await fetch(`${url}/test/echo`, { method: "POST", body });
+      expect(res.status).toBe(200);
+      expect(await res.text()).toBe(body);
+    });
   });
 });
