@@ -423,7 +423,10 @@ pub const LuaState = struct {
 
     /// Hot-reload: unref old routes, reset router, clear package.loaded, re-execute script.
     /// On script error: logs the error and leaves the router empty (all requests 404).
-    pub fn reload(self: *LuaState, router: *Router, script_path: []const u8) void {
+    /// Returns true on success, false on failure — callers use this to gate the
+    /// script-generation counter (see prom.scriptReloadSucceeded), since a
+    /// fire-and-forget reload otherwise leaves failures invisible (#117).
+    pub fn reload(self: *LuaState, router: *Router, script_path: []const u8) bool {
         // 1. Collect old lua_refs from router and unref each
         var refs: std.ArrayListUnmanaged(i32) = .empty;
         defer refs.deinit(self.allocator);
@@ -435,7 +438,7 @@ pub const LuaState = struct {
         // 2. Reset router (free trie + static routes)
         router.reset() catch |err| {
             log.err().string("msg", "reload: router reset failed").err(err).log();
-            return;
+            return false;
         };
 
         // 3. Clear package.loaded for non-stdlib modules
@@ -459,24 +462,25 @@ pub const LuaState = struct {
         // 4. Re-execute the entry point script
         self.loadScript(script_path) catch |err| {
             log.err().string("msg", "reload: script load failed").string("path", script_path).err(err).log();
-            return;
+            return false;
         };
 
         // 5. Rebuild route table from fresh keyway.routes
         self.processRouteTable(router) catch |err| {
             log.err().string("msg", "reload: processRouteTable failed").err(err).log();
-            return;
+            return false;
         };
         self.processStaticTable(router) catch |err| {
             log.err().string("msg", "reload: processStaticTable failed").err(err).log();
-            return;
+            return false;
         };
         self.processProxyTable(router) catch |err| {
             log.err().string("msg", "reload: processProxyTable failed").err(err).log();
-            return;
+            return false;
         };
 
         log.info().string("msg", "reload complete").string("script", script_path).log();
+        return true;
     }
 
     /// Clean up Lua state
