@@ -22,6 +22,16 @@ pub fn build(b: *std.Build) void {
         .optimize = optimize,
     });
 
+    // OpenSSL headers translated to a Zig module (Zig 0.16 moved C translation
+    // into the build system — no more inline @cImport).
+    const openssl_translate = b.addTranslateC(.{
+        .root_source_file = b.path("src/tls/openssl.h"),
+        .target = target,
+        .optimize = optimize,
+        .link_libc = true,
+    });
+    const openssl_mod = openssl_translate.createModule();
+
     // Main executable
     const exe = b.addExecutable(.{
         .name = "keyway",
@@ -31,7 +41,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    addSharedDeps(b, exe, libxev_dep, luajit_dep, metrics_dep, logz_dep);
+    addSharedDeps(b, exe, libxev_dep, luajit_dep, metrics_dep, logz_dep, openssl_mod);
 
     // Export all symbols so LuaRocks C modules can find Lua API functions
     // This is required for dynamically loaded .so modules to resolve symbols like lua_getmetatable
@@ -59,7 +69,7 @@ pub fn build(b: *std.Build) void {
             .optimize = optimize,
         }),
     });
-    addSharedDeps(b, exe_unit_tests, libxev_dep, luajit_dep, metrics_dep, logz_dep);
+    addSharedDeps(b, exe_unit_tests, libxev_dep, luajit_dep, metrics_dep, logz_dep, openssl_mod);
 
     const run_exe_unit_tests = b.addRunArtifact(exe_unit_tests);
     const test_step = b.step("test", "Run unit tests");
@@ -75,11 +85,13 @@ fn addSharedDeps(
     luajit_dep: *std.Build.Dependency,
     metrics_dep: *std.Build.Dependency,
     logz_dep: *std.Build.Dependency,
+    openssl_mod: *std.Build.Module,
 ) void {
     compile.root_module.addImport("xev", libxev_dep.module("xev"));
     compile.root_module.addImport("luajit", luajit_dep.module("luajit"));
     compile.root_module.addImport("metrics", metrics_dep.module("metrics"));
     compile.root_module.addImport("logz", logz_dep.module("logz"));
+    compile.root_module.addImport("openssl", openssl_mod);
     // Lua stdlib: lua/stdlib.zig uses @embedFile for sibling .lua files
     compile.root_module.addImport("stdlib", b.createModule(.{
         .root_source_file = b.path("lua/stdlib.zig"),

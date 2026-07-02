@@ -13,6 +13,6 @@ Read this before editing any `.zig` file. (Zig version + deps live in `build.zig
 - **Async-yield coroutine hack (WS/SSE/stream) — keep it.** zig-luajit marks `resumeCoroutine`/`yieldCoroutine` private. We declare `extern "c" fn lua_yield` and export `lua_resume` (both in `src/lua/lua_state.zig`), calling them via `@ptrCast(lua)` because `*Lua` maps 1:1 to `lua_State*`. Don't route this through the wrapper API.
 - **GCC 15 linker workaround — don't remove.** `link_gc_sections = true` in `build.zig`: GCC 15's `crt1.o` has `.sframe` sections with `R_X86_64_PC64` relocations that Zig's bundled lld can't handle; `--gc-sections` discards the unreferenced ones.
 - **`rdynamic` on the exe** (`build.zig`) exports symbols so Lua `.so` modules (LuaRocks) resolve at runtime. Don't drop it.
-- **OpenSSL is a system lib** — `linkSystemLibrary("ssl")` / `("crypto")` + inline `@cImport` in `src/tls/tls.zig`.
+- **OpenSSL is a system lib** — `linkSystemLibrary("ssl")` / `("crypto")` + `b.addTranslateC` on `src/tls/openssl.h` in `build.zig`, imported in `src/tls/tls.zig` as `@import("openssl")`.
 - **`std.debug.assert` is stripped in release builds.** Never use it as a runtime guard for conditions that can actually occur (bad input, ring overflow, null state) — use real error returns.
 - **Proactor rule (it bites here):** no blocking syscalls on the worker thread — no `std.net.tcpConnectToHost`, no blocking `read`/`pread`/`writeAll`. All I/O goes through libxev/io_uring. See MANIFEST.md.

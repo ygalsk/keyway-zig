@@ -2,15 +2,7 @@ const std = @import("std");
 const log = @import("../observability/log.zig");
 const config = @import("../util/config.zig");
 const helpers = @import("../util/helpers.zig");
-const c = @cImport({
-    @cInclude("openssl/ssl.h");
-    @cInclude("openssl/err.h");
-    @cInclude("openssl/bio.h");
-    @cInclude("openssl/hmac.h");
-    @cInclude("openssl/evp.h");
-    @cInclude("linux/tls.h");
-    @cInclude("netinet/tcp.h");
-});
+const c = @import("openssl");
 
 const ENCRYPT_BUF_SIZE = config.TLS_ENCRYPT_BUF_SIZE;
 
