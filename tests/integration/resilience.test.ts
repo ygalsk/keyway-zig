@@ -80,3 +80,56 @@ describe("connection close after error responses (#180)", () => {
     });
   });
 });
+
+describe("connection close semantics (#204)", () => {
+  // RFC 9112 §9.6: HTTP/1.0 defaults to close unless the client explicitly
+  // asked to keep-alive.
+  test("HTTP/1.0 with no Connection header closes (implicit close)", async () => {
+    await withServer(async ({ port }) => {
+      const { response, serverClosed } = await rawResponseAndClose(
+        port,
+        `GET /health HTTP/1.0\r\n\r\n`,
+      );
+      expect(response.split(" ")[1]).toBe("200");
+      expect(serverClosed).toBe(true);
+    });
+  });
+
+  // RFC 9112 §9.6: a client's `Connection: close` request header must be
+  // honored on ANY version, including success responses.
+  test("HTTP/1.1 with Connection: close closes after the response", async () => {
+    await withServer(async ({ port }) => {
+      const { response, serverClosed } = await rawResponseAndClose(
+        port,
+        `GET /health HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nConnection: close\r\n\r\n`,
+      );
+      expect(response.split(" ")[1]).toBe("200");
+      expect(serverClosed).toBe(true);
+    });
+  });
+
+  // Guard against over-closing: HTTP/1.0 with an explicit keep-alive request
+  // must NOT be closed by the server.
+  test("HTTP/1.0 with Connection: keep-alive stays open", async () => {
+    await withServer(async ({ port }) => {
+      const { response, serverClosed } = await rawResponseAndClose(
+        port,
+        `GET /health HTTP/1.0\r\nConnection: keep-alive\r\n\r\n`,
+      );
+      expect(response.split(" ")[1]).toBe("200");
+      expect(serverClosed).toBe(false);
+    });
+  });
+
+  // Control: HTTP/1.1 default (no Connection header) keeps the connection open.
+  test("HTTP/1.1 with no Connection header stays open (default keep-alive)", async () => {
+    await withServer(async ({ port }) => {
+      const { response, serverClosed } = await rawResponseAndClose(
+        port,
+        `GET /health HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n\r\n`,
+      );
+      expect(response.split(" ")[1]).toBe("200");
+      expect(serverClosed).toBe(false);
+    });
+  });
+});

@@ -59,6 +59,7 @@ pub const HttpState = struct {
     request_path: []const u8 = "",
     request_raw_len: usize = 0, // total bytes consumed by current request (headers + body)
     route_pattern: []const u8 = "", // matched route pattern for Prometheus labels (e.g. "/users/{id}")
+    wants_close: bool = false, // client asked to close, or HTTP/1.0 implicit close (#204)
 };
 
 /// Inbound TLS state — set once at connection init, persists across keep-alive.
@@ -589,6 +590,7 @@ pub const Connection = struct {
         self.http_state.request_method = request.method;
         self.http_state.request_path = clean_path;
         self.http_state.request_raw_len = request.raw_len;
+        self.http_state.wants_close = request.wants_close;
 
         // Parse query string and clear param cache for route matching
         self.query_cache.clear();
@@ -1020,8 +1022,11 @@ pub const Connection = struct {
         // instead of recycling (#180). pending_timer_ops/pending_io_ops may
         // still be non-zero (in-flight completions), so close() ->
         // maybeFinishClose() defers deinit until they drain.
-        // (Honoring the *client's* Connection: close request header on success
-        // responses is separate — deferred to #204.)
+        // (Honoring the *client's* Connection: close request header — and the
+        // HTTP/1.0 implicit-close default — on success responses is handled
+        // in handleHttpPostWrite via http_state.wants_close, not here: this
+        // check runs before the state switch, so it would wrongly close a
+        // WS/SSE/stream upgrade response too. See #204.)
         if (self.timed_out or self.close_after_write) {
             self.close();
             return .disarm;
@@ -1112,6 +1117,15 @@ pub const Connection = struct {
 
         // During drain: close keep-alive connections after current request completes
         if (self.server.draining) {
+            self.close();
+            return;
+        }
+
+        // Client asked to close (Connection: close), or HTTP/1.0 implicit
+        // close (#204) — close instead of recycling for keep-alive. No
+        // `Connection: close` response header is added; the client already
+        // initiated the close expectation.
+        if (self.http_state.wants_close) {
             self.close();
             return;
         }
