@@ -320,6 +320,13 @@ pub fn registerHttpExchangeMetatable(lua: *Lua) void {
 
 // === Keyway Module ===
 
+/// __keyway_log_middleware_error(msg) — see registerKeywayModule.
+fn logMiddlewareError(lua: *Lua) callconv(.c) c_int {
+    const msg = lua.toString(1) catch "unknown error";
+    log.err().string("msg", "middleware error").string("error", std.mem.span(msg)).log();
+    return 0;
+}
+
 /// Register the keyway module with Lua
 /// Creates global `keyway` table (script assigns keyway.routes = {...})
 pub fn registerKeywayModule(lua: *Lua) void {
@@ -329,6 +336,12 @@ pub fn registerKeywayModule(lua: *Lua) void {
     // Create empty keyway table (script populates keyway.routes)
     lua.createTable(0, 1);
     lua.setGlobal("keyway");
+
+    // A misbehaving middleware is caught here via pcall (so it can't unwind
+    // the whole coroutine, see #186) but the error must still be surfaced —
+    // routed through Zig's logger, not io.stderr:write (Lua never does I/O, #227).
+    lua.pushCFunction(logMiddlewareError);
+    lua.setGlobal("__keyway_log_middleware_error");
 
     // Register middleware chain builder as a global helper
     lua.doString(
@@ -340,7 +353,7 @@ pub fn registerKeywayModule(lua: *Lua) void {
         \\        chain = function(ctx)
         \\            local ok, err = pcall(mw, ctx, function() next_fn(ctx) end)
         \\            if not ok then
-        \\                io.stderr:write("middleware error: " .. tostring(err) .. "\n")
+        \\                __keyway_log_middleware_error(tostring(err))
         \\                ctx.status = 500
         \\                ctx.body = "Internal Server Error"
         \\            end

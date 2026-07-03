@@ -80,12 +80,12 @@ pub const LuaState = struct {
         lua.openTableLib();
         lua.openMathLib();
         lua.openPackageLib();
-        lua.openIOLib(); // Required for LuaRocks to load modules from disk
-        lua.openOSLib(); // Required for some LuaRocks modules (time, execute, etc.)
-        lua.openDebugLib(); // Required for some LuaRocks modules (debug introspection)
-        lua.openBitLib(); // Required for pgmoon and other LuaJIT modules (bit operations)
-        lua.openJITLib(); // Required for JIT control (jit.on/off, jit.opt, etc.)
-        lua.openFFILib(); // Required for FFI (ffi.cdef, ffi.C, ffi.new, etc.)
+        lua.openDebugLib(); // Error tracebacks — not an I/O capability, kept
+        lua.openJITLib(); // JIT control (jit.on/off, jit.opt, etc.) — the compiler itself
+
+        // io/os/bit/ffi are deliberately NOT opened: Lua never does I/O (#227).
+        // require() loads modules via C luaL_loadfile, not the Lua `io` table,
+        // so disk-based requires and LuaRocks still work without it.
 
         // Register keyway module (must be done before creating userdata)
         lua_api.registerKeywayModule(lua);
@@ -99,41 +99,21 @@ pub const LuaState = struct {
         lua.pushCFunction(json.jsonDecode);
         lua.setGlobal("__keyway_json_decode");
 
+        // Register the monotonic clock C function (used by lua/response.lua's
+        // now_us() — used to go through ffi.C.clock_gettime, but ffi isn't
+        // opened anymore, #227).
+        lua.pushCFunction(keywayNowUs);
+        lua.setGlobal("__keyway_now_us");
+
         // Create reusable coroutine thread (avoids lua_newThread per request)
         const cached_thread = lua.newThread();
         const cached_thread_ref = lua.ref(Lua.PseudoIndex.Registry);
 
-        // Configure package.path for app-local requires and LuaRocks.
+        // Configure package.path/cpath for app-local requires and LuaRocks.
         // Stdlib modules are preloaded (above), so no scripts/ prefix needed.
-        // KEYWAY_LUA_PATH / KEYWAY_LUA_CPATH override defaults if set.
-        lua.doString(
-            \\local custom_path = os.getenv("KEYWAY_LUA_PATH")
-            \\local custom_cpath = os.getenv("KEYWAY_LUA_CPATH")
-            \\if custom_path then
-            \\    package.path = custom_path .. ";" .. package.path
-            \\else
-            \\    local home = os.getenv("HOME") or ""
-            \\    package.path = "./?.lua;./?/init.lua;"
-            \\        .. home .. "/.luarocks/share/lua/5.1/?.lua;"
-            \\        .. home .. "/.luarocks/share/lua/5.1/?/init.lua;"
-            \\        .. "/usr/share/lua/5.1/?.lua;"
-            \\        .. "/usr/share/lua/5.1/?/init.lua;"
-            \\        .. package.path
-            \\end
-            \\if custom_cpath then
-            \\    package.cpath = custom_cpath .. ";" .. package.cpath
-            \\else
-            \\    local home = os.getenv("HOME") or ""
-            \\    package.cpath = home .. "/.luarocks/lib/lua/5.1/?.so;"
-            \\        .. "/usr/lib/lua/5.1/?.so;"
-            \\        .. "/usr/lib64/lua/5.1/?.so;"
-            \\        .. "/usr/share/lua/5.1/?.so;"
-            \\        .. "/usr/local/lib/lua/5.1/?.so;"
-            \\        .. package.cpath
-            \\end
-        ) catch |err| {
-            log.warn().string("msg", "failed to configure Lua package paths").err(err).log();
-        };
+        // KEYWAY_LUA_PATH / KEYWAY_LUA_CPATH override defaults if set. Built
+        // in Zig, not via os.getenv — the os lib isn't opened anymore (#227).
+        configurePackagePaths(lua, allocator);
 
         return LuaState{
             .lua = lua,
@@ -427,6 +407,75 @@ pub const LuaState = struct {
         lua.pop(2); // pop preload + package
     }
 
+    /// __keyway_now_us() → monotonic microseconds. Backs lua/response.lua's
+    /// now_us(), which used to read CLOCK_MONOTONIC directly via ffi (#227).
+    fn keywayNowUs(lua: *Lua) callconv(.c) c_int {
+        const us = @divTrunc(helpers.monotonicNanos(), std.time.ns_per_us);
+        lua.pushNumber(@floatFromInt(us));
+        return 1;
+    }
+
+    /// Configure package.path/cpath for app-local requires and LuaRocks.
+    /// Stdlib modules are preloaded (registerEmbeddedModules), so no scripts/
+    /// prefix is needed here. KEYWAY_LUA_PATH / KEYWAY_LUA_CPATH override the
+    /// defaults if set. Built in Zig (not os.getenv) — os isn't opened (#227).
+    fn configurePackagePaths(lua: *Lua, allocator: std.mem.Allocator) void {
+        _ = lua.getGlobal("package"); // stack: [package]
+
+        setPackagePath(lua, allocator) catch |err| {
+            log.warn().string("msg", "failed to configure Lua package.path").err(err).log();
+        };
+        setPackageCpath(lua, allocator) catch |err| {
+            log.warn().string("msg", "failed to configure Lua package.cpath").err(err).log();
+        };
+
+        lua.pop(1); // pop package table
+    }
+
+    fn setPackagePath(lua: *Lua, allocator: std.mem.Allocator) !void {
+        _ = lua.getField(-1, "path"); // stack: [package, old_path]
+        errdefer lua.pop(1); // keep the stack balanced if allocPrint below fails (OOM)
+        const old_path = lua.toLString(-1) catch "";
+
+        const new_path = if (helpers.getenv("KEYWAY_LUA_PATH")) |custom|
+            try std.fmt.allocPrint(allocator, "{s};{s}", .{ custom, old_path })
+        else blk: {
+            const home = helpers.getenv("HOME") orelse "";
+            break :blk try std.fmt.allocPrint(
+                allocator,
+                "./?.lua;./?/init.lua;{0s}/.luarocks/share/lua/5.1/?.lua;{0s}/.luarocks/share/lua/5.1/?/init.lua;/usr/share/lua/5.1/?.lua;/usr/share/lua/5.1/?/init.lua;{1s}",
+                .{ home, old_path },
+            );
+        };
+        defer allocator.free(new_path);
+
+        lua.pop(1); // pop old_path, stack: [package]
+        lua.pushLString(new_path); // stack: [package, new_path]
+        lua.setField(-2, "path"); // package.path = new_path, pops new_path
+    }
+
+    fn setPackageCpath(lua: *Lua, allocator: std.mem.Allocator) !void {
+        _ = lua.getField(-1, "cpath"); // stack: [package, old_cpath]
+        errdefer lua.pop(1); // keep the stack balanced if allocPrint below fails (OOM)
+        const old_cpath = lua.toLString(-1) catch "";
+
+        const new_cpath = if (helpers.getenv("KEYWAY_LUA_CPATH")) |custom|
+            try std.fmt.allocPrint(allocator, "{s};{s}", .{ custom, old_cpath })
+        else blk: {
+            const home = helpers.getenv("HOME") orelse "";
+            break :blk try std.fmt.allocPrint(
+                allocator,
+                "{0s}/.luarocks/lib/lua/5.1/?.so;/usr/lib/lua/5.1/?.so;/usr/lib64/lua/5.1/?.so;/usr/share/lua/5.1/?.so;/usr/local/lib/lua/5.1/?.so;{1s}",
+                .{ home, old_cpath },
+            );
+        };
+        defer allocator.free(new_cpath);
+
+        lua.pop(1); // pop old_cpath, stack: [package]
+        lua.pushLString(new_cpath); // stack: [package, new_cpath]
+        lua.setField(-2, "cpath"); // package.cpath = new_cpath, pops new_cpath
+    }
+
     /// Hot-reload: unref old routes, reset router, clear package.loaded, re-execute script.
     /// On script error: logs the error and leaves the router empty (all requests 404).
     /// Returns true on success, false on failure — callers use this to gate the
@@ -451,9 +500,9 @@ pub const LuaState = struct {
         self.lua.doString(
             \\local keep = {
             \\    ["keyway"] = true, ["keyway.response"] = true,
-            \\    ["string"] = true, ["table"] = true, ["math"] = true, ["io"] = true,
-            \\    ["os"] = true, ["debug"] = true, ["coroutine"] = true, ["package"] = true,
-            \\    ["bit"] = true, ["ffi"] = true, ["jit"] = true, ["jit.opt"] = true,
+            \\    ["string"] = true, ["table"] = true, ["math"] = true,
+            \\    ["debug"] = true, ["coroutine"] = true, ["package"] = true,
+            \\    ["jit"] = true, ["jit.opt"] = true,
             \\    ["jit.util"] = true, ["keyway.json"] = true,
             \\}
             \\for name in pairs(package.loaded) do
@@ -602,6 +651,55 @@ test "embedded stdlib modules are preloaded" {
     // All embedded modules should be available in package.preload
     try state.loadString("assert(type(package.preload['keyway.response']) == 'function')");
     try state.loadString("assert(type(package.preload['keyway.json']) == 'function')");
+}
+
+test "capability surface: io/os/bit/ffi are not loaded (#227)" {
+    const allocator = std.testing.allocator;
+
+    var state = try LuaState.init(allocator);
+    defer state.deinit();
+
+    // Lua never does I/O — these libs are the escape hatches that would let
+    // route scripts bypass the proactor. Nothing in the codebase uses them
+    // (see #227), so they must not be opened at all.
+    try state.loadString(
+        \\assert(io == nil, 'io')
+        \\assert(os == nil, 'os')
+        \\assert(bit == nil, 'bit')
+        \\assert(package.loaded.ffi == nil and ffi == nil, 'ffi')
+    );
+}
+
+test "package.path keeps default search dirs without os.getenv (#227)" {
+    const allocator = std.testing.allocator;
+
+    var state = try LuaState.init(allocator);
+    defer state.deinit();
+
+    // package.path/cpath are now assembled in Zig (no os.getenv) — confirm
+    // the same default search dirs (app-local + LuaRocks) still land.
+    try state.loadString(
+        \\assert(package.path:find("./?.lua", 1, true) ~= nil, "missing ./?.lua")
+        \\assert(package.path:find(".luarocks/share/lua/5.1", 1, true) ~= nil, "missing luarocks share dir")
+        \\assert(package.cpath:find(".luarocks/lib/lua/5.1", 1, true) ~= nil, "missing luarocks cpath dir")
+    );
+}
+
+test "now_us works via keyway.response without ffi (#227)" {
+    const allocator = std.testing.allocator;
+
+    var state = try LuaState.init(allocator);
+    defer state.deinit();
+
+    // now_us() used to shell out to ffi.C.clock_gettime; it's now backed by
+    // a Zig C function. Also proves require() of a pure-Lua module still
+    // works with the io/os/bit/ffi libs gone.
+    try state.loadString(
+        \\local response = require("keyway.response")
+        \\local t = response.now_us()
+        \\assert(type(t) == "number", "now_us must return a number")
+        \\assert(t > 0, "now_us must be positive")
+    );
 }
 
 test "middleware execution order" {
