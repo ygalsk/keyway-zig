@@ -3,7 +3,9 @@
 
 /// Read buffer for inbound HTTP data (headers + body) — the hard cap on
 /// request size, since the buffer never grows. A request that doesn't fit
-/// gets 413.
+/// gets 413. Also the recv buffer post-WS-upgrade, so this is the effective
+/// ceiling on a single WS frame's payload — see ws.zig's
+/// MAX_SINGLE_FRAME_PAYLOAD (#228).
 pub const READ_BUFFER_SIZE = 65536;
 
 /// Ciphertext receive buffer for inbound TLS connections.
