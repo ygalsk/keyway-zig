@@ -209,10 +209,13 @@ pub const Parser = struct {
         // RFC 7230 §3.3.2 — the final coding is what determines chunked-ness).
         var content_length: ?usize = null;
         var transfer_encoding: ?[]const u8 = null;
+        var host_count: usize = 0;
         for (0..num_headers) |i| {
             const h = c_headers[i];
             const name = h.name[0..h.name_len];
-            if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+            if (std.ascii.eqlIgnoreCase(name, "host")) {
+                host_count += 1;
+            } else if (std.ascii.eqlIgnoreCase(name, "content-length")) {
                 const val = h.value[0..h.value_len];
                 if (!isDigitsOnly(val)) {
                     self.allocator.free(headers);
@@ -233,6 +236,13 @@ pub const Parser = struct {
             } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
                 transfer_encoding = h.value[0..h.value_len];
             }
+        }
+
+        // RFC 9112 §3.2: an HTTP/1.1 request MUST have exactly one Host header.
+        // HTTP/1.0 has no such requirement.
+        if (minor_version == 1 and host_count != 1) {
+            self.allocator.free(headers);
+            return error.InvalidRequest;
         }
 
         // A request with both headers is the classic CL.TE/TE.CL smuggling
@@ -471,6 +481,25 @@ test "http parser - rejects Transfer-Encoding with non-chunked final coding" {
     const request = "POST /test HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked, gzip\r\n\r\n4\r\nping\r\n0\r\n\r\n";
     const result = parser.parseRequest(request);
     try std.testing.expectError(error.InvalidRequest, result);
+}
+
+test "http parser - rejects HTTP/1.1 request with no Host header" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+
+    const request = "GET /test HTTP/1.1\r\nUser-Agent: test\r\n\r\n";
+    const result = parser.parseRequest(request);
+    try std.testing.expectError(error.InvalidRequest, result);
+}
+
+test "http parser - HTTP/1.0 request with no Host header parses OK" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+
+    const request = "GET /test HTTP/1.0\r\nUser-Agent: test\r\n\r\n";
+    const request_result = try parser.parseRequest(request);
+    defer allocator.free(request_result.headers);
+    try std.testing.expectEqualStrings("/test", request_result.path);
 }
 
 test "serialize no longer special-cases 101 — a tenant ctx.status=101 is framed, not desynced (#194)" {
