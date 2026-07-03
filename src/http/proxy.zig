@@ -408,7 +408,7 @@ fn onProxyUpstreamRecv(
 /// True if `headers`' final Transfer-Encoding coding is "chunked" (RFC 7230
 /// §3.3.2/§3.3.3: repeated TE headers combine, so the *last* header's *last*
 /// comma-separated token is what determines chunked-ness). Mirrors the
-/// identical check in Parser.parseRequest, duplicated here rather than
+/// identical check in parseRequest, duplicated here rather than
 /// shared: that one operates inline over raw picohttpparser output while
 /// parsing a request, this one over an already-parsed Header slice.
 fn isChunkedResponse(headers: []const http.Header) bool {
@@ -445,8 +445,7 @@ fn forwardProxyResponse(self: *Connection) void {
         return;
     }
 
-    var parser = http.Parser.init(self.base_allocator);
-    const head = parser.parseResponseHead(ps.response.items) catch {
+    const head = http.parseResponseHead(self.base_allocator, ps.response.items) catch {
         proxyFail(self, 502, "proxy upstream invalid response");
         return;
     };

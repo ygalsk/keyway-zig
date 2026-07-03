@@ -569,8 +569,7 @@ pub const Connection = struct {
     /// error response / scheduling another read).
     fn parseRequest(self: *Connection) !http.Request {
         const request_data = self.read_buffer.readSlice();
-        var parser = http.Parser.init(self.arena.allocator());
-        const request = parser.parseRequest(request_data) catch |err| {
+        const request = http.parseRequest(self.arena.allocator(), request_data) catch |err| {
             if (err == error.Incomplete) {
                 self.startRead();
             } else {
@@ -895,10 +894,6 @@ pub const Connection = struct {
         try response.serialize(&response_buf.writer);
         const response_bytes = response_buf.writer.buffered();
 
-        if (self.ws_state != null) {
-            log.debug().string("msg", "ws response buf").int("len", response_bytes.len).string("content", response_bytes).log();
-        }
-
         self.submitSend(self.stripBodyForHead(response_bytes), onWrite, false);
     }
 
@@ -965,12 +960,8 @@ pub const Connection = struct {
             return;
         };
         const body = allocating_writer.writer.buffered();
-        const header = std.fmt.allocPrint(alloc, "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {d}\r\n\r\n", .{body.len}) catch {
-            error_response.sendError(self, .server_error, "metrics header failed");
-            return;
-        };
-        const full = std.mem.concat(alloc, u8, &.{ header, body }) catch {
-            error_response.sendError(self, .server_error, "metrics concat failed");
+        const full = std.fmt.allocPrint(alloc, "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch {
+            error_response.sendError(self, .server_error, "metrics response failed");
             return;
         };
         self.logAccess(200);
@@ -1050,7 +1041,7 @@ pub const Connection = struct {
             self.close();
             return;
         }
-        log.debug().string("msg", "ws 101 sent, entering WS mode").int("bytes_written", bytes_written).int("raw_len", self.http_state.request_raw_len).int("buf_avail_read", self.read_buffer.availableRead()).int("buf_avail_write", self.read_buffer.availableWrite()).log();
+        _ = bytes_written;
         _ = self.arena.reset(.retain_capacity);
         if (self.http_state.request_raw_len > 0) {
             self.read_buffer.consume(self.http_state.request_raw_len);
@@ -1058,7 +1049,6 @@ pub const Connection = struct {
         } else {
             self.read_buffer.reset();
         }
-        log.debug().string("msg", "ws starting read loop").int("buf_avail_read", self.read_buffer.availableRead()).int("buf_avail_write", self.read_buffer.availableWrite()).log();
         // If the client sent WS data in the same TCP segment as the HTTP
         // upgrade request, process it now instead of waiting for another recv.
         if (self.read_buffer.availableRead() > 0) {
@@ -1188,51 +1178,5 @@ pub const Connection = struct {
         if (self.state == .closing and self.pending_timer_ops == 0 and self.pending_io_ops == 0) {
             self.deinit(self.base_allocator);
         }
-    }
-
-    // =========================================================================
-    // Tests
-    // =========================================================================
-
-    test "maybeFinishClose: does not deinit when pending_io_ops > 0" {
-        // We can only test the guard logic without a real allocator/connection.
-        const conn = struct {
-            state: State,
-            pending_timer_ops: u8,
-            pending_io_ops: u8,
-        }{
-            .state = .closing,
-            .pending_timer_ops = 0,
-            .pending_io_ops = 1,
-        };
-        // Guard: closing with pending_io_ops == 1 must NOT deinit
-        try std.testing.expect(!(conn.state == .closing and conn.pending_timer_ops == 0 and conn.pending_io_ops == 0));
-    }
-
-    test "maybeFinishClose: condition met when closing and no pending ops" {
-        const conn = struct {
-            state: State,
-            pending_timer_ops: u8,
-            pending_io_ops: u8,
-        }{
-            .state = .closing,
-            .pending_timer_ops = 0,
-            .pending_io_ops = 0,
-        };
-        // Guard: closing with both counters at 0 SHOULD deinit
-        try std.testing.expect(conn.state == .closing and conn.pending_timer_ops == 0 and conn.pending_io_ops == 0);
-    }
-
-    test "maybeFinishClose: does not deinit when not closing" {
-        const conn = struct {
-            state: State,
-            pending_timer_ops: u8,
-            pending_io_ops: u8,
-        }{
-            .state = .processing,
-            .pending_timer_ops = 0,
-            .pending_io_ops = 0,
-        };
-        try std.testing.expect(!(conn.state == .closing and conn.pending_timer_ops == 0 and conn.pending_io_ops == 0));
     }
 };

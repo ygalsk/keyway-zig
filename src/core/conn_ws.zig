@@ -55,7 +55,7 @@ pub fn handleWsUpgrade(conn: *Connection, exchange: *HttpExchange, request: *con
 
     // RFC 6455 §4.4: on an unsupported version, respond 426 with the
     // version we support instead of failing the handshake generically.
-    const version_hdr = http.Parser.getHeader(request, "Sec-WebSocket-Version");
+    const version_hdr = http.getHeader(request, "Sec-WebSocket-Version");
     const version = if (version_hdr) |v| std.mem.trim(u8, v, " \t") else null;
     if (version == null or !std.mem.eql(u8, version.?, "13")) {
         // Raw response: the engine authors this handshake reply and it carries an
@@ -71,14 +71,14 @@ pub fn handleWsUpgrade(conn: *Connection, exchange: *HttpExchange, request: *con
 
     // RFC 6455 §4.2.1 rules 5-6: Upgrade/Connection headers must carry the
     // upgrade tokens (case-insensitive, possibly comma-separated).
-    const upgrade_hdr = http.Parser.getHeader(request, "Upgrade") orelse return error.MissingUpgradeHeader;
+    const upgrade_hdr = http.getHeader(request, "Upgrade") orelse return error.MissingUpgradeHeader;
     if (!headerHasToken(upgrade_hdr, "websocket")) return error.InvalidUpgradeHeader;
 
-    const connection_hdr = http.Parser.getHeader(request, "Connection") orelse return error.MissingConnectionHeader;
+    const connection_hdr = http.getHeader(request, "Connection") orelse return error.MissingConnectionHeader;
     if (!headerHasToken(connection_hdr, "upgrade")) return error.InvalidConnectionHeader;
 
     // Validate Sec-WebSocket-Key header
-    const sec_key = http.Parser.getHeader(request, "Sec-WebSocket-Key") orelse {
+    const sec_key = http.getHeader(request, "Sec-WebSocket-Key") orelse {
         return error.MissingWebSocketKey;
     };
 

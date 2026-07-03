@@ -333,14 +333,14 @@ pub fn serveStaticFile(
     // Check If-None-Match (use already-parsed headers, not raw buffer).
     // If-None-Match takes precedence over If-Modified-Since (RFC 7232 §6):
     // when present but not matching, serve full — do not consult IMS.
-    if (http.Parser.getHeader(request, "If-None-Match")) |inm| {
+    if (http.getHeader(request, "If-None-Match")) |inm| {
         if (ifNoneMatchMatches(inm, etag)) {
             helpers.closeFd(fd);
             self.logAccess(304);
             self.sendRawResponse("HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\n\r\n");
             return;
         }
-    } else if (http.Parser.getHeader(request, "If-Modified-Since")) |ims| {
+    } else if (http.getHeader(request, "If-Modified-Since")) |ims| {
         if (parseHttpDate(ims)) |ims_secs| {
             if (mtime_sec <= ims_secs) {
                 helpers.closeFd(fd);

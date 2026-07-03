@@ -205,19 +205,3 @@ test "parseLogFormat valid values" {
     try std.testing.expectEqual(Config.LogFormat.json, parseLogFormat("json").?);
     try std.testing.expectEqual(@as(?Config.LogFormat, null), parseLogFormat("invalid"));
 }
-
-test "parse returns defaults when no args or env vars" {
-    // parse() reads real process args — the test runner passes its own flags
-    // which the CLI parser rejects. Verify defaults via struct init instead.
-    const c = Config{};
-    try std.testing.expectEqual(@as(u16, 8080), c.port);
-    try std.testing.expectEqualStrings("0.0.0.0", c.host);
-}
-
-test "env var fallback for KEYWAY_PORT" {
-    // Verify the default port when KEYWAY_PORT is not set.
-    if (helpers.getenv("KEYWAY_PORT") == null) {
-        const c = Config{};
-        try std.testing.expectEqual(@as(u16, 8080), c.port);
-    }
-}

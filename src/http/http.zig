@@ -25,30 +25,22 @@ pub const Request = struct {
 pub const Response = struct {
     allocator: std.mem.Allocator,
     status: u16 = 200,
-    headers: ?std.ArrayList(Header) = null,  // Lazy init - null until first header added
+    headers: std.ArrayList(Header) = .empty,
     body: []const u8 = "",
 
     pub fn init(allocator: std.mem.Allocator) Response {
         return Response{
             .allocator = allocator,
-            .headers = null,  // No ArrayList overhead until needed
         };
     }
 
     pub fn deinit(self: *Response) void {
-        if (self.headers) |*h| {
-            h.deinit(self.allocator);
-        }
+        self.headers.deinit(self.allocator);
     }
 
     /// Add a header to the response (O(1) amortized)
-    /// Lazily initializes ArrayList on first header addition
     pub fn addHeader(self: *Response, name: []const u8, value: []const u8) !void {
-        if (self.headers == null) {
-            // First header - initialize with capacity for typical case (4 headers)
-            self.headers = try std.ArrayList(Header).initCapacity(self.allocator, 4);
-        }
-        try self.headers.?.append(self.allocator, Header{ .name = name, .value = value });
+        try self.headers.append(self.allocator, Header{ .name = name, .value = value });
     }
 
     /// Comptime-generated status line table indexed by HTTP status code.
@@ -76,13 +68,11 @@ pub const Response = struct {
         const code: usize = @min(self.status, status_lines.len - 1);
         try writer.writeAll(status_lines[code]);
 
-        if (self.headers) |h| {
-            for (h.items) |header| {
-                if (isEngineOwnedHeader(header.name)) continue;
-                if (std.mem.indexOfAny(u8, header.name, "\r\n") != null) continue;
-                if (std.mem.indexOfAny(u8, header.value, "\r\n") != null) continue;
-                try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
-            }
+        for (self.headers.items) |header| {
+            if (isEngineOwnedHeader(header.name)) continue;
+            if (std.mem.indexOfAny(u8, header.name, "\r\n") != null) continue;
+            if (std.mem.indexOfAny(u8, header.value, "\r\n") != null) continue;
+            try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
         }
 
         try writer.writeAll("Transfer-Encoding: chunked\r\n\r\n");
@@ -94,14 +84,12 @@ pub const Response = struct {
         const code: usize = @min(self.status, status_lines.len - 1);
         try writer.writeAll(status_lines[code]);
 
-        // Headers (only if ArrayList was initialized)
-        if (self.headers) |h| {
-            for (h.items) |header| {
-                if (isEngineOwnedHeader(header.name)) continue;
-                if (std.mem.indexOfAny(u8, header.name, "\r\n") != null) continue;
-                if (std.mem.indexOfAny(u8, header.value, "\r\n") != null) continue;
-                try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
-            }
+        // Headers
+        for (self.headers.items) |header| {
+            if (isEngineOwnedHeader(header.name)) continue;
+            if (std.mem.indexOfAny(u8, header.name, "\r\n") != null) continue;
+            if (std.mem.indexOfAny(u8, header.value, "\r\n") != null) continue;
+            try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
         }
 
         // RFC 9110 §6.4.1 / §15.3.5: 1xx, 204, and 304 responses carry no body.
@@ -153,254 +141,245 @@ fn isDigitsOnly(s: []const u8) bool {
     return true;
 }
 
-/// HTTP parser using picohttpparser
-pub const Parser = struct {
-    allocator: std.mem.Allocator,
+/// Parse HTTP request from buffer
+/// Returns Request on success, error.Incomplete if partial, or other error
+pub fn parseRequest(allocator: std.mem.Allocator, buf: []const u8) !Request {
+    // Prepare C API parameters
+    var method_ptr: [*c]const u8 = undefined;
+    var method_len: usize = 0;
+    var path_ptr: [*c]const u8 = undefined;
+    var path_len: usize = 0;
+    var minor_version: c_int = 0;
 
-    pub fn init(allocator: std.mem.Allocator) Parser {
-        return Parser{ .allocator = allocator };
+    // Allocate space for headers (max from config)
+    const max_headers: usize = config.MAX_HEADERS;
+    var c_headers: [max_headers]c.struct_phr_header = undefined;
+    var num_headers: usize = max_headers;
+
+    // Call picohttpparser
+    const result = c.phr_parse_request(
+        buf.ptr,
+        buf.len,
+        @ptrCast(&method_ptr),
+        &method_len,
+        @ptrCast(&path_ptr),
+        &path_len,
+        &minor_version,
+        &c_headers,
+        &num_headers,
+        0, // last_len (0 for first parse)
+    );
+
+    if (result == -2) {
+        return error.Incomplete; // Need more data
+    }
+    if (result == -1) {
+        return error.InvalidRequest;
     }
 
-    /// Parse HTTP request from buffer
-    /// Returns Request on success, error.Incomplete if partial, or other error
-    pub fn parseRequest(self: *Parser, buf: []const u8) !Request {
-        // Prepare C API parameters
-        var method_ptr: [*c]const u8 = undefined;
-        var method_len: usize = 0;
-        var path_ptr: [*c]const u8 = undefined;
-        var path_len: usize = 0;
-        var minor_version: c_int = 0;
+    // Convert to Zig slices (zero-copy - pointers into buf)
+    const method = method_ptr[0..method_len];
+    const path = path_ptr[0..path_len];
 
-        // Allocate space for headers (max from config)
-        const max_headers: usize = config.MAX_HEADERS;
-        var c_headers: [max_headers]c.struct_phr_header = undefined;
-        var num_headers: usize = max_headers;
+    // Convert headers
+    var headers = try allocator.alloc(Header, num_headers);
+    for (0..num_headers) |i| {
+        const h = c_headers[i];
+        headers[i] = Header{
+            .name = h.name[0..h.name_len],
+            .value = h.value[0..h.value_len],
+        };
+    }
 
-        // Call picohttpparser
-        const result = c.phr_parse_request(
-            buf.ptr,
-            buf.len,
-            @ptrCast(&method_ptr),
-            &method_len,
-            @ptrCast(&path_ptr),
-            &path_len,
-            &minor_version,
-            &c_headers,
-            &num_headers,
-            0, // last_len (0 for first parse)
-        );
+    // Body: use Content-Length to determine exact body boundaries.
+    // Without this, leftover body bytes corrupt the next keep-alive request.
+    const bytes_consumed = @as(usize, @intCast(result));
 
-        if (result == -2) {
-            return error.Incomplete; // Need more data
-        }
-        if (result == -1) {
-            return error.InvalidRequest;
-        }
-
-        // Convert to Zig slices (zero-copy - pointers into buf)
-        const method = method_ptr[0..method_len];
-        const path = path_ptr[0..path_len];
-
-        // Convert headers
-        var headers = try self.allocator.alloc(Header, num_headers);
-        for (0..num_headers) |i| {
-            const h = c_headers[i];
-            headers[i] = Header{
-                .name = h.name[0..h.name_len],
-                .value = h.value[0..h.value_len],
-            };
-        }
-
-        // Body: use Content-Length to determine exact body boundaries.
-        // Without this, leftover body bytes corrupt the next keep-alive request.
-        const bytes_consumed = @as(usize, @intCast(result));
-
-        // Single pass over headers: collect Content-Length (rejecting malformed
-        // values and duplicates whose parsed values disagree), the value of
-        // the last Transfer-Encoding header (repeated TE headers combine per
-        // RFC 7230 §3.3.2 — the final coding is what determines chunked-ness),
-        // and Connection: close/keep-alive tokens (#204) — OR'd across any
-        // repeated Connection headers.
-        var content_length: ?usize = null;
-        var transfer_encoding: ?[]const u8 = null;
-        var host_count: usize = 0;
-        var conn_close = false;
-        var conn_keep_alive = false;
-        for (0..num_headers) |i| {
-            const h = c_headers[i];
-            const name = h.name[0..h.name_len];
-            if (std.ascii.eqlIgnoreCase(name, "host")) {
-                host_count += 1;
-            } else if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-                const val = h.value[0..h.value_len];
-                if (!isDigitsOnly(val)) {
-                    self.allocator.free(headers);
-                    return error.InvalidRequest;
-                }
-                const parsed = std.fmt.parseInt(usize, val, 10) catch {
-                    self.allocator.free(headers);
-                    return error.InvalidRequest;
-                };
-                if (content_length) |existing| {
-                    if (existing != parsed) {
-                        self.allocator.free(headers);
-                        return error.InvalidRequest;
-                    }
-                } else {
-                    content_length = parsed;
-                }
-            } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
-                transfer_encoding = h.value[0..h.value_len];
-            } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
-                var it = std.mem.splitScalar(u8, h.value[0..h.value_len], ',');
-                while (it.next()) |tok| {
-                    const trimmed = std.mem.trim(u8, tok, " \t");
-                    if (std.ascii.eqlIgnoreCase(trimmed, "close")) conn_close = true;
-                    if (std.ascii.eqlIgnoreCase(trimmed, "keep-alive")) conn_keep_alive = true;
-                }
-            }
-        }
-
-        // RFC 9112 §9.6: HTTP/1.0 defaults to close unless the client asked
-        // to keep-alive; any version closes if the client asked to close.
-        const wants_close = conn_close or (minor_version == 0 and !conn_keep_alive);
-
-        // RFC 9112 §3.2: an HTTP/1.1 request MUST have exactly one Host header.
-        // HTTP/1.0 has no such requirement.
-        if (minor_version == 1 and host_count != 1) {
-            self.allocator.free(headers);
-            return error.InvalidRequest;
-        }
-
-        // A request with both headers is the classic CL.TE/TE.CL smuggling
-        // primitive — reject rather than picking a framing to trust (RFC 7230 §3.3.3).
-        if (transfer_encoding != null and content_length != null) {
-            self.allocator.free(headers);
-            return error.InvalidRequest;
-        }
-
-        if (transfer_encoding) |te_val| {
-            // Final coding is the last comma-separated token of the last TE header.
-            const last_token = if (std.mem.lastIndexOfScalar(u8, te_val, ',')) |idx| te_val[idx + 1 ..] else te_val;
-            const final_coding = std.mem.trim(u8, last_token, " \t");
-            if (!std.ascii.eqlIgnoreCase(final_coding, "chunked")) {
-                // Non-chunked final coding: body length is undeterminable.
-                self.allocator.free(headers);
+    // Single pass over headers: collect Content-Length (rejecting malformed
+    // values and duplicates whose parsed values disagree), the value of
+    // the last Transfer-Encoding header (repeated TE headers combine per
+    // RFC 7230 §3.3.2 — the final coding is what determines chunked-ness),
+    // and Connection: close/keep-alive tokens (#204) — OR'd across any
+    // repeated Connection headers.
+    var content_length: ?usize = null;
+    var transfer_encoding: ?[]const u8 = null;
+    var host_count: usize = 0;
+    var conn_close = false;
+    var conn_keep_alive = false;
+    for (0..num_headers) |i| {
+        const h = c_headers[i];
+        const name = h.name[0..h.name_len];
+        if (std.ascii.eqlIgnoreCase(name, "host")) {
+            host_count += 1;
+        } else if (std.ascii.eqlIgnoreCase(name, "content-length")) {
+            const val = h.value[0..h.value_len];
+            if (!isDigitsOnly(val)) {
+                allocator.free(headers);
                 return error.InvalidRequest;
             }
-
-            // Decode chunked body: hex-size\r\n + data\r\n + ... + 0\r\n\r\n
-            const chunk_data = buf[bytes_consumed..];
-            const decoded = decodeChunkedBody(chunk_data, self.allocator) catch |err| {
-                if (err == error.Incomplete) {
-                    self.allocator.free(headers);
-                    return error.Incomplete;
-                }
-                self.allocator.free(headers);
+            const parsed = std.fmt.parseInt(usize, val, 10) catch {
+                allocator.free(headers);
                 return error.InvalidRequest;
             };
-            return Request{
-                .method = method,
-                .path = path,
-                .headers = headers,
-                .body = decoded.body,
-                .raw_len = bytes_consumed + decoded.total_consumed,
-                .wants_close = wants_close,
-            };
+            if (content_length) |existing| {
+                if (existing != parsed) {
+                    allocator.free(headers);
+                    return error.InvalidRequest;
+                }
+            } else {
+                content_length = parsed;
+            }
+        } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
+            transfer_encoding = h.value[0..h.value_len];
+        } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
+            var it = std.mem.splitScalar(u8, h.value[0..h.value_len], ',');
+            while (it.next()) |tok| {
+                const trimmed = std.mem.trim(u8, tok, " \t");
+                if (std.ascii.eqlIgnoreCase(trimmed, "close")) conn_close = true;
+                if (std.ascii.eqlIgnoreCase(trimmed, "keep-alive")) conn_keep_alive = true;
+            }
+        }
+    }
+
+    // RFC 9112 §9.6: HTTP/1.0 defaults to close unless the client asked
+    // to keep-alive; any version closes if the client asked to close.
+    const wants_close = conn_close or (minor_version == 0 and !conn_keep_alive);
+
+    // RFC 9112 §3.2: an HTTP/1.1 request MUST have exactly one Host header.
+    // HTTP/1.0 has no such requirement.
+    if (minor_version == 1 and host_count != 1) {
+        allocator.free(headers);
+        return error.InvalidRequest;
+    }
+
+    // A request with both headers is the classic CL.TE/TE.CL smuggling
+    // primitive — reject rather than picking a framing to trust (RFC 7230 §3.3.3).
+    if (transfer_encoding != null and content_length != null) {
+        allocator.free(headers);
+        return error.InvalidRequest;
+    }
+
+    if (transfer_encoding) |te_val| {
+        // Final coding is the last comma-separated token of the last TE header.
+        const last_token = if (std.mem.lastIndexOfScalar(u8, te_val, ',')) |idx| te_val[idx + 1 ..] else te_val;
+        const final_coding = std.mem.trim(u8, last_token, " \t");
+        if (!std.ascii.eqlIgnoreCase(final_coding, "chunked")) {
+            // Non-chunked final coding: body length is undeterminable.
+            allocator.free(headers);
+            return error.InvalidRequest;
         }
 
-        const cl = content_length orelse 0;
-        const total_needed = bytes_consumed + cl;
-        if (buf.len < total_needed) {
-            // Body not fully received yet — need more data
-            self.allocator.free(headers);
-            return error.Incomplete;
-        }
-
-        const body = if (cl > 0) buf[bytes_consumed .. bytes_consumed + cl] else &[_]u8{};
-
+        // Decode chunked body: hex-size\r\n + data\r\n + ... + 0\r\n\r\n
+        const chunk_data = buf[bytes_consumed..];
+        const decoded = decodeChunkedBody(chunk_data, allocator) catch |err| {
+            if (err == error.Incomplete) {
+                allocator.free(headers);
+                return error.Incomplete;
+            }
+            allocator.free(headers);
+            return error.InvalidRequest;
+        };
         return Request{
             .method = method,
             .path = path,
             .headers = headers,
-            .body = body,
-            .raw_len = total_needed,
+            .body = decoded.body,
+            .raw_len = bytes_consumed + decoded.total_consumed,
             .wants_close = wants_close,
         };
     }
 
-    /// Find header value by name (case-insensitive)
-    pub fn getHeader(req: *const Request, name: []const u8) ?[]const u8 {
-        for (req.headers) |header| {
-            if (std.ascii.eqlIgnoreCase(header.name, name)) {
-                return header.value;
-            }
-        }
-        return null;
+    const cl = content_length orelse 0;
+    const total_needed = bytes_consumed + cl;
+    if (buf.len < total_needed) {
+        // Body not fully received yet — need more data
+        allocator.free(headers);
+        return error.Incomplete;
     }
 
-    /// Parse an HTTP response's status line + headers from a buffer via
-    /// picohttpparser. Mirrors parseRequest, but for responses — used by the
-    /// reverse-proxy response path (proxy.zig's forwardProxyResponse) to
-    /// parse the buffered upstream response before stripping hop-by-hop
-    /// headers and re-emitting it to the client (#182). Body framing is the
-    /// caller's job: `head_len` is where the body starts in `buf`.
-    pub fn parseResponseHead(self: *Parser, buf: []const u8) !ResponseHead {
-        var minor_version: c_int = 0;
-        var status: c_int = 0;
-        var msg_ptr: [*c]const u8 = undefined;
-        var msg_len: usize = 0;
+    const body = if (cl > 0) buf[bytes_consumed .. bytes_consumed + cl] else &[_]u8{};
 
-        const max_headers: usize = config.MAX_HEADERS;
-        var c_headers: [max_headers]c.struct_phr_header = undefined;
-        var num_headers: usize = max_headers;
+    return Request{
+        .method = method,
+        .path = path,
+        .headers = headers,
+        .body = body,
+        .raw_len = total_needed,
+        .wants_close = wants_close,
+    };
+}
 
-        const result = c.phr_parse_response(
-            buf.ptr,
-            buf.len,
-            &minor_version,
-            &status,
-            @ptrCast(&msg_ptr),
-            &msg_len,
-            &c_headers,
-            &num_headers,
-            0, // last_len (0 for first parse)
-        );
-
-        if (result == -2) {
-            return error.Incomplete;
+/// Find header value by name (case-insensitive)
+pub fn getHeader(req: *const Request, name: []const u8) ?[]const u8 {
+    for (req.headers) |header| {
+        if (std.ascii.eqlIgnoreCase(header.name, name)) {
+            return header.value;
         }
-        if (result == -1) {
-            return error.InvalidRequest;
-        }
+    }
+    return null;
+}
 
-        const reason = msg_ptr[0..msg_len];
+/// Parse an HTTP response's status line + headers from a buffer via
+/// picohttpparser. Mirrors parseRequest, but for responses — used by the
+/// reverse-proxy response path (proxy.zig's forwardProxyResponse) to
+/// parse the buffered upstream response before stripping hop-by-hop
+/// headers and re-emitting it to the client (#182). Body framing is the
+/// caller's job: `head_len` is where the body starts in `buf`.
+pub fn parseResponseHead(allocator: std.mem.Allocator, buf: []const u8) !ResponseHead {
+    var minor_version: c_int = 0;
+    var status: c_int = 0;
+    var msg_ptr: [*c]const u8 = undefined;
+    var msg_len: usize = 0;
 
-        var headers = try self.allocator.alloc(Header, num_headers);
-        for (0..num_headers) |i| {
-            const h = c_headers[i];
-            headers[i] = Header{
-                .name = h.name[0..h.name_len],
-                .value = h.value[0..h.value_len],
-            };
-        }
+    const max_headers: usize = config.MAX_HEADERS;
+    var c_headers: [max_headers]c.struct_phr_header = undefined;
+    var num_headers: usize = max_headers;
 
-        return ResponseHead{
-            .status = @intCast(status),
-            .reason = reason,
-            .minor_version = minor_version,
-            .headers = headers,
-            .head_len = @intCast(result),
+    const result = c.phr_parse_response(
+        buf.ptr,
+        buf.len,
+        &minor_version,
+        &status,
+        @ptrCast(&msg_ptr),
+        &msg_len,
+        &c_headers,
+        &num_headers,
+        0, // last_len (0 for first parse)
+    );
+
+    if (result == -2) {
+        return error.Incomplete;
+    }
+    if (result == -1) {
+        return error.InvalidRequest;
+    }
+
+    const reason = msg_ptr[0..msg_len];
+
+    var headers = try allocator.alloc(Header, num_headers);
+    for (0..num_headers) |i| {
+        const h = c_headers[i];
+        headers[i] = Header{
+            .name = h.name[0..h.name_len],
+            .value = h.value[0..h.value_len],
         };
     }
-};
 
-/// Parsed HTTP response status line + headers (see Parser.parseResponseHead).
+    return ResponseHead{
+        .status = @intCast(status),
+        .reason = reason,
+        .minor_version = minor_version,
+        .headers = headers,
+        .head_len = @intCast(result),
+    };
+}
+
+/// Parsed HTTP response status line + headers (see parseResponseHead).
 pub const ResponseHead = struct {
     status: u16,
     reason: []const u8, // slice into buf
     minor_version: c_int,
-    headers: []Header, // caller frees with the allocator passed to Parser.init
+    headers: []Header, // caller frees with the allocator passed to parseRequest/parseResponseHead
     head_len: usize, // byte offset in buf where the body begins
 };
 
@@ -523,10 +502,8 @@ test "status_lines: known phrase and unmapped-code fallback" {
 test "http parser - simple GET request" {
     const allocator = std.testing.allocator;
 
-    var parser = Parser.init(allocator);
-
     const http_request = "GET /test HTTP/1.1\r\nHost: localhost\r\nUser-Agent: test\r\n\r\n";
-    const request = try parser.parseRequest(http_request);
+    const request = try parseRequest(allocator, http_request);
     defer allocator.free(request.headers);
 
     try std.testing.expectEqualStrings("GET", request.method);
@@ -537,74 +514,65 @@ test "http parser - simple GET request" {
 test "http parser - incomplete request" {
     const allocator = std.testing.allocator;
 
-    var parser = Parser.init(allocator);
-
     const partial_request = "GET /test HTTP";
-    const result = parser.parseRequest(partial_request);
+    const result = parseRequest(allocator, partial_request);
     try std.testing.expectError(error.Incomplete, result);
 }
 
 test "http parser - rejects Content-Length and Transfer-Encoding together" {
     const allocator = std.testing.allocator;
-    var parser = Parser.init(allocator);
 
     const request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nping\r\n0\r\n\r\n";
-    const result = parser.parseRequest(request);
+    const result = parseRequest(allocator, request);
     try std.testing.expectError(error.InvalidRequest, result);
 }
 
 test "http parser - rejects duplicate Content-Length with distinct values" {
     const allocator = std.testing.allocator;
-    var parser = Parser.init(allocator);
 
     const request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nContent-Length: 5\r\n\r\nhello";
-    const result = parser.parseRequest(request);
+    const result = parseRequest(allocator, request);
     try std.testing.expectError(error.InvalidRequest, result);
 }
 
 test "http parser - accepts duplicate Content-Length with identical values" {
     const allocator = std.testing.allocator;
-    var parser = Parser.init(allocator);
 
     const request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\nContent-Length: 04\r\n\r\nping";
-    const request_result = try parser.parseRequest(request);
+    const request_result = try parseRequest(allocator, request);
     defer allocator.free(request_result.headers);
     try std.testing.expectEqualStrings("ping", request_result.body);
 }
 
 test "http parser - rejects malformed Content-Length" {
     const allocator = std.testing.allocator;
-    var parser = Parser.init(allocator);
 
     const request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: abc\r\n\r\nping";
-    const result = parser.parseRequest(request);
+    const result = parseRequest(allocator, request);
     try std.testing.expectError(error.InvalidRequest, result);
 }
 
 test "http parser - rejects signed Content-Length" {
     const allocator = std.testing.allocator;
-    var parser = Parser.init(allocator);
 
     const request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: +4\r\n\r\nping";
-    const result = parser.parseRequest(request);
+    const result = parseRequest(allocator, request);
     try std.testing.expectError(error.InvalidRequest, result);
 }
 
 test "http parser - rejects Content-Length with digit separator" {
     const allocator = std.testing.allocator;
-    var parser = Parser.init(allocator);
 
     const request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1_0\r\n\r\nping";
-    const result = parser.parseRequest(request);
+    const result = parseRequest(allocator, request);
     try std.testing.expectError(error.InvalidRequest, result);
 }
 
 test "http parser - plain Transfer-Encoding: chunked decodes" {
     const allocator = std.testing.allocator;
-    var parser = Parser.init(allocator);
 
     const request = "POST /test HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked\r\n\r\n4\r\nping\r\n0\r\n\r\n";
-    const request_result = try parser.parseRequest(request);
+    const request_result = try parseRequest(allocator, request);
     defer allocator.free(request_result.headers);
     defer allocator.free(request_result.body);
     try std.testing.expectEqualStrings("ping", request_result.body);
@@ -612,10 +580,9 @@ test "http parser - plain Transfer-Encoding: chunked decodes" {
 
 test "http parser - Transfer-Encoding with chunked as final coding decodes" {
     const allocator = std.testing.allocator;
-    var parser = Parser.init(allocator);
 
     const request = "POST /test HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: gzip, chunked\r\n\r\n4\r\nping\r\n0\r\n\r\n";
-    const request_result = try parser.parseRequest(request);
+    const request_result = try parseRequest(allocator, request);
     defer allocator.free(request_result.headers);
     defer allocator.free(request_result.body);
     try std.testing.expectEqualStrings("ping", request_result.body);
@@ -623,90 +590,81 @@ test "http parser - Transfer-Encoding with chunked as final coding decodes" {
 
 test "http parser - rejects Transfer-Encoding with non-chunked final coding" {
     const allocator = std.testing.allocator;
-    var parser = Parser.init(allocator);
 
     const request = "POST /test HTTP/1.1\r\nHost: localhost\r\nTransfer-Encoding: chunked, gzip\r\n\r\n4\r\nping\r\n0\r\n\r\n";
-    const result = parser.parseRequest(request);
+    const result = parseRequest(allocator, request);
     try std.testing.expectError(error.InvalidRequest, result);
 }
 
 test "http parser - rejects HTTP/1.1 request with no Host header" {
     const allocator = std.testing.allocator;
-    var parser = Parser.init(allocator);
 
     const request = "GET /test HTTP/1.1\r\nUser-Agent: test\r\n\r\n";
-    const result = parser.parseRequest(request);
+    const result = parseRequest(allocator, request);
     try std.testing.expectError(error.InvalidRequest, result);
 }
 
 test "http parser - HTTP/1.0 request with no Host header parses OK" {
     const allocator = std.testing.allocator;
-    var parser = Parser.init(allocator);
 
     const request = "GET /test HTTP/1.0\r\nUser-Agent: test\r\n\r\n";
-    const request_result = try parser.parseRequest(request);
+    const request_result = try parseRequest(allocator, request);
     defer allocator.free(request_result.headers);
     try std.testing.expectEqualStrings("/test", request_result.path);
 }
 
 test "parseRequest wants_close (#204): HTTP/1.0 implicit close" {
     const allocator = std.testing.allocator;
-    var parser = Parser.init(allocator);
 
     const request = "GET /test HTTP/1.0\r\n\r\n";
-    const result = try parser.parseRequest(request);
+    const result = try parseRequest(allocator, request);
     defer allocator.free(result.headers);
     try std.testing.expect(result.wants_close);
 }
 
 test "parseRequest wants_close (#204): HTTP/1.0 with Connection: keep-alive stays open" {
     const allocator = std.testing.allocator;
-    var parser = Parser.init(allocator);
 
     const request = "GET /test HTTP/1.0\r\nConnection: keep-alive\r\n\r\n";
-    const result = try parser.parseRequest(request);
+    const result = try parseRequest(allocator, request);
     defer allocator.free(result.headers);
     try std.testing.expect(!result.wants_close);
 }
 
 test "parseRequest wants_close (#204): HTTP/1.1 default keep-alive" {
     const allocator = std.testing.allocator;
-    var parser = Parser.init(allocator);
 
     const request = "GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n";
-    const result = try parser.parseRequest(request);
+    const result = try parseRequest(allocator, request);
     defer allocator.free(result.headers);
     try std.testing.expect(!result.wants_close);
 }
 
 test "parseRequest wants_close (#204): HTTP/1.1 with Connection: close" {
     const allocator = std.testing.allocator;
-    var parser = Parser.init(allocator);
 
     const request = "GET /test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
-    const result = try parser.parseRequest(request);
+    const result = try parseRequest(allocator, request);
     defer allocator.free(result.headers);
     try std.testing.expect(result.wants_close);
 }
 
 test "parseRequest wants_close (#204): case-insensitive header name and token, whitespace-trimmed" {
     const allocator = std.testing.allocator;
-    var parser = Parser.init(allocator);
 
     const request = "GET /test HTTP/1.1\r\nHost: localhost\r\nCONNECTION:  CLOSE \r\n\r\n";
-    const result = try parser.parseRequest(request);
+    const result = try parseRequest(allocator, request);
     defer allocator.free(result.headers);
     try std.testing.expect(result.wants_close);
 }
 
 test "parseRequest wants_close (#204): repeated Connection headers OR their tokens" {
     const allocator = std.testing.allocator;
-    var parser = Parser.init(allocator);
 
     // First Connection header names an unrelated hop-by-hop token, second
     // carries close — both headers' tokens must be scanned, not just the last.
     const request = "GET /test HTTP/1.1\r\nHost: localhost\r\nConnection: X-Foo\r\nConnection: close\r\n\r\n";
-    const result = try parser.parseRequest(request);
+    const result = try parseRequest(allocator, request);
     defer allocator.free(result.headers);
     try std.testing.expect(result.wants_close);
 }
@@ -743,18 +701,17 @@ test "serialize no longer special-cases 101 — a tenant ctx.status=101 is frame
 
 test "picohttpparser websocket upgrade headers" {
     const allocator = std.testing.allocator;
-    var parser = Parser.init(allocator);
 
     const ws_request = "GET /ws HTTP/1.1\r\nHost: localhost:8080\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: VRr1Px7jQfIhHCVGc+tb4w==\r\nSec-WebSocket-Version: 13\r\n\r\n";
-    const request = try parser.parseRequest(ws_request);
+    const request = try parseRequest(allocator, ws_request);
     defer allocator.free(request.headers);
 
     // Verify picohttpparser returns exact header value (no trailing whitespace)
-    const sec_key = Parser.getHeader(&request, "Sec-WebSocket-Key").?;
+    const sec_key = getHeader(&request, "Sec-WebSocket-Key").?;
     try std.testing.expectEqualStrings("VRr1Px7jQfIhHCVGc+tb4w==", sec_key);
     try std.testing.expectEqual(@as(usize, 24), sec_key.len);
 
-    const upgrade = Parser.getHeader(&request, "Upgrade").?;
+    const upgrade = getHeader(&request, "Upgrade").?;
     try std.testing.expectEqualStrings("websocket", upgrade);
 
     // Verify accept key computation with this specific key
@@ -914,9 +871,8 @@ test "decodeChunkedBody returns Incomplete for trailer missing final blank line"
 
 test "parseResponseHead parses status, reason, headers, and head_len" {
     const allocator = std.testing.allocator;
-    var parser = Parser.init(allocator);
     const buf = "HTTP/1.1 200 OK\r\nX-Foo: bar\r\nContent-Length: 5\r\n\r\nhello";
-    const head = try parser.parseResponseHead(buf);
+    const head = try parseResponseHead(allocator, buf);
     defer allocator.free(head.headers);
 
     try std.testing.expectEqual(@as(u16, 200), head.status);
@@ -930,9 +886,8 @@ test "parseResponseHead parses status, reason, headers, and head_len" {
 
 test "parseResponseHead rejects a malformed status line" {
     const allocator = std.testing.allocator;
-    var parser = Parser.init(allocator);
     const buf = "not an http response at all\r\n\r\n";
-    try std.testing.expectError(error.InvalidRequest, parser.parseResponseHead(buf));
+    try std.testing.expectError(error.InvalidRequest, parseResponseHead(allocator, buf));
 }
 
 test "serializeChunkedHeaders omits Content-Length" {
