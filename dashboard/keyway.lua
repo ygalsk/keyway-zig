@@ -125,9 +125,7 @@ keyway.static = {
 
 -- ─── Reverse Proxy Mounts ────────────────────────────────────────────
 
-keyway.proxy = {
-    ["/__keyway/grafana"] = { host = "127.0.0.1", port = 3000, redirect = "/__keyway/dashboard/grafana.html", strip_prefix = false },
-}
+keyway.proxy = {}
 
 -- ─── Routes ──────────────────────────────────────────────────────────
 
