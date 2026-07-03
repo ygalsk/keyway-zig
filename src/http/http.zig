@@ -99,17 +99,24 @@ pub const Response = struct {
             }
         }
 
-        // Content-Length. The 101 handshake is emitted as a raw response by
-        // conn_ws (not via serialize), so serialize has no status==101 special
-        // case: every response it produces is framed with an explicit length —
-        // a tenant that sets ctx.status=101 can no longer desync framing (#194).
-        try writer.print("Content-Length: {d}\r\n", .{self.body.len});
+        // RFC 9110 §6.4.1 / §15.3.5: 1xx, 204, and 304 responses carry no body.
+        // Suppress the engine Content-Length too (simplest and RFC-clean for
+        // all three). The 101 handshake is emitted as a raw response by
+        // conn_ws (not via serialize) — this only fires if a tenant sets
+        // ctx.status to one of these, in which case no-body is correct (#194, #206).
+        const no_body = self.status < 200 or self.status == 204 or self.status == 304;
+
+        if (!no_body) {
+            try writer.print("Content-Length: {d}\r\n", .{self.body.len});
+        }
 
         // Blank line
         try writer.writeAll("\r\n");
 
         // Body
-        try writer.writeAll(self.body);
+        if (!no_body) {
+            try writer.writeAll(self.body);
+        }
     }
 };
 
@@ -393,6 +400,60 @@ test "response serialization" {
     try std.testing.expectEqualStrings(expected, buf.writer.buffered());
 }
 
+test "serialize suppresses Content-Length and body for 204 (#206)" {
+    // RFC 9110 §15.3.5: 204 No Content MUST NOT include a message body.
+    const allocator = std.testing.allocator;
+
+    var response = Response.init(allocator);
+    defer response.deinit();
+    response.status = 204;
+    response.body = "should never be sent";
+
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    defer buf.deinit();
+
+    try response.serialize(&buf.writer);
+
+    const expected = "HTTP/1.1 204 No Content\r\n\r\n";
+    try std.testing.expectEqualStrings(expected, buf.writer.buffered());
+}
+
+test "serialize suppresses Content-Length and body for 304 (#206)" {
+    // RFC 9110 §15.4.5: 304 Not Modified MUST NOT include a message body.
+    const allocator = std.testing.allocator;
+
+    var response = Response.init(allocator);
+    defer response.deinit();
+    response.status = 304;
+    response.body = "should never be sent";
+
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    defer buf.deinit();
+
+    try response.serialize(&buf.writer);
+
+    const expected = "HTTP/1.1 304 Not Modified\r\n\r\n";
+    try std.testing.expectEqualStrings(expected, buf.writer.buffered());
+}
+
+test "serialize suppresses Content-Length and body for 1xx (#206)" {
+    // RFC 9110 §6.4.1: 1xx informational responses MUST NOT include content.
+    const allocator = std.testing.allocator;
+
+    var response = Response.init(allocator);
+    defer response.deinit();
+    response.status = 102;
+    response.body = "should never be sent";
+
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    defer buf.deinit();
+
+    try response.serialize(&buf.writer);
+
+    const expected = "HTTP/1.1 102 Processing\r\n\r\n";
+    try std.testing.expectEqualStrings(expected, buf.writer.buffered());
+}
+
 test "isEngineOwnedHeader matches content-length, transfer-encoding, connection case-insensitively" {
     try std.testing.expect(isEngineOwnedHeader("Content-Length"));
     try std.testing.expect(isEngineOwnedHeader("content-length"));
@@ -566,12 +627,12 @@ test "http parser - HTTP/1.0 request with no Host header parses OK" {
     try std.testing.expectEqualStrings("/test", request_result.path);
 }
 
-test "serialize no longer special-cases 101 — a tenant ctx.status=101 is framed, not desynced (#194)" {
+test "serialize no longer special-cases 101 — a tenant ctx.status=101 is framed, not desynced (#194, #206)" {
     // The real WebSocket 101 handshake is now emitted as a raw response by
     // conn_ws (verified end-to-end by the WS integration tests), so serialize
-    // only ever sees a 101 from a misused Lua handler. That must be well-framed:
-    // an explicit Content-Length, and the engine-owned Connection header stripped
-    // — no framing desync, no Connection leak.
+    // only ever sees a 101 from a misused Lua handler. 101 is a 1xx, so per
+    // #206 it now gets the RFC 9110 no-body treatment: no Content-Length, no
+    // body — and the engine-owned Connection header is still stripped.
     const allocator = std.testing.allocator;
 
     var resp = Response.init(allocator);
@@ -587,8 +648,9 @@ test "serialize no longer special-cases 101 — a tenant ctx.status=101 is frame
 
     const out = buf.writer.buffered();
     try std.testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 101 Switching Protocols\r\n"));
-    // Content-Length now present (no 101 skip) → framing intact.
-    try std.testing.expect(std.mem.indexOf(u8, out, "Content-Length: 4\r\n") != null);
+    // 1xx → no Content-Length, no body (#206).
+    try std.testing.expect(std.mem.indexOf(u8, out, "Content-Length:") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "oops") == null);
     // Engine-owned Connection stripped even at 101 (exemption removed).
     try std.testing.expect(std.mem.indexOf(u8, out, "Connection:") == null);
     // A non-engine tenant header is still emitted.
