@@ -74,6 +74,35 @@ pub const TlsState = struct {
     }
 };
 
+/// RFC 9112 §3.2.2 absolute-form: "scheme://authority/path?query" → "/path?query".
+/// Returns the target unchanged if it isn't absolute-form. Does not enforce
+/// that the authority agrees with the Host header (RFC says a server
+/// "should" check this; skipped as low-value extra strictness).
+fn originForm(target: []const u8) []const u8 {
+    // Origin-form always starts with '/'; absolute-form starts with a scheme
+    // letter. This discriminator keeps a query string containing "://"
+    // (e.g. "/redirect?url=http://x") from being misparsed as absolute-form.
+    if (target.len == 0 or target[0] == '/') return target;
+    const sep = std.mem.indexOf(u8, target, "://") orelse return target;
+    const after_authority_start = sep + 3;
+    if (after_authority_start >= target.len) return "/"; // "http://" with nothing after
+    const rel = std.mem.indexOfScalarPos(u8, target, after_authority_start, '/');
+    return if (rel) |i| target[i..] else "/"; // authority with no path → "/"
+}
+
+test "originForm strips scheme and authority from absolute-form" {
+    try std.testing.expectEqualStrings("/path", originForm("http://host/path"));
+    try std.testing.expectEqualStrings("/path?q=1", originForm("http://host:8080/path?q=1"));
+    try std.testing.expectEqualStrings("/", originForm("http://host"));
+    try std.testing.expectEqualStrings("/", originForm("http://"));
+}
+
+test "originForm leaves origin-form untouched" {
+    try std.testing.expectEqualStrings("/path", originForm("/path"));
+    try std.testing.expectEqualStrings("/redirect?url=http://x", originForm("/redirect?url=http://x"));
+    try std.testing.expectEqualStrings("", originForm(""));
+}
+
 /// Connection handler - manages HTTP request/response lifecycle
 pub const Connection = struct {
     pub const State = enum { reading, processing, writing, websocket, sse, streaming, static_file, closing };
@@ -549,8 +578,13 @@ pub const Connection = struct {
             return err;
         };
 
-        const query_pos = std.mem.indexOfScalar(u8, request.path, '?');
-        const clean_path = if (query_pos) |qi| request.path[0..qi] else request.path;
+        // RFC 9112 §3.2.2: normalize absolute-form ("http://host/path") to
+        // origin-form before routing. Authority-vs-Host agreement is
+        // intentionally not enforced (RFC says "should"; low-value here).
+        const target = originForm(request.path);
+
+        const query_pos = std.mem.indexOfScalar(u8, target, '?');
+        const clean_path = if (query_pos) |qi| target[0..qi] else target;
 
         self.http_state.request_method = request.method;
         self.http_state.request_path = clean_path;
@@ -559,7 +593,7 @@ pub const Connection = struct {
         // Parse query string and clear param cache for route matching
         self.query_cache.clear();
         if (query_pos) |qi| {
-            parseQueryString(request.path[qi + 1 ..], &self.query_cache);
+            parseQueryString(target[qi + 1 ..], &self.query_cache);
         }
         self.param_cache.clear();
 

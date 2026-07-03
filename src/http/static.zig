@@ -255,6 +255,20 @@ fn buildStaticHeaders(
     });
 }
 
+/// RFC 9110 §13.1.2: If-None-Match is a comma-separated list of entity-tags
+/// or "*". The GET/HEAD 304 check uses weak comparison, so a "W/" weak
+/// indicator is ignored. Our own ETag is strong (no W/ prefix).
+fn ifNoneMatchMatches(header_value: []const u8, etag: []const u8) bool {
+    var it = std.mem.splitScalar(u8, header_value, ',');
+    while (it.next()) |raw| {
+        var tok = std.mem.trim(u8, raw, " \t");
+        if (std.mem.eql(u8, tok, "*")) return true;
+        if (std.mem.startsWith(u8, tok, "W/")) tok = tok[2..];
+        if (etag.len != 0 and std.mem.eql(u8, tok, etag)) return true;
+    }
+    return false;
+}
+
 /// Serve a static file. Called from handler.zig routeRequest.
 pub fn serveStaticFile(
     self: *Connection,
@@ -320,7 +334,7 @@ pub fn serveStaticFile(
     // If-None-Match takes precedence over If-Modified-Since (RFC 7232 §6):
     // when present but not matching, serve full — do not consult IMS.
     if (http.Parser.getHeader(request, "If-None-Match")) |inm| {
-        if (std.mem.eql(u8, inm, etag)) {
+        if (ifNoneMatchMatches(inm, etag)) {
             helpers.closeFd(fd);
             self.logAccess(304);
             self.sendRawResponse("HTTP/1.1 304 Not Modified\r\nContent-Length: 0\r\n\r\n");
@@ -519,6 +533,26 @@ test "isWithinRoot enforces a segment boundary, not just a string prefix" {
     try std.testing.expect(isWithinRoot("/x/public/a.css", "/x/public"));
     try std.testing.expect(!isWithinRoot("/x/public-secret/s.txt", "/x/public"));
     try std.testing.expect(!isWithinRoot("/x/pub", "/x/public"));
+}
+
+test "ifNoneMatchMatches: exact match" {
+    try std.testing.expect(ifNoneMatchMatches("\"abc\"", "\"abc\""));
+    try std.testing.expect(!ifNoneMatchMatches("\"xyz\"", "\"abc\""));
+}
+
+test "ifNoneMatchMatches: comma-separated list" {
+    try std.testing.expect(ifNoneMatchMatches("\"wrong-one\", \"abc\"", "\"abc\""));
+    try std.testing.expect(ifNoneMatchMatches("\"abc\", \"wrong-one\"", "\"abc\""));
+    try std.testing.expect(!ifNoneMatchMatches("\"wrong-one\", \"also-wrong\"", "\"abc\""));
+}
+
+test "ifNoneMatchMatches: wildcard matches anything" {
+    try std.testing.expect(ifNoneMatchMatches("*", "\"abc\""));
+}
+
+test "ifNoneMatchMatches: weak indicator is ignored" {
+    try std.testing.expect(ifNoneMatchMatches("W/\"abc\"", "\"abc\""));
+    try std.testing.expect(ifNoneMatchMatches("\"wrong\", W/\"abc\"", "\"abc\""));
 }
 
 test "parseHttpDate round-trips formatHttpDate" {
