@@ -3,8 +3,11 @@
 import { createSignal, createEffect, For, Show, onMount, onCleanup } from "solid-js";
 import {
   type MetricsSnapshot, api, sendWS, startStream,
-  classifyStatus, INVOCATION_LABELS, formatTime,
+  classifyStatus, INVOCATION_LABELS, formatTime, METRICS_POLL_MS,
 } from "../main";
+
+interface EngineLogEntry { seq: number; ts: number; level: string; worker: number; msg: string; }
+interface EngineLogResponse { entries: EngineLogEntry[]; latest: number; }
 
 interface LogEntry { type: "cmd" | "response" | "error"; text: string; ts: number; }
 
@@ -107,6 +110,33 @@ export function ConsoleCore(props: {
       }
     }
     lastIdx = msgs.length;
+  });
+
+  // Live engine log — polls GET /__keyway/api/log with a `since` cursor at
+  // the same cadence as the metrics poll, surfacing Lua tracebacks and other
+  // warn/error engine events without leaving the dashboard (#230). Raw
+  // fetch (not the `api()` helper): a transient poll failure shouldn't pop
+  // an error toast, same reasoning as the metrics poll in main.tsx.
+  let logCursor = 0;
+  async function pollEngineLog() {
+    try {
+      const res = await fetch(`/__keyway/api/log?since=${logCursor}`);
+      if (!res.ok) return;
+      const data = await res.json() as EngineLogResponse;
+      for (const e of data.entries) {
+        addEntry({
+          type: e.level === "err" ? "error" : "response",
+          text: `[w${e.worker}] ${e.level.toUpperCase()}: ${e.msg.replace(/\\n/g, "\n")}`,
+          ts: e.ts,
+        });
+      }
+      logCursor = data.latest;
+    } catch { /* dashboard connectivity is already signaled elsewhere */ }
+  }
+  onMount(() => {
+    pollEngineLog();
+    const logTimer = setInterval(pollEngineLog, METRICS_POLL_MS);
+    onCleanup(() => clearInterval(logTimer));
   });
 
   type CmdFn = (arg: string) => void | Promise<void>;
@@ -244,7 +274,7 @@ export function ConsoleCore(props: {
                 {entry.type === "cmd" ? (
                   <span class="text-primary">{">"} {entry.text}</span>
                 ) : entry.type === "error" ? (
-                  <span class="text-error">{entry.text}</span>
+                  <pre class="text-error whitespace-pre-wrap m-0 font-inherit">{entry.text}</pre>
                 ) : (
                   <JsonHighlight text={entry.text} />
                 )}
