@@ -425,3 +425,29 @@ describe("websocket handshake validation (#175)", () => {
     });
   });
 });
+
+// (#225) A WebSocket connection captures its route pattern once at handshake
+// and never refreshes it (only method/path are updated per message). A
+// hot-reload frees and rebuilds the whole route trie, so a message on a live
+// WS connection after a reload used to read the freed pattern string. Cycles
+// reload+message repeatedly to widen the race and confirms the connection
+// keeps echoing correctly and the worker stays alive throughout.
+describe("websocket survives hot-reload of its own route (#225)", () => {
+  test("echoes correctly and stays healthy across repeated reloads", async () => {
+    await withServer(async ({ base, port }) => {
+      const ws = await openRawWs(port);
+      for (let round = 0; round < 20; round++) {
+        const res = await fetch(`${base}/__keyway/reload`, { method: "POST" });
+        expect(res.ok).toBe(true);
+        // Give the worker's event loop a turn to process the reload signal
+        // and free the old trie before the next WS message lands.
+        await Bun.sleep(20);
+        ws.socket.write(clientFrame(0x1, `round-${round}`));
+        ws.socket.flush();
+        expect(await ws.readText()).toBe(`round-${round}`);
+      }
+      ws.socket.end();
+      expect(await rawStatus(port, `GET /health HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n\r\n`)).toBe(200);
+    });
+  });
+});
