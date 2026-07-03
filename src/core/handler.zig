@@ -129,6 +129,11 @@ pub const Connection = struct {
     // Completions (must have stable address!)
     read_completion: xev.Completion = .{},
     write_completion: xev.Completion = .{},
+    // Enforces "at most one send in flight" on write_completion: submitSend
+    // refuses to overwrite/re-add it while this is true. A violation means
+    // two sends raced onto the same Completion — double io_uring add and a
+    // clobbered buffer (#224). Cleared in handleSendCompletion.
+    send_in_flight: bool = false,
 
     // Buffers (allocated from base_allocator, persist across requests)
     read_buffer: LinearBuffer,
@@ -915,6 +920,15 @@ pub const Connection = struct {
     /// After kTLS setup, all sends are plaintext — the kernel encrypts transparently.
     /// If arena_dupe is true, data is copied into the arena (for stack-local buffers).
     pub fn submitSend(self: *Connection, data: []const u8, callback: *const fn (?*anyopaque, *xev.Loop, *xev.Completion, xev.Result) xev.CallbackAction, arena_dupe: bool) void {
+        if (self.send_in_flight) {
+            // Invariant violation, not a std.debug.assert (stripped in release,
+            // see zig-gotchas.md): a caller tried to submit a second send while
+            // one was still in flight, which would clobber write_completion and
+            // double-add it to the loop (#224). Fail loud and closed instead.
+            log.err().string("msg", "submitSend: send already in flight, closing connection").int("fd", self.socket).log();
+            self.close();
+            return;
+        }
         const alloc = self.arena.allocator();
         const send_data = if (arena_dupe) alloc.dupe(u8, data) catch {
             self.close();
@@ -925,6 +939,7 @@ pub const Connection = struct {
             .userdata = self,
             .callback = callback,
         };
+        self.send_in_flight = true;
         self.pending_io_ops += 1;
         self.loop.add(&self.write_completion);
     }
@@ -1161,6 +1176,7 @@ pub const Connection = struct {
     /// if the caller should return .disarm (error or closing).
     pub fn handleSendCompletion(self: *Connection, result: xev.Result) ?usize {
         self.pending_io_ops -= 1;
+        self.send_in_flight = false;
         const bytes = result.send catch {
             if (self.state == .closing) {
                 self.maybeFinishClose();

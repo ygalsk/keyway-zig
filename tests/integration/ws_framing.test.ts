@@ -70,6 +70,8 @@ async function openRawWs(port: number) {
   return {
     socket,
     readText: () => waitFor(() => readFrame(bytes, 0x1)),
+    // (#224) Reads a pong frame (opcode 0xA) by payload.
+    readPong: () => waitFor(() => readFrame(bytes, 0xa)),
     readClose: () => waitFor(() => (closed || readFrame(bytes, 0x8) !== null ? true : null)),
     // (#175) Parses the close frame's 2-byte big-endian status code instead
     // of just detecting that a close happened.
@@ -305,6 +307,70 @@ describe("websocket adversarial framing", () => {
       ws.socket.flush();
       expect(await ws.readCloseCode()).toBe(1007);
       ws.socket.end();
+    });
+  });
+});
+
+// (#224) Two control frames arriving in a single TCP segment used to be
+// processed synchronously in one pass of the frame loop while the first
+// frame's pong send was still in flight, clobbering the shared
+// write_completion (double io_uring add on a live Completion) — a
+// whole-worker corruption from unauthenticated input. Each write() below is
+// unflushed until the final flush() so both frames land in the same recv().
+describe("websocket queued control frames in one segment (#224)", () => {
+  test("answers back-to-back pings with two pongs and keeps the worker alive", async () => {
+    await withServer(async ({ port }) => {
+      const ws = await openRawWs(port);
+      ws.socket.write(clientFrame(0x9, "a"));
+      ws.socket.write(clientFrame(0x9, "b"));
+      ws.socket.flush();
+      expect(await ws.readPong()).toBe("a");
+      expect(await ws.readPong()).toBe("b");
+      ws.socket.end();
+      // The worker must have survived the double send unscathed.
+      expect(await rawStatus(port, `GET /health HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n\r\n`)).toBe(200);
+    });
+  });
+
+  test("answers a queued [ping][close] with a pong then a clean close, and keeps the worker alive", async () => {
+    await withServer(async ({ port }) => {
+      const ws = await openRawWs(port);
+      ws.socket.write(clientFrame(0x9, "a"));
+      ws.socket.write(clientFrame(0x8, ""));
+      ws.socket.flush();
+      expect(await ws.readPong()).toBe("a");
+      expect(await ws.readCloseCode()).toBe(1000);
+      ws.socket.end();
+      expect(await rawStatus(port, `GET /health HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n\r\n`)).toBe(200);
+    });
+  });
+
+  // A single [ping][ping] pair doesn't always corrupt anything an observer
+  // can see — the kernel often already captured each pong's buffer when its
+  // send was submitted. But processWsFrames's stray re-arm of the recv
+  // completion each round leaves a dangling operation targeting the same
+  // (stale) buffer offset as the next round's real recv, and repeating the
+  // pair reliably wins that race within a handful of rounds: a later round's
+  // ping payload lands in the wrong recv's buffer and comes back echoed
+  // under the wrong round number below. Left running long enough, the
+  // dangling completions also accumulate forever (never cleaned up until
+  // close) and overflow pending_io_ops (a u8 counter), panicking — and on
+  // this single-worker build, killing — the whole process ("panic: integer
+  // overflow" at handler.zig's submitSend, reached from sendWsFrame <-
+  // processWsFrames's `.ping` arm). 150 rounds is overkill for the fast
+  // corruption but cheap insurance against the slower overflow too.
+  test("many back-to-back ping pairs on one connection don't wedge or crash the worker", async () => {
+    await withServer(async ({ port }) => {
+      const ws = await openRawWs(port);
+      for (let round = 0; round < 150; round++) {
+        ws.socket.write(clientFrame(0x9, `${round}`));
+        ws.socket.write(clientFrame(0x9, `${round}`));
+        ws.socket.flush();
+        expect(await ws.readPong()).toBe(`${round}`);
+        expect(await ws.readPong()).toBe(`${round}`);
+      }
+      ws.socket.end();
+      expect(await rawStatus(port, `GET /health HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n\r\n`)).toBe(200);
     });
   });
 });
