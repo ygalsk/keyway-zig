@@ -585,13 +585,23 @@ fn decodeChunkedBody(data: []const u8, allocator: std.mem.Allocator) !ChunkedRes
         const size_str = std.mem.trim(u8, data[pos .. pos + crlf_pos], " \t");
         // Strip chunk extensions (everything after ';')
         const pure_size = if (std.mem.indexOfScalar(u8, size_str, ';')) |semi| size_str[0..semi] else size_str;
+        // RFC 9112 §7.1: chunk-size is strictly 1*HEXDIG — reject empty,
+        // '+'/'-' signs, and '_' digit separators that parseInt would accept.
+        if (pure_size.len == 0) return error.InvalidRequest;
+        for (pure_size) |ch| {
+            if (!std.ascii.isHex(ch)) return error.InvalidRequest;
+        }
         const chunk_size = std.fmt.parseInt(usize, pure_size, 16) catch return error.InvalidRequest;
         pos += crlf_pos + 2; // skip past size line + CRLF
 
         if (chunk_size == 0) {
-            // Terminal chunk — skip trailing CRLF
-            if (pos + 2 > data.len) return error.Incomplete;
-            pos += 2;
+            // Trailer section: zero or more trailer-field lines, ended by a
+            // blank line (RFC 9112 §7.1.2). We consume and ignore the fields.
+            while (true) {
+                const line_end = std.mem.indexOf(u8, data[pos..], "\r\n") orelse return error.Incomplete;
+                pos += line_end + 2;
+                if (line_end == 0) break; // blank line → end of trailer section
+            }
             return .{
                 .body = body_buf.toOwnedSlice(allocator) catch return error.InvalidRequest,
                 .total_consumed = pos,
@@ -602,7 +612,9 @@ fn decodeChunkedBody(data: []const u8, allocator: std.mem.Allocator) !ChunkedRes
         if (pos + chunk_size + 2 > data.len) return error.Incomplete;
 
         try body_buf.appendSlice(allocator, data[pos .. pos + chunk_size]);
-        pos += chunk_size + 2; // skip data + CRLF
+        pos += chunk_size;
+        if (!std.mem.eql(u8, data[pos .. pos + 2], "\r\n")) return error.InvalidRequest;
+        pos += 2;
     }
 
     return error.Incomplete;
@@ -647,6 +659,45 @@ test "decodeChunkedBody handles hex sizes" {
     const result = try decodeChunkedBody(data, allocator);
     defer allocator.free(result.body);
     try std.testing.expectEqualStrings("0123456789", result.body);
+}
+
+test "decodeChunkedBody consumes trailer section" {
+    const allocator = std.testing.allocator;
+    const data = "5\r\nHello\r\n0\r\nX-Trailer: v\r\n\r\n";
+    const result = try decodeChunkedBody(data, allocator);
+    defer allocator.free(result.body);
+    try std.testing.expectEqualStrings("Hello", result.body);
+    try std.testing.expectEqual(data.len, result.total_consumed);
+}
+
+test "decodeChunkedBody rejects missing data CRLF" {
+    const allocator = std.testing.allocator;
+    // After "Hello" the next two bytes are "!!" instead of CRLF. Unvalidated,
+    // this desyncs and reinterprets "!!6\r\nWorld!\r\n0\r\n\r\n" as further
+    // chunk framing, silently producing "HelloWorld!" instead of erroring.
+    const data = "5\r\nHello!!6\r\nWorld!\r\n0\r\n\r\n";
+    try std.testing.expectError(error.InvalidRequest, decodeChunkedBody(data, allocator));
+}
+
+test "decodeChunkedBody rejects chunk size with leading plus" {
+    const allocator = std.testing.allocator;
+    const data = "+4\r\nping\r\n0\r\n\r\n";
+    try std.testing.expectError(error.InvalidRequest, decodeChunkedBody(data, allocator));
+}
+
+test "decodeChunkedBody rejects chunk size with digit separator" {
+    const allocator = std.testing.allocator;
+    // "1_0" in hex with '_' ignored as a digit separator is 0x10 = 16, and
+    // the 16-byte body below matches that length exactly, so unvalidated
+    // this decodes "successfully" instead of being rejected.
+    const data = "1_0\r\n0123456789012345\r\n0\r\n\r\n";
+    try std.testing.expectError(error.InvalidRequest, decodeChunkedBody(data, allocator));
+}
+
+test "decodeChunkedBody returns Incomplete for trailer missing final blank line" {
+    const allocator = std.testing.allocator;
+    const data = "5\r\nHello\r\n0\r\nX-Trailer: v\r\n";
+    try std.testing.expectError(error.Incomplete, decodeChunkedBody(data, allocator));
 }
 
 test "serializeChunkedHeaders omits Content-Length" {
