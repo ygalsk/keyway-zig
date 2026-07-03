@@ -19,18 +19,8 @@ function M.get_header(ctx, name)
     return nil
 end
 
---- Monotonic clock in microseconds (cached timespec)
-local ffi = require("ffi")
-pcall(ffi.cdef, [[
-    typedef long time_t;
-    struct timespec { time_t tv_sec; long tv_nsec; };
-    int clock_gettime(int clockid, struct timespec *tp);
-]])
-local _ts = ffi.new("struct timespec")
-function M.now_us()
-    ffi.C.clock_gettime(1, _ts) -- CLOCK_MONOTONIC
-    return tonumber(_ts.tv_sec) * 1000000 + tonumber(_ts.tv_nsec) / 1000
-end
+--- Monotonic clock in microseconds
+M.now_us = __keyway_now_us
 
 --- Broadcast an SSE event with automatic JSON encoding
 function M.broadcast_event(room, data)
