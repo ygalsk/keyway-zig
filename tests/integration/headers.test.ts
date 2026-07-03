@@ -15,4 +15,13 @@ describe("headers", () => {
     expect(res.status).toBe(200);
     expect(res.headers.get("X-MW-Before")).toBeTruthy();
   });
+
+  test("GET /test/headers carries a valid RFC 7231 Date header (#238)", async () => {
+    const res = await fetch(`${base()}/test/headers`);
+    expect(res.status).toBe(200);
+    const date = res.headers.get("date");
+    expect(date).toBeTruthy();
+    expect(Number.isNaN(Date.parse(date!))).toBe(false);
+    expect(date!.endsWith("GMT")).toBe(true);
+  });
 });

@@ -72,31 +72,6 @@ fn getContentType(path: []const u8) []const u8 {
     return mime_types.get(ext) orelse "application/octet-stream";
 }
 
-/// Format a Unix timestamp as HTTP-date (RFC 7231).
-fn formatHttpDate(buf: *[29]u8, epoch_secs: i64) void {
-    const days = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
-    const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
-
-    const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(@max(0, epoch_secs)) };
-    const day_seconds = epoch.getDaySeconds();
-    const epoch_day = epoch.getEpochDay();
-    const year_day = epoch_day.calculateYearDay();
-    const month_day = year_day.calculateMonthDay();
-
-    // Day of week: Jan 1 1970 was Thursday (days[0])
-    const dow_idx: usize = @intCast(@mod(@as(i64, @intCast(epoch_day.day)), 7));
-
-    _ = std.fmt.bufPrint(buf, "{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
-        days[dow_idx],
-        month_day.day_index + 1,
-        months[month_day.month.numeric() - 1],
-        year_day.year,
-        day_seconds.getHoursIntoDay(),
-        day_seconds.getMinutesIntoHour(),
-        day_seconds.getSecondsIntoMinute(),
-    }) catch {};
-}
-
 /// Parse an RFC 7231 IMF-fixdate ("Sun, 06 Nov 1994 08:49:37 GMT") to epoch
 /// seconds. Returns null on any deviation (caller then serves 200).
 // ponytail: IMF-fixdate only (the format we emit); other HTTP-date forms fall through to 200
@@ -245,13 +220,16 @@ fn buildStaticHeaders(
     mtime_sec: i64,
 ) ![]const u8 {
     var last_modified_buf: [29]u8 = undefined;
-    formatHttpDate(&last_modified_buf, mtime_sec);
+    helpers.formatHttpDate(&last_modified_buf, mtime_sec);
+    var date_buf: [29]u8 = undefined;
+    helpers.formatHttpDate(&date_buf, helpers.realtimeSeconds());
 
-    return std.fmt.allocPrint(alloc, "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nETag: {s}\r\nLast-Modified: {s}\r\nCache-Control: public, max-age=3600\r\n\r\n", .{
+    return std.fmt.allocPrint(alloc, "HTTP/1.1 200 OK\r\nContent-Type: {s}\r\nContent-Length: {d}\r\nETag: {s}\r\nLast-Modified: {s}\r\nDate: {s}\r\nCache-Control: public, max-age=3600\r\n\r\n", .{
         content_type,
         file_size,
         etag,
         &last_modified_buf,
+        &date_buf,
     });
 }
 
@@ -510,13 +488,6 @@ test "getContentType handles no extension" {
     try std.testing.expectEqualStrings("application/octet-stream", getContentType("/Makefile"));
 }
 
-test "formatHttpDate produces valid format" {
-    var buf: [29]u8 = undefined;
-    // Unix epoch: Thu, 01 Jan 1970 00:00:00 GMT
-    formatHttpDate(&buf, 0);
-    try std.testing.expectEqualStrings("Thu, 01 Jan 1970 00:00:00 GMT", &buf);
-}
-
 test "buildStaticHeaders formats status line and cache headers" {
     var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
     defer arena.deinit();
@@ -526,6 +497,7 @@ test "buildStaticHeaders formats status line and cache headers" {
     try std.testing.expect(std.mem.indexOf(u8, headers, "Content-Length: 42\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, headers, "ETag: \"abc\"\r\n") != null);
     try std.testing.expect(std.mem.indexOf(u8, headers, "Last-Modified: Thu, 01 Jan 1970 00:00:00 GMT\r\n") != null);
+    try std.testing.expect(std.mem.indexOf(u8, headers, "Date: ") != null);
 }
 
 test "isWithinRoot enforces a segment boundary, not just a string prefix" {
@@ -558,12 +530,12 @@ test "ifNoneMatchMatches: weak indicator is ignored" {
 test "parseHttpDate round-trips formatHttpDate" {
     // 784111777 = Sun, 06 Nov 1994 08:49:37 GMT
     var buf: [29]u8 = undefined;
-    formatHttpDate(&buf, 784111777);
+    helpers.formatHttpDate(&buf, 784111777);
     try std.testing.expectEqualStrings("Sun, 06 Nov 1994 08:49:37 GMT", &buf);
     try std.testing.expectEqual(@as(?i64, 784111777), parseHttpDate(&buf));
 
     var epoch_buf: [29]u8 = undefined;
-    formatHttpDate(&epoch_buf, 0);
+    helpers.formatHttpDate(&epoch_buf, 0);
     try std.testing.expectEqual(@as(?i64, 0), parseHttpDate(&epoch_buf));
 
     try std.testing.expectEqual(@as(?i64, null), parseHttpDate("not a date"));

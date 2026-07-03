@@ -1,5 +1,6 @@
 const std = @import("std");
 const config = @import("../util/config.zig");
+const helpers = @import("../util/helpers.zig");
 
 // Picohttpparser C bindings
 const c = @cImport({
@@ -92,6 +93,16 @@ pub const Response = struct {
             try writer.print("{s}: {s}\r\n", .{ header.name, header.value });
         }
 
+        // RFC 9110 §6.6.1: an origin server with a clock SHOULD generate a
+        // Date on every response it emits (#238). One vDSO read per
+        // response — no per-second caching (ponytail: add if profiling ever
+        // shows this line matters).
+        {
+            var date_buf: [29]u8 = undefined;
+            helpers.formatHttpDate(&date_buf, helpers.realtimeSeconds());
+            try writer.print("Date: {s}\r\n", .{&date_buf});
+        }
+
         // RFC 9110 §6.4.1 / §15.3.5: 1xx, 204, and 304 responses carry no body.
         // Suppress the engine Content-Length too (simplest and RFC-clean for
         // all three). The 101 handshake is emitted as a raw response by
@@ -127,7 +138,8 @@ fn isEngineOwnedHeader(name: []const u8) bool {
     const n = std.mem.trim(u8, name, " \t");
     return std.ascii.eqlIgnoreCase(n, "content-length") or
         std.ascii.eqlIgnoreCase(n, "transfer-encoding") or
-        std.ascii.eqlIgnoreCase(n, "connection");
+        std.ascii.eqlIgnoreCase(n, "connection") or
+        std.ascii.eqlIgnoreCase(n, "date");
 }
 
 /// True if `cl` could never be satisfied — the read buffer never grows past
@@ -409,8 +421,72 @@ test "response serialization" {
 
     try response.serialize(&buf.writer);
 
-    const expected = "HTTP/1.1 200 OK\r\nContent-Length: 13\r\n\r\nHello, World!";
-    try std.testing.expectEqualStrings(expected, buf.writer.buffered());
+    // Date's value is nondeterministic (#238), so this checks structure
+    // rather than a single exact-match string.
+    const out = buf.writer.buffered();
+    try std.testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 200 OK\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "Date: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Content-Length: 13\r\n") != null);
+    try std.testing.expect(std.mem.endsWith(u8, out, "\r\n\r\nHello, World!"));
+}
+
+test "serialize emits an RFC 7231 IMF-fixdate Date header (#238)" {
+    const allocator = std.testing.allocator;
+
+    var response = Response.init(allocator);
+    defer response.deinit();
+    response.status = 200;
+    response.body = "hi";
+
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    defer buf.deinit();
+    try response.serialize(&buf.writer);
+
+    const out = buf.writer.buffered();
+    const marker = "Date: ";
+    const marker_idx = std.mem.indexOf(u8, out, marker);
+    try std.testing.expect(marker_idx != null);
+    const value_start = marker_idx.? + marker.len;
+    try std.testing.expect(out.len >= value_start + 29);
+    const value = out[value_start..][0..29];
+
+    // "Xxx, DD Xxx YYYY HH:MM:SS GMT" — shape checks on the fixed-width IMF-fixdate.
+    try std.testing.expectEqual(@as(u8, ','), value[3]);
+    try std.testing.expectEqual(@as(u8, ' '), value[4]);
+    try std.testing.expectEqual(@as(u8, ' '), value[7]);
+    try std.testing.expectEqual(@as(u8, ' '), value[11]);
+    try std.testing.expectEqual(@as(u8, ' '), value[16]);
+    try std.testing.expectEqual(@as(u8, ':'), value[19]);
+    try std.testing.expectEqual(@as(u8, ':'), value[22]);
+    try std.testing.expect(std.mem.endsWith(u8, value, " GMT"));
+
+    // Header line is terminated and precedes the blank line separating body.
+    try std.testing.expect(std.mem.indexOf(u8, out, "\r\n\r\n") != null);
+}
+
+test "serialize strips a tenant-set Date header, emitting exactly one engine Date (#238)" {
+    const allocator = std.testing.allocator;
+
+    var response = Response.init(allocator);
+    defer response.deinit();
+    response.status = 200;
+    response.body = "ok";
+    try response.addHeader("Date", "bogus-tenant-date");
+
+    var buf: std.Io.Writer.Allocating = .init(allocator);
+    defer buf.deinit();
+    try response.serialize(&buf.writer);
+
+    const out = buf.writer.buffered();
+    try std.testing.expect(std.mem.indexOf(u8, out, "bogus-tenant-date") == null);
+
+    var count: usize = 0;
+    var pos: usize = 0;
+    while (std.mem.indexOfPos(u8, out, pos, "Date: ")) |i| {
+        count += 1;
+        pos = i + 1;
+    }
+    try std.testing.expectEqual(@as(usize, 1), count);
 }
 
 test "serialize suppresses Content-Length and body for 204 (#206)" {
@@ -427,8 +503,14 @@ test "serialize suppresses Content-Length and body for 204 (#206)" {
 
     try response.serialize(&buf.writer);
 
-    const expected = "HTTP/1.1 204 No Content\r\n\r\n";
-    try std.testing.expectEqualStrings(expected, buf.writer.buffered());
+    // Date's value is nondeterministic (#238), so this checks structure
+    // rather than a single exact-match string.
+    const out = buf.writer.buffered();
+    try std.testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 204 No Content\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "Date: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Content-Length") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "should never be sent") == null);
+    try std.testing.expect(std.mem.endsWith(u8, out, "\r\n\r\n"));
 }
 
 test "serialize suppresses Content-Length and body for 304 (#206)" {
@@ -445,8 +527,12 @@ test "serialize suppresses Content-Length and body for 304 (#206)" {
 
     try response.serialize(&buf.writer);
 
-    const expected = "HTTP/1.1 304 Not Modified\r\n\r\n";
-    try std.testing.expectEqualStrings(expected, buf.writer.buffered());
+    const out = buf.writer.buffered();
+    try std.testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 304 Not Modified\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "Date: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Content-Length") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "should never be sent") == null);
+    try std.testing.expect(std.mem.endsWith(u8, out, "\r\n\r\n"));
 }
 
 test "serialize suppresses Content-Length and body for 1xx (#206)" {
@@ -463,8 +549,12 @@ test "serialize suppresses Content-Length and body for 1xx (#206)" {
 
     try response.serialize(&buf.writer);
 
-    const expected = "HTTP/1.1 102 Processing\r\n\r\n";
-    try std.testing.expectEqualStrings(expected, buf.writer.buffered());
+    const out = buf.writer.buffered();
+    try std.testing.expect(std.mem.startsWith(u8, out, "HTTP/1.1 102 Processing\r\n"));
+    try std.testing.expect(std.mem.indexOf(u8, out, "Date: ") != null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "Content-Length") == null);
+    try std.testing.expect(std.mem.indexOf(u8, out, "should never be sent") == null);
+    try std.testing.expect(std.mem.endsWith(u8, out, "\r\n\r\n"));
 }
 
 test "isEngineOwnedHeader matches content-length, transfer-encoding, connection case-insensitively" {
@@ -475,6 +565,9 @@ test "isEngineOwnedHeader matches content-length, transfer-encoding, connection 
     try std.testing.expect(isEngineOwnedHeader("transfer-encoding"));
     try std.testing.expect(isEngineOwnedHeader("Connection"));
     try std.testing.expect(isEngineOwnedHeader("connection"));
+    try std.testing.expect(isEngineOwnedHeader("Date"));
+    try std.testing.expect(isEngineOwnedHeader("date"));
+    try std.testing.expect(isEngineOwnedHeader("DATE"));
     try std.testing.expect(!isEngineOwnedHeader("X-Foo"));
     // Whitespace-padded framing names are the classic smuggling obfuscation —
     // still recognized so they can't ride alongside the engine's own header.
