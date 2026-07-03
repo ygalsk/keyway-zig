@@ -191,6 +191,35 @@ describe("websocket adversarial framing", () => {
     });
   });
 
+  // (#228) A legal single (unfragmented) frame whose declared length is under
+  // the 1MB message limit but over the 64KB read buffer used to be
+  // unassemblable: parseFrame kept returning `.incomplete` until the buffer
+  // filled, then armWsRecv gave up with a bare `close()` (client sees 1006).
+  // It must instead get a clean 1009, same as the existing >1MB case above.
+  test("closes with 1009 on a legal single frame too large for the read buffer", async () => {
+    await withServer(async ({ port }) => {
+      const ws = await openRawWs(port);
+      ws.socket.write(clientFrame(0x2, "x".repeat(100_000))); // binary, ~100KB
+      ws.socket.flush();
+      expect(await ws.readCloseCode()).toBe(1009);
+      ws.socket.end();
+    });
+  });
+
+  // (#228) The largest single-frame payload guaranteed to fit the read
+  // buffer: 65536 (READ_BUFFER_SIZE) - 10 (max frame header) - 4 (mask key).
+  test("echoes a single frame at the read-buffer capacity and keeps the worker alive", async () => {
+    await withServer(async ({ port }) => {
+      const ws = await openRawWs(port);
+      const payload = "x".repeat(65522);
+      ws.socket.write(clientFrame(0x1, payload));
+      ws.socket.flush();
+      expect(await ws.readText()).toBe(payload);
+      ws.socket.end();
+      expect(await rawStatus(port, `GET /health HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\n\r\n`)).toBe(200);
+    });
+  });
+
   // (#167)
   test("echoes a text message sent as three continuation frames", async () => {
     await withServer(async ({ port }) => {

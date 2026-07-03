@@ -139,6 +139,11 @@ fn armWsRecv(conn: *Connection) void {
         }
         break :blk cb.writeSlice();
     } else blk: {
+        // Defensive fallback: parseFrame now rejects any single frame whose
+        // declared length exceeds ws.MAX_SINGLE_FRAME_PAYLOAD before this
+        // point, so a legal frame should never fill the buffer without
+        // completing (#228). A bare close() here would still mean a bug
+        // upstream, not an expected path.
         if (conn.read_buffer.availableWrite() == 0) {
             conn.close();
             return;

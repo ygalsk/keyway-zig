@@ -50,7 +50,11 @@ pub fn parseFrame(data: []u8) !ParseResult {
         pos += 8;
     }
 
-    if (payload_len > @as(u64, config.WS_MAX_MESSAGE_SIZE)) return error.FrameTooLarge;
+    // A single frame's payload must fit the read buffer in one shot — it can
+    // never be assembled otherwise (#228). This is stricter than (and
+    // supersedes) the reassembled-message limit: a fragmented message may
+    // still reach WS_MAX_MESSAGE_SIZE across many frames, each ≤ this cap.
+    if (payload_len > @as(u64, MAX_SINGLE_FRAME_PAYLOAD)) return error.FrameTooLarge;
     const payload_len_usize: usize = @intCast(payload_len);
 
     if (masked) {
@@ -111,6 +115,23 @@ pub fn serializeFrame(opcode: Opcode, payload: []const u8, buf: []u8) usize {
 
 /// Maximum frame overhead: 1 (fin+opcode) + 9 (extended length) = 10 bytes
 pub const MAX_FRAME_OVERHEAD = 10;
+
+/// RFC 6455 §5.3: client frames carry a 4-byte mask key we don't emit ourselves.
+const MASK_KEY_SIZE = 4;
+
+/// Largest single (unfragmented) frame payload guaranteed to fit the read
+/// buffer in one recv. `config.READ_BUFFER_SIZE` is the hard cap on how much
+/// of one frame we can ever hold; a frame declaring more than this can never
+/// be assembled, so parseFrame rejects it up front (clean 1009) instead of
+/// spinning on `.incomplete` until the buffer fills (#228).
+pub const MAX_SINGLE_FRAME_PAYLOAD = config.READ_BUFFER_SIZE - MAX_FRAME_OVERHEAD - MASK_KEY_SIZE;
+
+comptime {
+    // Defined here (not config.zig) to avoid an import cycle: ws.zig already
+    // imports config.zig for READ_BUFFER_SIZE.
+    if (config.READ_BUFFER_SIZE <= MAX_FRAME_OVERHEAD + MASK_KEY_SIZE)
+        @compileError("READ_BUFFER_SIZE too small to hold even an empty WS frame");
+}
 
 /// Compute the Sec-WebSocket-Accept value per RFC 6455 Section 4.2.2.
 /// sec_key: the client's Sec-WebSocket-Key header value
