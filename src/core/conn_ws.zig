@@ -253,13 +253,18 @@ pub fn processWsFrames(conn: *Connection) void {
 
                 switch (f.frame.opcode) {
                     .ping => {
+                        // sendWsFrame submits a send — must return, not continue
+                        // (#224): looping straight to the next buffered frame
+                        // would process it while the pong send is still in
+                        // flight, clobbering write_completion. onWsControlSent
+                        // re-enters processWsFrames once the pong actually lands.
                         sendWsFrame(conn, .pong, f.frame.payload) catch {
                             sendWsClose(conn, 1002);
                             return;
                         };
-                        continue;
+                        return;
                     },
-                    .pong => continue,
+                    .pong => continue, // no send submitted — safe to keep draining buffered frames
                     .close => {
                         handleWsClose(conn, f.frame.payload);
                         return;
