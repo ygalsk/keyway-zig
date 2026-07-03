@@ -977,7 +977,9 @@ pub const Connection = struct {
             return;
         };
         const body = allocating_writer.writer.buffered();
-        const full = std.fmt.allocPrint(alloc, "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nContent-Length: {d}\r\n\r\n{s}", .{ body.len, body }) catch {
+        var date_buf: [29]u8 = undefined;
+        helpers.formatHttpDate(&date_buf, helpers.realtimeSeconds());
+        const full = std.fmt.allocPrint(alloc, "HTTP/1.1 200 OK\r\nContent-Type: text/plain; version=0.0.4; charset=utf-8\r\nDate: {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{ &date_buf, body.len, body }) catch {
             error_response.sendError(self, .server_error, "metrics response failed");
             return;
         };
@@ -987,7 +989,9 @@ pub const Connection = struct {
 
     /// Format and send a JSON HTTP response with the given status and body.
     fn sendJsonResponse(self: *Connection, alloc: std.mem.Allocator, status_code: u16, status_text: []const u8, body: []const u8) void {
-        const resp = std.fmt.allocPrint(alloc, "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nContent-Length: {d}\r\n\r\n{s}", .{ status_code, status_text, body.len, body }) catch {
+        var date_buf: [29]u8 = undefined;
+        helpers.formatHttpDate(&date_buf, helpers.realtimeSeconds());
+        const resp = std.fmt.allocPrint(alloc, "HTTP/1.1 {d} {s}\r\nContent-Type: application/json\r\nDate: {s}\r\nContent-Length: {d}\r\n\r\n{s}", .{ status_code, status_text, &date_buf, body.len, body }) catch {
             error_response.sendError(self, .server_error, "response allocation failed");
             return;
         };

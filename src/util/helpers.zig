@@ -26,6 +26,42 @@ pub fn monotonicNanos() i64 {
     return @as(i64, @intCast(ts.sec)) * std.time.ns_per_s + @as(i64, @intCast(ts.nsec));
 }
 
+/// Wall-clock time in whole seconds since the Unix epoch. `std.time.timestamp`
+/// was removed in Zig 0.16; this reads CLOCK_REALTIME via the vDSO (no
+/// syscall) — safe to call per-response, not a proactor violation.
+pub fn realtimeSeconds() i64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.REALTIME, &ts);
+    return @as(i64, @intCast(ts.sec));
+}
+
+/// Format a Unix timestamp as an RFC 7231 IMF-fixdate HTTP-date, e.g.
+/// "Sun, 06 Nov 1994 08:49:37 GMT". Shared by the Date response header and
+/// static file Last-Modified.
+pub fn formatHttpDate(buf: *[29]u8, epoch_secs: i64) void {
+    const days = [_][]const u8{ "Thu", "Fri", "Sat", "Sun", "Mon", "Tue", "Wed" };
+    const months = [_][]const u8{ "Jan", "Feb", "Mar", "Apr", "May", "Jun", "Jul", "Aug", "Sep", "Oct", "Nov", "Dec" };
+
+    const epoch = std.time.epoch.EpochSeconds{ .secs = @intCast(@max(0, epoch_secs)) };
+    const day_seconds = epoch.getDaySeconds();
+    const epoch_day = epoch.getEpochDay();
+    const year_day = epoch_day.calculateYearDay();
+    const month_day = year_day.calculateMonthDay();
+
+    // Day of week: Jan 1 1970 was Thursday (days[0])
+    const dow_idx: usize = @intCast(@mod(@as(i64, @intCast(epoch_day.day)), 7));
+
+    _ = std.fmt.bufPrint(buf, "{s}, {d:0>2} {s} {d} {d:0>2}:{d:0>2}:{d:0>2} GMT", .{
+        days[dow_idx],
+        month_day.day_index + 1,
+        months[month_day.month.numeric() - 1],
+        year_day.year,
+        day_seconds.getHoursIntoDay(),
+        day_seconds.getMinutesIntoHour(),
+        day_seconds.getSecondsIntoMinute(),
+    }) catch {};
+}
+
 // -- Raw syscall wrappers ---------------------------------------------------
 // Zig 0.16 removed most `std.posix.*` syscall wrappers. These reimplement the
 // few keyway needs via raw `std.os.linux` / libc calls.
@@ -71,4 +107,11 @@ test "castUserdata round-trips a struct pointer" {
     try testing.expectEqual(@as(i32, 42), recovered.x);
     try testing.expectEqual(@as(i32, -7), recovered.y);
     try testing.expect(recovered == &p);
+}
+
+test "formatHttpDate produces valid format" {
+    var buf: [29]u8 = undefined;
+    // Unix epoch: Thu, 01 Jan 1970 00:00:00 GMT
+    formatHttpDate(&buf, 0);
+    try testing.expectEqualStrings("Thu, 01 Jan 1970 00:00:00 GMT", &buf);
 }
