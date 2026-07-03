@@ -79,6 +79,17 @@ keyway.routes["/test/sse"] = {
     end,
 }
 
+-- (#192) Sets on_message/on_close (like a WS handler would) but leaves
+-- sse_room unset, so the SSE upgrade is rejected with 400 — exercises the
+-- Lua-registry-ref cleanup on the SSE reject path.
+keyway.routes["/test/sse-no-room"] = {
+    GET = function(ctx)
+        ctx.on_message = function() end
+        ctx.on_close = function() end
+        ctx.upgrade = "sse"
+    end,
+}
+
 keyway.routes["/test/ws"] = {
     GET = function(ctx)
         ctx.upgrade = "websocket"
