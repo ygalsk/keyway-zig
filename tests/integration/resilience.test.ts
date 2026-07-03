@@ -38,6 +38,22 @@ describe("worker resilience regressions", () => {
       expect(await res.text()).toBe(body);
     });
   });
+
+  // (#226) A pathologically nested JSON body (well within the 64KB read
+  // buffer, so it actually reaches json.decode) must not hang or crash the
+  // worker — it should fail cleanly, and the worker must keep serving.
+  test("POST body with pathologically nested JSON does not crash the worker", async () => {
+    const depth = 30000;
+    const body = "[".repeat(depth) + "]".repeat(depth);
+    await withServer(async ({ base }) => {
+      const res = await fetch(`${base}/test/json-decode`, { method: "POST", body });
+      expect(res.status).toBeGreaterThanOrEqual(400);
+      expect(res.status).toBeLessThan(600);
+
+      const next = await fetch(`${base}/test/hello`);
+      expect(next.status).toBe(200);
+    });
+  });
 });
 
 describe("connection close after error responses (#180)", () => {
