@@ -790,10 +790,24 @@ pub const Connection = struct {
             return null;
         }
 
-        const route_match = self.router.match(request.method, clean_path, &self.param_cache) catch {
+        var route_match = self.router.match(request.method, clean_path, &self.param_cache) catch {
             error_response.sendError(self, .client_error, "route match error");
             return error.RouteMatchFailed;
         };
+
+        // RFC 9110 §9.1: HEAD must be supported wherever GET is. Fall back to
+        // the GET handler when no explicit HEAD route matched. `match` already
+        // populated param_cache while walking the trie above (regardless of
+        // the method miss), and `put` APPENDS rather than overwriting by key
+        // (src/http/params.zig) — clear before the retry or a parameterized
+        // route ends up with duplicate param entries.
+        if (route_match == null and std.mem.eql(u8, request.method, "HEAD")) {
+            self.param_cache.clear();
+            route_match = self.router.match("GET", clean_path, &self.param_cache) catch {
+                error_response.sendError(self, .client_error, "route match error");
+                return error.RouteMatchFailed;
+            };
+        }
 
         if (route_match == null) {
             if (self.router.methodsForPath(clean_path)) |methods| {
@@ -849,7 +863,19 @@ pub const Connection = struct {
             log.debug().string("msg", "ws response buf").int("len", response_bytes.len).string("content", response_bytes).log();
         }
 
-        self.submitSend(response_bytes, onWrite, false);
+        self.submitSend(self.stripBodyForHead(response_bytes), onWrite, false);
+    }
+
+    /// A HEAD response carries the headers (incl. Content-Length) a GET would
+    /// have sent, but no body (RFC 9110 §8.6, §9.3.2). Truncate an
+    /// already-serialized response right after its header block when the
+    /// request was HEAD; otherwise return it unchanged. Not folded into
+    /// submitSend: that function also carries WS/SSE/streaming frames and the
+    /// proxy relay, where a blanket strip would corrupt the payload.
+    fn stripBodyForHead(self: *Connection, bytes: []const u8) []const u8 {
+        if (!std.mem.eql(u8, self.http_state.request_method, "HEAD")) return bytes;
+        const header_end = std.mem.indexOf(u8, bytes, "\r\n\r\n") orelse return bytes;
+        return bytes[0 .. header_end + 4];
     }
 
     /// Submit a send on this connection's socket.
@@ -872,7 +898,7 @@ pub const Connection = struct {
 
     pub fn sendRawResponse(self: *Connection, text: []const u8) void {
         self.state = .writing;
-        self.submitSend(text, onWrite, true);
+        self.submitSend(self.stripBodyForHead(text), onWrite, true);
     }
 
     pub fn send400BadRequest(self: *Connection) void {
