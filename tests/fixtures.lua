@@ -59,6 +59,17 @@ keyway.routes["/test/echo"] = {
     end,
 }
 
+-- (#226) json.decode of an untrusted body must not crash the worker,
+-- however deeply nested the input is.
+keyway.routes["/test/json-decode"] = {
+    POST = function(ctx)
+        local json = require("keyway.json")
+        json.decode(ctx.body)
+        ctx.status = 200
+        ctx.body = "ok"
+    end,
+}
+
 keyway.routes["/test/status/{code}"] = {
     GET = function(ctx)
         local code = tonumber(ctx.params.code) or 200
