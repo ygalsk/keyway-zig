@@ -21,6 +21,7 @@ keyway.middleware.register("mw_after", mw_after)
 keyway.proxy["/__keyway/test-proxy"] = { host = "127.0.0.1", port = 38291, strip_prefix = true }
 keyway.proxy["/__keyway/test-proxy-dead"] = { host = "127.0.0.1", port = 1, strip_prefix = true }
 keyway.proxy["/__keyway/test-proxy-hung"] = { host = "127.0.0.1", port = 38292, strip_prefix = true }
+keyway.proxy["/__keyway/test-proxy-raw"] = { host = "127.0.0.1", port = 38293, strip_prefix = true }
 
 keyway.routes["/test/hello"] = {
     GET = function(ctx)

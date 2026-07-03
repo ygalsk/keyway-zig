@@ -5,9 +5,12 @@
 //! (io_uring) and never blocks it.
 //!
 //! Response framing: we send `Connection: close` upstream and read until EOF,
-//! buffering the whole response before relaying it (no Content-Length/chunked
-//! parsing). Upstream hosts are pre-resolved to an address at route
-//! registration, so the data path never does DNS.
+//! buffering the whole response, then parse it (picohttpparser) to strip
+//! hop-by-hop headers and regenerate Content-Length before relaying it to the
+//! client (#182) — a de-chunked or as-is body copied into a fresh buffer, not
+//! a streamed rewrite (see forwardProxyResponse). Upstream hosts are
+//! pre-resolved to an address at route registration, so the data path never
+//! does DNS.
 //!
 //! Connect/send/recv go through xev.TCP rather than raw xev.Completion ops
 //! (the pattern the rest of this file's siblings use for the client socket):
@@ -53,12 +56,17 @@ pub const ProxyState = struct {
     // timeout (see onProxyTimeout) — a cancel op needs its own completion
     // struct, separate from the one it targets.
     cancel_completion: xev.Completion = .{},
+    // Hop-by-hop-stripped, reframed response sent to the client (built by
+    // forwardProxyResponse). Own base_allocator buffer, like request_buf: it
+    // must outlive the async send. Empty until set.
+    client_response: []const u8 = &.{},
 
     pub fn deinit(self: *ProxyState, allocator: std.mem.Allocator) void {
         helpers.closeFd(self.tcp.fd);
         allocator.free(self.request_buf);
         allocator.free(self.recv_buf);
         self.response.deinit(allocator);
+        if (self.client_response.len > 0) allocator.free(self.client_response);
     }
 };
 
@@ -397,18 +405,38 @@ fn onProxyUpstreamRecv(
     return .disarm;
 }
 
-/// Parse the 3-digit status code from a buffered upstream response's status
-/// line (e.g. "HTTP/1.1 502 Bad Gateway\r\n" -> 502). Returns null if the
-/// buffer is too short or doesn't start with a well-formed status line.
-/// Never allocates.
-fn parseUpstreamStatus(response: []const u8) ?u16 {
-    if (response.len < 12) return null;
-    if (!std.mem.startsWith(u8, response, "HTTP/1.")) return null;
-    if (!std.ascii.isDigit(response[7]) or response[8] != ' ') return null;
-    return std.fmt.parseInt(u16, response[9..12], 10) catch null;
+/// True if `headers`' final Transfer-Encoding coding is "chunked" (RFC 7230
+/// §3.3.2/§3.3.3: repeated TE headers combine, so the *last* header's *last*
+/// comma-separated token is what determines chunked-ness). Mirrors the
+/// identical check in Parser.parseRequest, duplicated here rather than
+/// shared: that one operates inline over raw picohttpparser output while
+/// parsing a request, this one over an already-parsed Header slice.
+fn isChunkedResponse(headers: []const http.Header) bool {
+    var te_val: ?[]const u8 = null;
+    for (headers) |h| {
+        if (std.ascii.eqlIgnoreCase(h.name, "transfer-encoding")) te_val = h.value;
+    }
+    const val = te_val orelse return false;
+    const last_token = if (std.mem.lastIndexOfScalar(u8, val, ',')) |idx| val[idx + 1 ..] else val;
+    return std.ascii.eqlIgnoreCase(std.mem.trim(u8, last_token, " \t"), "chunked");
 }
 
-/// Relay the buffered upstream response to the client.
+/// True if a response to this exchange carries no body, per RFC 9110
+/// §6.4.1: the request was HEAD, or status is 1xx/204/304.
+fn responseHasNoBody(request_method: []const u8, status: u16) bool {
+    if (std.mem.eql(u8, request_method, "HEAD")) return true;
+    if (status >= 100 and status <= 199) return true;
+    if (status == 204 or status == 304) return true;
+    return false;
+}
+
+/// Parse the buffered upstream response, strip hop-by-hop headers, and
+/// relay it to the client.
+///
+/// ponytail: buffered relay — the whole body is copied into a fresh
+/// base_allocator buffer rather than rewritten in place/streamed. Simple and
+/// correct for the read-to-EOF buffering this file already does; a
+/// zero-copy/streaming relay is future work (out of scope for #182).
 fn forwardProxyResponse(self: *Connection) void {
     self.cancelRequestTimer();
     const ps = &self.proxy_state.?;
@@ -416,19 +444,71 @@ fn forwardProxyResponse(self: *Connection) void {
         proxyFail(self, 502, "proxy upstream empty response");
         return;
     }
-    // Log the real upstream status rather than a hardcoded 200 (#73). The
-    // response bytes are relayed to the client verbatim regardless; if the
-    // status line doesn't parse, the upstream didn't send valid HTTP, so we
-    // log 502 (bad gateway) rather than lie with 200.
-    self.logAccess(parseUpstreamStatus(ps.response.items) orelse 502);
+
+    var parser = http.Parser.init(self.base_allocator);
+    const head = parser.parseResponseHead(ps.response.items) catch {
+        proxyFail(self, 502, "proxy upstream invalid response");
+        return;
+    };
+    defer self.base_allocator.free(head.headers);
+
+    // Log the real upstream status rather than a hardcoded 200 (#73).
+    self.logAccess(head.status);
+
+    var chunked_body: ?[]const u8 = null;
+    defer if (chunked_body) |cb| self.base_allocator.free(cb);
+
+    const body: []const u8 = if (responseHasNoBody(self.http_state.request_method, head.status))
+        ""
+    else if (isChunkedResponse(head.headers)) blk: {
+        const decoded = http.decodeChunkedBody(ps.response.items[head.head_len..], self.base_allocator) catch {
+            proxyFail(self, 502, "proxy upstream invalid chunked body");
+            return;
+        };
+        chunked_body = decoded.body;
+        break :blk decoded.body;
+    } else
+        // Read-to-EOF already gives the full body; the upstream's own
+        // Content-Length (if any) is not authoritative — these bytes are.
+        ps.response.items[head.head_len..];
+
+    // Re-emit into a fresh base_allocator buffer: normalized status line,
+    // every parsed header that isn't hop-by-hop (isHopByHop already strips
+    // framing headers too, so Content-Length/Transfer-Encoding below are the
+    // only ones emitted), regenerated framing, then the body.
+    var aw: std.Io.Writer.Allocating = std.Io.Writer.Allocating.initCapacity(self.base_allocator, ps.response.items.len) catch {
+        proxyFail(self, 502, "proxy response build failed");
+        return;
+    };
+    defer aw.deinit();
+    const w = &aw.writer;
+    const build_ok = blk: {
+        w.print("HTTP/1.1 {d} {s}\r\n", .{ head.status, head.reason }) catch break :blk false;
+        for (head.headers) |h| {
+            if (isHopByHop(h.name, head.headers)) continue;
+            w.print("{s}: {s}\r\n", .{ h.name, h.value }) catch break :blk false;
+        }
+        w.print("Content-Length: {d}\r\n\r\n", .{body.len}) catch break :blk false;
+        w.writeAll(body) catch break :blk false;
+        break :blk true;
+    };
+    if (!build_ok) {
+        proxyFail(self, 502, "proxy response build failed");
+        return;
+    }
+
+    ps.client_response = aw.toOwnedSlice() catch {
+        proxyFail(self, 502, "proxy response build failed");
+        return;
+    };
     // Send directly from proxy_state's base_allocator buffer (arena_dupe=false)
     // rather than through sendRawResponse: that buffer must stay valid until
     // the write completion actually fires (io_uring reads it asynchronously),
     // so cleanupProxy runs from handler.zig's onWrite once the send is
     // confirmed done — not here. Freeing it at submission time would race the
-    // in-flight send; also avoids a full copy of a possibly large response.
+    // in-flight send.
     self.state = .writing;
-    self.submitSend(ps.response.items, handler_mod.Connection.onWrite, false);
+    self.submitSend(ps.client_response, handler_mod.Connection.onWrite, false);
 }
 
 /// Send an error to the client and tear down proxy state. Safe to call from any
@@ -460,30 +540,6 @@ pub fn cleanupProxy(self: *Connection) void {
 // =============================================================================
 // Tests
 // =============================================================================
-
-test "parseUpstreamStatus: well-formed status lines" {
-    try std.testing.expectEqual(@as(?u16, 200), parseUpstreamStatus("HTTP/1.1 200 OK\r\n\r\n"));
-    try std.testing.expectEqual(@as(?u16, 404), parseUpstreamStatus("HTTP/1.1 404 Not Found\r\n\r\n"));
-    try std.testing.expectEqual(@as(?u16, 502), parseUpstreamStatus("HTTP/1.0 502 Bad Gateway\r\n\r\n"));
-}
-
-test "parseUpstreamStatus: 3-digit boundary codes" {
-    try std.testing.expectEqual(@as(?u16, 100), parseUpstreamStatus("HTTP/1.1 100 Continue\r\n\r\n"));
-    try std.testing.expectEqual(@as(?u16, 999), parseUpstreamStatus("HTTP/1.1 999 X\r\n\r\n"));
-    try std.testing.expectEqual(@as(?u16, 200), parseUpstreamStatus("HTTP/1.1 200")); // exact len == 12, no trailing bytes
-}
-
-test "parseUpstreamStatus: malformed status line" {
-    try std.testing.expectEqual(@as(?u16, null), parseUpstreamStatus("not an http response at all"));
-    try std.testing.expectEqual(@as(?u16, null), parseUpstreamStatus("HTTP/1.1-200 OK\r\n\r\n"));
-    try std.testing.expectEqual(@as(?u16, null), parseUpstreamStatus("HTTP/1.1 abc OK\r\n\r\n"));
-    try std.testing.expectEqual(@as(?u16, null), parseUpstreamStatus("HTTP/2 200 OK\r\n\r\n")); // not HTTP/1.x
-}
-
-test "parseUpstreamStatus: short buffer" {
-    try std.testing.expectEqual(@as(?u16, null), parseUpstreamStatus(""));
-    try std.testing.expectEqual(@as(?u16, null), parseUpstreamStatus("HTTP/1.1 2"));
-}
 
 fn testRoute() router_mod.ProxyRoute {
     return .{
@@ -596,4 +652,32 @@ test "buildUpstreamRequest: GET with no body and no framing headers emits no Con
     defer std.testing.allocator.free(built);
 
     try std.testing.expect(std.mem.indexOf(u8, built, "Content-Length") == null);
+}
+
+test "isChunkedResponse: last Transfer-Encoding header's last coding determines chunked-ness" {
+    try std.testing.expect(isChunkedResponse(&[_]http.Header{
+        .{ .name = "Transfer-Encoding", .value = "chunked" },
+    }));
+    try std.testing.expect(isChunkedResponse(&[_]http.Header{
+        .{ .name = "Transfer-Encoding", .value = "gzip, chunked" },
+    }));
+    try std.testing.expect(!isChunkedResponse(&[_]http.Header{
+        .{ .name = "Transfer-Encoding", .value = "chunked, gzip" },
+    }));
+    try std.testing.expect(!isChunkedResponse(&[_]http.Header{}));
+    // Repeated headers combine (RFC 7230 §3.3.2) — the last one wins.
+    try std.testing.expect(isChunkedResponse(&[_]http.Header{
+        .{ .name = "Transfer-Encoding", .value = "gzip" },
+        .{ .name = "Transfer-Encoding", .value = "chunked" },
+    }));
+}
+
+test "responseHasNoBody: HEAD, 1xx, 204, 304 have no body; everything else does" {
+    try std.testing.expect(responseHasNoBody("HEAD", 200));
+    try std.testing.expect(responseHasNoBody("GET", 100));
+    try std.testing.expect(responseHasNoBody("GET", 199));
+    try std.testing.expect(responseHasNoBody("GET", 204));
+    try std.testing.expect(responseHasNoBody("GET", 304));
+    try std.testing.expect(!responseHasNoBody("GET", 200));
+    try std.testing.expect(!responseHasNoBody("POST", 404));
 }
