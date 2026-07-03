@@ -51,10 +51,11 @@ const Node = struct {
             self.allocator.destroy(param);
         }
 
-        // Free pattern string
-        if (self.pattern.len > 0) {
-            self.allocator.free(self.pattern);
-        }
+        // pattern is NOT freed here — it's an interned string owned by the
+        // Router's intern pool (see Router.internPattern), which deliberately
+        // outlives reset()/node teardown so callers who capture a matched
+        // pattern (route_pattern, timing.route, Prometheus labels) don't hold
+        // a dangling slice across a hot-reload (#225).
 
         // Free handler methods map
         if (self.methods) |*m| {
@@ -113,6 +114,12 @@ pub const Router = struct {
     root: *Node,
     static_routes: std.ArrayListUnmanaged(StaticRoute) = .empty,
     proxy_routes: std.ArrayListUnmanaged(ProxyRoute) = .empty,
+
+    // Route pattern strings, deduped and owned independently of the trie.
+    // Patterns are a small, bounded set fixed at route-load time, so this
+    // stays small even under repeated `--watch` reloads. Deliberately NOT
+    // freed by reset() — see internPattern() and node.pattern (#225).
+    intern: std.StringHashMapUnmanaged(void) = .empty,
 
     /// Initialize radix router
     pub fn init(allocator: std.mem.Allocator) !Router {
@@ -271,13 +278,27 @@ pub const Router = struct {
             node.methods = std.StringHashMap(i32).init(self.allocator);
         }
 
-        // Store pattern on the leaf node (for Prometheus route labels)
+        // Store pattern on the leaf node (for Prometheus route labels).
+        // Interned rather than node-owned so it survives Router.reset() (#225).
         if (node.pattern.len == 0) {
-            node.pattern = try self.allocator.dupe(u8, pattern);
+            node.pattern = try self.internPattern(pattern);
         }
 
         const method_copy = try self.allocator.dupe(u8, method);
         try node.methods.?.put(method_copy, lua_ref);
+    }
+
+    /// Return a stable, deduped copy of `pattern` owned by the Router's intern
+    /// pool. Unlike trie-node-owned strings, interned strings are not freed by
+    /// reset() — they live as long as the Router itself, so a pattern handed
+    /// out via RouteMatch stays valid across a hot-reload even after the trie
+    /// node that produced it is torn down (#225).
+    fn internPattern(self: *Router, pattern: []const u8) ![]const u8 {
+        const gop = try self.intern.getOrPut(self.allocator, pattern);
+        if (!gop.found_existing) {
+            gop.key_ptr.* = try self.allocator.dupe(u8, pattern);
+        }
+        return gop.key_ptr.*;
     }
 
     pub const RouteMatch = struct { lua_ref: i32, pattern: []const u8 };
@@ -418,6 +439,12 @@ pub const Router = struct {
         self.freeProxyRoutes();
         self.proxy_routes.deinit(self.allocator);
         self.root.deinit();
+
+        // Intern pool outlives reset() by design — free it only here, on
+        // Router teardown (process/worker shutdown), not on every reload.
+        var it = self.intern.keyIterator();
+        while (it.next()) |key| self.allocator.free(key.*);
+        self.intern.deinit(self.allocator);
     }
 };
 
@@ -616,6 +643,28 @@ test "router reset clears all routes" {
     var p = params.ParamArray{};
     const result = try router.match("GET", "/users", &p);
     try std.testing.expect(result == null);
+}
+
+test "matched route pattern outlives Router.reset() (#225)" {
+    // A WebSocket/SSE connection captures RouteMatch.pattern once at handshake
+    // and never refreshes it, so if reset() frees the memory backing it, the
+    // next read after a hot-reload is a use-after-free. Uses page_allocator
+    // (not std.testing.allocator) because it munmaps on free with no bucket
+    // reuse to mask the bug — a regression here crashes this test outright
+    // instead of silently reading stale-but-still-mapped bytes.
+    var router = try Router.init(std.heap.page_allocator);
+    defer router.deinit();
+
+    try router.addRoute("GET", "/users/{id}", 1);
+    var p = params.ParamArray{};
+    const before = (try router.match("GET", "/users/42", &p)).?;
+    const captured: []const u8 = before.pattern;
+    p.clear();
+
+    try router.reset();
+    try router.addRoute("GET", "/users/{id}", 2); // reload re-registers the same route
+
+    try std.testing.expectEqualStrings("/users/{id}", captured);
 }
 
 test "collectLuaRefs gathers all refs" {
