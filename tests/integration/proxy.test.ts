@@ -18,11 +18,32 @@ const base = () => globalThis.__KEYWAY_BASE;
 const port = () => globalThis.__KEYWAY_PORT;
 const UPSTREAM_PORT = 38291;
 const HUNG_UPSTREAM_PORT = 38292;
+const RAW_UPSTREAM_PORT = 38293;
 const LARGE_SIZE = 500_000; // ~32 chunks at a 16 KB recv buffer
 const LARGE_BODY = "x".repeat(LARGE_SIZE);
 
+// Response bodies for the raw upstream below (#182). Bun.serve's Response
+// object won't let a handler set hop-by-hop headers like Connection/
+// Keep-Alive/Proxy-Authenticate (the runtime owns and strips them), and
+// fetch()'s injects its own Transfer-Encoding for chunked bodies rather than
+// letting us hand-write chunk framing — so both cases need a raw socket that
+// writes the exact bytes on the wire, same pattern as hungUpstream above.
+const HOP_BODY = "hop-body!";
+const HOP_RESPONSE =
+  `HTTP/1.1 200 OK\r\n` +
+  `Keep-Alive: timeout=5\r\n` +
+  `Proxy-Authenticate: Basic\r\n` +
+  `Connection: x-hop\r\n` +
+  `X-Hop: leak\r\n` +
+  `X-Normal: keep\r\n` +
+  `Content-Length: ${HOP_BODY.length}\r\n\r\n` +
+  HOP_BODY;
+const CHUNKED_BODY = "hello world";
+const CHUNKED_RESPONSE = `HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\n\r\n5\r\nhello\r\n6\r\n world\r\n0\r\n\r\n`;
+
 let upstream: Server | null = null;
 let hungUpstream: TCPSocketListener | null = null;
+let rawUpstream: TCPSocketListener | null = null;
 
 beforeAll(() => {
   upstream = Bun.serve({
@@ -73,6 +94,30 @@ beforeAll(() => {
       error() {},
     },
   });
+
+  // Serves the two raw responses above by request path, then closes — a
+  // real upstream honoring the proxy's forced `Connection: close`.
+  rawUpstream = Bun.listen({
+    hostname: "127.0.0.1",
+    port: RAW_UPSTREAM_PORT,
+    socket: {
+      data(socket, data) {
+        const req = data.toString();
+        if (req.startsWith("GET /hopbyhop ")) {
+          socket.write(HOP_RESPONSE);
+        } else if (req.startsWith("GET /chunked ")) {
+          socket.write(CHUNKED_RESPONSE);
+        } else {
+          socket.write("HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\n\r\n");
+        }
+        socket.end();
+      },
+      open() {},
+      close() {},
+      drain() {},
+      error() {},
+    },
+  });
 });
 
 afterAll(() => {
@@ -80,6 +125,8 @@ afterAll(() => {
   upstream = null;
   hungUpstream?.stop(true);
   hungUpstream = null;
+  rawUpstream?.stop(true);
+  rawUpstream = null;
 });
 
 // Raw-socket helper (mirrors smuggling.test.ts's rawStatus): fetch() can't
@@ -192,6 +239,47 @@ describe("reverse proxy", () => {
 
     const metrics = await (await fetch(`${base()}/metrics`)).text();
     expect(metrics).toMatch(/keyway_http_requests_total\{[^}]*status="500"[^}]*\}/);
+  });
+
+  // #182: forwardProxyResponse used to relay the buffered upstream response
+  // verbatim, so every hop-by-hop response header (Connection, Keep-Alive,
+  // Proxy-Authenticate, plus anything the upstream's Connection header
+  // nominates) leaked straight to the client.
+  test("strips hop-by-hop response headers, keeps end-to-end ones, and reports a correct Content-Length", async () => {
+    const raw = await rawRequest(
+      `GET /__keyway/test-proxy-raw/hopbyhop HTTP/1.1\r\n` +
+        `Host: 127.0.0.1:${port()}\r\n` +
+        `Connection: close\r\n\r\n`,
+    );
+    const headerEnd = raw.indexOf("\r\n\r\n");
+    const headerBlock = raw.slice(0, headerEnd).toLowerCase();
+    const body = raw.slice(headerEnd + 4);
+
+    expect(headerBlock).not.toContain("keep-alive:");
+    expect(headerBlock).not.toContain("proxy-authenticate:");
+    expect(headerBlock).not.toContain("x-hop:");
+    expect(headerBlock).not.toContain("connection:");
+    expect(headerBlock).toContain("x-normal: keep");
+    expect(headerBlock).toContain(`content-length: ${HOP_BODY.length}`);
+    expect(body).toBe(HOP_BODY);
+  });
+
+  // #182: a chunked upstream response used to be relayed with its original
+  // Transfer-Encoding: chunked header and raw chunk framing still attached —
+  // wrong framing for a response keyway itself didn't chunk-encode.
+  test("re-frames a chunked upstream response as Content-Length", async () => {
+    const raw = await rawRequest(
+      `GET /__keyway/test-proxy-raw/chunked HTTP/1.1\r\n` +
+        `Host: 127.0.0.1:${port()}\r\n` +
+        `Connection: close\r\n\r\n`,
+    );
+    const headerEnd = raw.indexOf("\r\n\r\n");
+    const headerBlock = raw.slice(0, headerEnd).toLowerCase();
+    const body = raw.slice(headerEnd + 4);
+
+    expect(headerBlock).not.toContain("transfer-encoding");
+    expect(headerBlock).toContain(`content-length: ${CHUNKED_BODY.length}`);
+    expect(body).toBe(CHUNKED_BODY);
   });
 });
 

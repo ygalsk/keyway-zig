@@ -309,6 +309,70 @@ pub const Parser = struct {
         }
         return null;
     }
+
+    /// Parse an HTTP response's status line + headers from a buffer via
+    /// picohttpparser. Mirrors parseRequest, but for responses — used by the
+    /// reverse-proxy response path (proxy.zig's forwardProxyResponse) to
+    /// parse the buffered upstream response before stripping hop-by-hop
+    /// headers and re-emitting it to the client (#182). Body framing is the
+    /// caller's job: `head_len` is where the body starts in `buf`.
+    pub fn parseResponseHead(self: *Parser, buf: []const u8) !ResponseHead {
+        var minor_version: c_int = 0;
+        var status: c_int = 0;
+        var msg_ptr: [*c]const u8 = undefined;
+        var msg_len: usize = 0;
+
+        const max_headers: usize = config.MAX_HEADERS;
+        var c_headers: [max_headers]c.struct_phr_header = undefined;
+        var num_headers: usize = max_headers;
+
+        const result = c.phr_parse_response(
+            buf.ptr,
+            buf.len,
+            &minor_version,
+            &status,
+            @ptrCast(&msg_ptr),
+            &msg_len,
+            &c_headers,
+            &num_headers,
+            0, // last_len (0 for first parse)
+        );
+
+        if (result == -2) {
+            return error.Incomplete;
+        }
+        if (result == -1) {
+            return error.InvalidRequest;
+        }
+
+        const reason = msg_ptr[0..msg_len];
+
+        var headers = try self.allocator.alloc(Header, num_headers);
+        for (0..num_headers) |i| {
+            const h = c_headers[i];
+            headers[i] = Header{
+                .name = h.name[0..h.name_len],
+                .value = h.value[0..h.value_len],
+            };
+        }
+
+        return ResponseHead{
+            .status = @intCast(status),
+            .reason = reason,
+            .minor_version = minor_version,
+            .headers = headers,
+            .head_len = @intCast(result),
+        };
+    }
+};
+
+/// Parsed HTTP response status line + headers (see Parser.parseResponseHead).
+pub const ResponseHead = struct {
+    status: u16,
+    reason: []const u8, // slice into buf
+    minor_version: c_int,
+    headers: []Header, // caller frees with the allocator passed to Parser.init
+    head_len: usize, // byte offset in buf where the body begins
 };
 
 test "response serialization" {
@@ -566,15 +630,17 @@ pub fn encodeChunk(allocator: std.mem.Allocator, data: []const u8) ![]const u8 {
 pub const terminal_chunk = "0\r\n\r\n";
 
 /// Result of decoding a chunked transfer-encoded body.
-const ChunkedResult = struct {
+pub const ChunkedResult = struct {
     body: []const u8,
     total_consumed: usize,
 };
 
 /// Decode a chunked transfer-encoded body.
-/// Returns the reassembled body (arena-allocated) and total bytes consumed.
-/// Returns error.Incomplete if the terminal chunk hasn't been received yet.
-fn decodeChunkedBody(data: []const u8, allocator: std.mem.Allocator) !ChunkedResult {
+/// Returns the reassembled body (allocated with the passed allocator) and
+/// total bytes consumed. Returns error.Incomplete if the terminal chunk
+/// hasn't been received yet. Public: also used by proxy.zig to decode a
+/// chunked upstream response body (#182).
+pub fn decodeChunkedBody(data: []const u8, allocator: std.mem.Allocator) !ChunkedResult {
     var body_buf: std.ArrayListUnmanaged(u8) = .empty;
     errdefer body_buf.deinit(allocator);
     var pos: usize = 0;
@@ -698,6 +764,29 @@ test "decodeChunkedBody returns Incomplete for trailer missing final blank line"
     const allocator = std.testing.allocator;
     const data = "5\r\nHello\r\n0\r\nX-Trailer: v\r\n";
     try std.testing.expectError(error.Incomplete, decodeChunkedBody(data, allocator));
+}
+
+test "parseResponseHead parses status, reason, headers, and head_len" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    const buf = "HTTP/1.1 200 OK\r\nX-Foo: bar\r\nContent-Length: 5\r\n\r\nhello";
+    const head = try parser.parseResponseHead(buf);
+    defer allocator.free(head.headers);
+
+    try std.testing.expectEqual(@as(u16, 200), head.status);
+    try std.testing.expectEqualStrings("OK", head.reason);
+    try std.testing.expectEqual(@as(usize, 2), head.headers.len);
+    try std.testing.expectEqualStrings("X-Foo", head.headers[0].name);
+    try std.testing.expectEqualStrings("bar", head.headers[0].value);
+    try std.testing.expectEqualStrings("Content-Length", head.headers[1].name);
+    try std.testing.expectEqualStrings("hello", buf[head.head_len..]);
+}
+
+test "parseResponseHead rejects a malformed status line" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+    const buf = "not an http response at all\r\n\r\n";
+    try std.testing.expectError(error.InvalidRequest, parser.parseResponseHead(buf));
 }
 
 test "serializeChunkedHeaders omits Content-Length" {
