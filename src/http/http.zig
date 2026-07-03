@@ -14,6 +14,11 @@ pub const Request = struct {
     body: []const u8,
     /// Total bytes consumed from input buffer (headers + body per Content-Length)
     raw_len: usize,
+    /// True if the connection should be closed after this request's response
+    /// is written (#204): client sent `Connection: close`, or HTTP/1.0
+    /// without an explicit `Connection: keep-alive`. Defaulted so existing
+    /// test call sites that build a Request directly don't need updating.
+    wants_close: bool = false,
 };
 
 /// HTTP response
@@ -211,12 +216,16 @@ pub const Parser = struct {
         const bytes_consumed = @as(usize, @intCast(result));
 
         // Single pass over headers: collect Content-Length (rejecting malformed
-        // values and duplicates whose parsed values disagree) and the value of
+        // values and duplicates whose parsed values disagree), the value of
         // the last Transfer-Encoding header (repeated TE headers combine per
-        // RFC 7230 §3.3.2 — the final coding is what determines chunked-ness).
+        // RFC 7230 §3.3.2 — the final coding is what determines chunked-ness),
+        // and Connection: close/keep-alive tokens (#204) — OR'd across any
+        // repeated Connection headers.
         var content_length: ?usize = null;
         var transfer_encoding: ?[]const u8 = null;
         var host_count: usize = 0;
+        var conn_close = false;
+        var conn_keep_alive = false;
         for (0..num_headers) |i| {
             const h = c_headers[i];
             const name = h.name[0..h.name_len];
@@ -242,8 +251,19 @@ pub const Parser = struct {
                 }
             } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
                 transfer_encoding = h.value[0..h.value_len];
+            } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
+                var it = std.mem.splitScalar(u8, h.value[0..h.value_len], ',');
+                while (it.next()) |tok| {
+                    const trimmed = std.mem.trim(u8, tok, " \t");
+                    if (std.ascii.eqlIgnoreCase(trimmed, "close")) conn_close = true;
+                    if (std.ascii.eqlIgnoreCase(trimmed, "keep-alive")) conn_keep_alive = true;
+                }
             }
         }
+
+        // RFC 9112 §9.6: HTTP/1.0 defaults to close unless the client asked
+        // to keep-alive; any version closes if the client asked to close.
+        const wants_close = conn_close or (minor_version == 0 and !conn_keep_alive);
 
         // RFC 9112 §3.2: an HTTP/1.1 request MUST have exactly one Host header.
         // HTTP/1.0 has no such requirement.
@@ -285,6 +305,7 @@ pub const Parser = struct {
                 .headers = headers,
                 .body = decoded.body,
                 .raw_len = bytes_consumed + decoded.total_consumed,
+                .wants_close = wants_close,
             };
         }
 
@@ -304,6 +325,7 @@ pub const Parser = struct {
             .headers = headers,
             .body = body,
             .raw_len = total_needed,
+            .wants_close = wants_close,
         };
     }
 
@@ -625,6 +647,68 @@ test "http parser - HTTP/1.0 request with no Host header parses OK" {
     const request_result = try parser.parseRequest(request);
     defer allocator.free(request_result.headers);
     try std.testing.expectEqualStrings("/test", request_result.path);
+}
+
+test "parseRequest wants_close (#204): HTTP/1.0 implicit close" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+
+    const request = "GET /test HTTP/1.0\r\n\r\n";
+    const result = try parser.parseRequest(request);
+    defer allocator.free(result.headers);
+    try std.testing.expect(result.wants_close);
+}
+
+test "parseRequest wants_close (#204): HTTP/1.0 with Connection: keep-alive stays open" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+
+    const request = "GET /test HTTP/1.0\r\nConnection: keep-alive\r\n\r\n";
+    const result = try parser.parseRequest(request);
+    defer allocator.free(result.headers);
+    try std.testing.expect(!result.wants_close);
+}
+
+test "parseRequest wants_close (#204): HTTP/1.1 default keep-alive" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+
+    const request = "GET /test HTTP/1.1\r\nHost: localhost\r\n\r\n";
+    const result = try parser.parseRequest(request);
+    defer allocator.free(result.headers);
+    try std.testing.expect(!result.wants_close);
+}
+
+test "parseRequest wants_close (#204): HTTP/1.1 with Connection: close" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+
+    const request = "GET /test HTTP/1.1\r\nHost: localhost\r\nConnection: close\r\n\r\n";
+    const result = try parser.parseRequest(request);
+    defer allocator.free(result.headers);
+    try std.testing.expect(result.wants_close);
+}
+
+test "parseRequest wants_close (#204): case-insensitive header name and token, whitespace-trimmed" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+
+    const request = "GET /test HTTP/1.1\r\nHost: localhost\r\nCONNECTION:  CLOSE \r\n\r\n";
+    const result = try parser.parseRequest(request);
+    defer allocator.free(result.headers);
+    try std.testing.expect(result.wants_close);
+}
+
+test "parseRequest wants_close (#204): repeated Connection headers OR their tokens" {
+    const allocator = std.testing.allocator;
+    var parser = Parser.init(allocator);
+
+    // First Connection header names an unrelated hop-by-hop token, second
+    // carries close — both headers' tokens must be scanned, not just the last.
+    const request = "GET /test HTTP/1.1\r\nHost: localhost\r\nConnection: X-Foo\r\nConnection: close\r\n\r\n";
+    const result = try parser.parseRequest(request);
+    defer allocator.free(result.headers);
+    try std.testing.expect(result.wants_close);
 }
 
 test "serialize no longer special-cases 101 — a tenant ctx.status=101 is framed, not desynced (#194, #206)" {
