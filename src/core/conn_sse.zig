@@ -6,6 +6,7 @@ const castUserdata = @import("../util/helpers.zig").castUserdata;
 const HttpExchange = @import("../http/http_exchange.zig").HttpExchange;
 const SseRegistry = @import("../protocol/sse.zig").SseRegistry;
 const config = @import("../util/config.zig");
+const Lua = @import("luajit").Lua;
 
 /// SSE connection state — set after successful SSE upgrade.
 /// Holds all SSE-specific fields; Connection.sse_state is ?SseState = null.
@@ -38,6 +39,18 @@ pub const SseState = struct {
 
 /// Handle SSE upgrade: send headers, set state, subscribe to registry.
 pub fn handleSseUpgrade(self: *Connection, exchange: *HttpExchange) void {
+    // ctx.on_message/on_close are ref'd into the Lua registry before this
+    // runs (lua_api.zig), but SSE never uses them — SseState has no callback
+    // fields (#175 is WS's twin: it moves the refs into WsState on success).
+    // Free them here on every return from this function so a handler that
+    // sets both then upgrades to SSE doesn't pin them in the registry
+    // forever (#192).
+    const lua = self.lua_state.lua;
+    defer {
+        if (exchange.ws_on_message_ref != 0) lua.unref(Lua.PseudoIndex.Registry, exchange.ws_on_message_ref);
+        if (exchange.ws_on_close_ref != 0) lua.unref(Lua.PseudoIndex.Registry, exchange.ws_on_close_ref);
+    }
+
     const room = exchange.sse_room;
     if (room.len == 0) {
         self.logAccess(400);

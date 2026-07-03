@@ -102,4 +102,24 @@ describe("sse", () => {
       socket.terminate();
     }
   }, 20000);
+
+  // (#192) ctx.on_message/on_close ref the handler into the Lua registry
+  // before the upgrade runs (lua_api.zig); the SSE reject path (missing
+  // sse_room -> 400) never frees them unless conn_sse.handleSseUpgrade
+  // unrefs on every return, mirroring the WS twin (#175). There's no
+  // network-reachable signal for Lua registry size, so this can't assert
+  // the leak is fixed directly — it only proves the reject path keeps
+  // working (and doesn't wedge/crash) across many upgrade attempts that
+  // each ref two callbacks. The fix itself is inspection-verified.
+  test("repeated rejected SSE upgrades with on_message/on_close set stay healthy", async () => {
+    for (let i = 0; i < 50; i++) {
+      const res = await fetch(`${base()}/test/sse-no-room`);
+      expect(res.status).toBe(400);
+      await res.arrayBuffer();
+    }
+
+    // Server is still serving requests normally after the loop.
+    const health = await fetch(`${base()}/test/hello`);
+    expect(health.status).toBe(200);
+  });
 });
