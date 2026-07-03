@@ -69,84 +69,25 @@ const Node = struct {
     }
 };
 
-/// Segment-keyed trie for longest-prefix matching of proxy/static mounts.
-/// Lookup is O(path-segments) — consistent with the dynamic route trie, no
-/// O(n) scan over every mount.
-/// ponytail: the StaticRoute/ProxyRoute arrays still own the route structs;
-/// this trie only maps a prefix to an index into them. Collapse the two only
-/// if mount counts ever grow enough to make the parallel array's memory matter.
-const PrefixTrie = struct {
-    root: *PNode,
+const MountMatch = struct { index: usize, suffix: []const u8 };
 
-    const PNode = struct {
-        allocator: std.mem.Allocator,
-        children: std.StringHashMap(*PNode),
-        route: ?usize, // index into the owning routes array, set where a mount ends
-
-        fn init(allocator: std.mem.Allocator) !*PNode {
-            const node = try allocator.create(PNode);
-            node.* = .{
-                .allocator = allocator,
-                .children = std.StringHashMap(*PNode).init(allocator),
-                .route = null,
-            };
-            return node;
+/// Longest-prefix match over a mount routes slice (T must have a `prefix:
+/// []const u8` field), aligned on a path segment boundary — "/abc" does not
+/// match mount "/a". O(mounts): real configs have a handful, indistinguishable
+/// from a trie at that scale.
+fn matchMountPrefix(comptime T: type, routes: []const T, path: []const u8) ?MountMatch {
+    var best: ?MountMatch = null;
+    for (routes, 0..) |route, i| {
+        const p = route.prefix;
+        if (path.len < p.len or !std.mem.startsWith(u8, path, p)) continue;
+        const at_boundary = path.len == p.len or path[p.len] == '/' or (p.len > 0 and p[p.len - 1] == '/');
+        if (!at_boundary) continue;
+        if (best == null or p.len >= routes[best.?.index].prefix.len) {
+            best = .{ .index = i, .suffix = path[p.len..] };
         }
-
-        fn deinit(self: *PNode) void {
-            var it = self.children.iterator();
-            while (it.next()) |entry| {
-                self.allocator.free(entry.key_ptr.*); // free duplicated segment key
-                entry.value_ptr.*.deinit();
-            }
-            self.children.deinit();
-            self.allocator.destroy(self);
-        }
-    };
-
-    fn init(allocator: std.mem.Allocator) !PrefixTrie {
-        return .{ .root = try PNode.init(allocator) };
     }
-
-    fn deinit(self: *PrefixTrie) void {
-        self.root.deinit();
-    }
-
-    /// Insert a mount prefix, associating it with an index into the routes array.
-    fn insert(self: *PrefixTrie, prefix: []const u8, index: usize) !void {
-        var node = self.root;
-        var it = std.mem.splitScalar(u8, prefix, '/');
-        while (it.next()) |segment| {
-            if (segment.len == 0) continue; // skip empty segments (leading/trailing /)
-            const gop = try node.children.getOrPut(segment);
-            if (!gop.found_existing) {
-                // HashMap owns a duplicated key; identical bytes hash the same.
-                gop.key_ptr.* = try node.allocator.dupe(u8, segment);
-                gop.value_ptr.* = try PNode.init(node.allocator);
-            }
-            node = gop.value_ptr.*;
-        }
-        node.route = index;
-    }
-
-    const Match = struct { index: usize, suffix: []const u8 };
-
-    /// Longest-prefix match: the deepest mount whose prefix aligns on a path
-    /// segment boundary, plus the path suffix after that prefix.
-    fn match(self: *const PrefixTrie, path: []const u8) ?Match {
-        var node = self.root;
-        var best: ?Match = null;
-        var start: usize = 1; // skip leading '/'
-        while (start < path.len) {
-            const end = std.mem.indexOfScalarPos(u8, path, start, '/') orelse path.len;
-            const child = node.children.get(path[start..end]) orelse break;
-            node = child;
-            if (node.route) |idx| best = .{ .index = idx, .suffix = path[end..] };
-            start = end + 1;
-        }
-        return best;
-    }
-};
+    return best;
+}
 
 /// Static file route configuration (from keyway.static).
 pub const StaticRoute = struct {
@@ -172,8 +113,6 @@ pub const Router = struct {
     root: *Node,
     static_routes: std.ArrayListUnmanaged(StaticRoute) = .empty,
     proxy_routes: std.ArrayListUnmanaged(ProxyRoute) = .empty,
-    static_trie: PrefixTrie,
-    proxy_trie: PrefixTrie,
 
     /// Initialize radix router
     pub fn init(allocator: std.mem.Allocator) !Router {
@@ -181,8 +120,6 @@ pub const Router = struct {
         return Router{
             .allocator = allocator,
             .root = root,
-            .static_trie = try PrefixTrie.init(allocator),
-            .proxy_trie = try PrefixTrie.init(allocator),
         };
     }
 
@@ -205,14 +142,13 @@ pub const Router = struct {
             .real_root = real_root,
             .index = index_copy,
         });
-        try self.static_trie.insert(prefix, self.static_routes.items.len - 1);
     }
 
     pub const StaticMatch = PrefixMatch(StaticRoute);
 
     /// Match a path against static route prefixes (longest prefix wins).
     pub fn matchStatic(self: *const Router, path: []const u8) ?StaticMatch {
-        const m = self.static_trie.match(path) orelse return null;
+        const m = matchMountPrefix(StaticRoute, self.static_routes.items, path) orelse return null;
         return .{ .route = self.static_routes.items[m.index], .suffix = m.suffix };
     }
 
@@ -234,7 +170,6 @@ pub const Router = struct {
             .redirect = redirect_copy,
             .strip_prefix = strip_prefix,
         });
-        try self.proxy_trie.insert(prefix, self.proxy_routes.items.len - 1);
     }
 
     /// Resolve an upstream host:port to an address once, at route registration.
@@ -268,7 +203,7 @@ pub const Router = struct {
 
     /// Match a path against proxy route prefixes (longest prefix wins).
     pub fn matchProxy(self: *const Router, path: []const u8) ?ProxyMatch {
-        const m = self.proxy_trie.match(path) orelse return null;
+        const m = matchMountPrefix(ProxyRoute, self.proxy_routes.items, path) orelse return null;
         return .{ .route = self.proxy_routes.items[m.index], .suffix = m.suffix };
     }
 
@@ -462,12 +397,6 @@ pub const Router = struct {
         self.freeProxyRoutes();
         self.proxy_routes.clearRetainingCapacity();
 
-        // Free prefix-match tries
-        self.static_trie.deinit();
-        self.static_trie = try PrefixTrie.init(self.allocator);
-        self.proxy_trie.deinit();
-        self.proxy_trie = try PrefixTrie.init(self.allocator);
-
         // Free trie
         self.root.deinit();
 
@@ -488,8 +417,6 @@ pub const Router = struct {
         self.static_routes.deinit(self.allocator);
         self.freeProxyRoutes();
         self.proxy_routes.deinit(self.allocator);
-        self.static_trie.deinit();
-        self.proxy_trie.deinit();
         self.root.deinit();
     }
 };
@@ -501,35 +428,37 @@ fn PrefixMatch(comptime T: type) type {
 }
 
 // Tests
-test "prefix trie: longest match, suffix, and segment boundary" {
+test "prefix scan: longest match, suffix, and segment boundary" {
     const allocator = std.testing.allocator;
 
-    var trie = try PrefixTrie.init(allocator);
-    defer trie.deinit();
+    var router = try Router.init(allocator);
+    defer router.deinit();
 
-    try trie.insert("/a", 0);
-    try trie.insert("/a/b", 1);
+    // Static routes are cheap to register and exercise the same scan as
+    // matchProxy; addStaticRoute needs a real directory to resolve.
+    try router.addStaticRoute("/a", ".", "index.html");
+    try router.addStaticRoute("/a/b", ".", "index.html");
 
     // Shorter prefix matches, suffix is the remainder after the segment.
-    const m1 = trie.match("/a/x").?;
-    try std.testing.expectEqual(@as(usize, 0), m1.index);
+    const m1 = router.matchStatic("/a/x").?;
+    try std.testing.expectEqualStrings("/a", m1.route.prefix);
     try std.testing.expectEqualStrings("/x", m1.suffix);
 
     // Longest prefix wins when nested.
-    const m2 = trie.match("/a/b/c").?;
-    try std.testing.expectEqual(@as(usize, 1), m2.index);
+    const m2 = router.matchStatic("/a/b/c").?;
+    try std.testing.expectEqualStrings("/a/b", m2.route.prefix);
     try std.testing.expectEqualStrings("/c", m2.suffix);
 
     // Exact mount → empty suffix.
-    const m3 = trie.match("/a").?;
-    try std.testing.expectEqual(@as(usize, 0), m3.index);
+    const m3 = router.matchStatic("/a").?;
+    try std.testing.expectEqualStrings("/a", m3.route.prefix);
     try std.testing.expectEqualStrings("", m3.suffix);
 
     // Must align on a segment boundary: "/abc" does not match "/a".
-    try std.testing.expect(trie.match("/abc") == null);
+    try std.testing.expect(router.matchStatic("/abc") == null);
 
     // Unrelated path → no match.
-    try std.testing.expect(trie.match("/z") == null);
+    try std.testing.expect(router.matchStatic("/z") == null);
 }
 
 test "radix router: simple static route" {
