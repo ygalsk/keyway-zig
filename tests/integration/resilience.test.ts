@@ -29,6 +29,24 @@ describe("worker resilience regressions", () => {
     });
   });
 
+  // (#223)
+  test("Content-Length that overflows bytes_consumed + cl returns 413, server keeps serving", async () => {
+    await withServer(async ({ base, port }) => {
+      const status = await rawStatus(
+        port,
+        `POST /test/echo HTTP/1.1\r\nHost: 127.0.0.1:${port}\r\nContent-Length: 18446744073709551600\r\nConnection: close\r\n\r\n`,
+      );
+      expect(status).toBe(413);
+
+      // A fresh connection (not the one that got the 413) still routes fine —
+      // proves the process didn't die. Unchecked, this Content-Length
+      // overflows the framing arithmetic and panics the whole worker,
+      // taking every SO_REUSEPORT sibling down with it.
+      const next = await fetch(`${base}/test/hello`);
+      expect(next.status).toBe(200);
+    });
+  });
+
   // (#171)
   test("POST /test/echo body within the read buffer echoes correctly", async () => {
     const body = "x".repeat(32 * 1024);

@@ -572,6 +572,8 @@ pub const Connection = struct {
         const request = http.parseRequest(self.arena.allocator(), request_data) catch |err| {
             if (err == error.Incomplete) {
                 self.startRead();
+            } else if (err == error.RequestTooLarge) {
+                error_response.sendErrorStatus(self, 413, "content-length exceeds buffer");
             } else {
                 error_response.sendError(self, .client_error, "http parse failed");
             }
