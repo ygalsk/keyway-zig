@@ -100,7 +100,7 @@ pub const StaticRoute = struct {
 
 /// Reverse proxy route configuration.
 pub const ProxyRoute = struct {
-    prefix: []const u8, // e.g. "/__keyway/grafana"
+    prefix: []const u8, // e.g. "/api"
     upstream_host: []const u8, // e.g. "127.0.0.1" — kept for the upstream Host header
     upstream_port: u16, // e.g. 3000
     upstream_addr: std.Io.net.IpAddress, // resolved once at registration (no per-request DNS)

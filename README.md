@@ -100,7 +100,6 @@ src/
 dashboard/          # Solid.js admin dashboard + keyway.lua entry script
 lua/                # embedded Lua stdlib modules (keyway.response)
 tests/              # Integration tests (Bun)
-observability/      # Prometheus + Grafana config
 ```
 
 ## Build
@@ -137,7 +136,6 @@ Keyway ships a built-in Solid.js dashboard at `/__keyway/dashboard`. It provides
 - Real-time event stream via SSE
 - Route and middleware inspection
 - Lua file editor (read/write/delete)
-- Embedded Grafana view
 
 Access is restricted to localhost (`127.0.0.1` / `::1`). Manual reload: `POST /__keyway/reload`.
 
@@ -181,15 +179,6 @@ Keyway exposes Prometheus metrics at `/metrics` (text exposition format).
 **Lua runtime**
 - `keyway_lua_coroutines_active` — per-worker gauge
 - `keyway_lua_script_duration_seconds` — execution time histogram by worker, route
-
-A docker-compose stack for Prometheus + Grafana is included:
-
-```bash
-docker compose up
-# Keyway:     http://localhost:8080
-# Prometheus: http://localhost:9090
-# Grafana:    http://localhost:3000
-```
 
 ## Testing
 

@@ -289,7 +289,7 @@ pub fn processStaticTable(lua: *Lua, router: *Router) !void {
 
 /// Process keyway.proxy table after script load.
 /// Registers reverse proxy routes with the router.
-/// Format: keyway.proxy = { ["/__keyway/grafana"] = { host = "127.0.0.1", port = 3000 } }
+/// Format: keyway.proxy = { ["/api"] = { host = "127.0.0.1", port = 3000 } }
 pub fn processProxyTable(lua: *Lua, router: *Router) !void {
     // reverse proxy is optional — a missing table is not an error
     if (!pushKeywayTable(lua, "proxy")) return;

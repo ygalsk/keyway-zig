@@ -1,4 +1,4 @@
-# Production compose override — CPU-pinned keyway + observability stack.
+# Production compose override — CPU-pinned keyway.
 #
 # Keyway's proactor model pins one worker per physical core for cache
 # locality, NUMA-local allocation, and eBPF connection affinity.
@@ -7,7 +7,6 @@
 # Adjust cpuset and KEYWAY_WORKERS to match your host topology:
 #   - cpuset must list the exact cores keyway owns
 #   - KEYWAY_WORKERS must equal the number of cores in cpuset
-#   - Keep observability services OFF those cores
 #
 # Usage:
 #   docker compose -f docker-compose.yml -f docker-compose.prod.yml up
@@ -20,9 +19,3 @@ services:
     cap_add:
       - SYS_NICE       # sched_setaffinity
       - NET_ADMIN       # SO_ATTACH_REUSEPORT_CBPF
-
-  prometheus:
-    cpuset: "4-5"
-
-  grafana:
-    cpuset: "4-5"

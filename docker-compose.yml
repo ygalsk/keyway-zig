@@ -1,6 +1,3 @@
-include:
-  - observability/docker-compose.yml
-
 services:
   keyway:
     build: .
