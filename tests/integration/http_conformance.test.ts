@@ -286,3 +286,61 @@ describe("Host header enforcement (#203)", () => {
     expect(status).toBe(200);
   });
 });
+
+describe("absolute-form request-target (#207)", () => {
+  // RFC 9112 §3.2.2: a server MUST accept the absolute-form request-target
+  // ("GET http://host/path HTTP/1.1") a proxy client may send, not just
+  // origin-form. Authority-vs-Host agreement is intentionally not checked.
+  test("(#207) absolute-form request-target is routed as origin-form", async () => {
+    const status = await rawStatus(
+      port(),
+      `GET http://127.0.0.1:${port()}/test/hello HTTP/1.1\r\nHost: 127.0.0.1:${port()}\r\n\r\n`,
+    );
+    expect(status).toBe(200);
+  });
+
+  // Control: a normal origin-form request must not regress.
+  test("(#207) origin-form request-target still works (control)", async () => {
+    const status = await rawStatus(
+      port(),
+      `GET /test/hello HTTP/1.1\r\nHost: 127.0.0.1:${port()}\r\n\r\n`,
+    );
+    expect(status).toBe(200);
+  });
+});
+
+describe("If-None-Match (#207)", () => {
+  // RFC 9110 §13.1.2: If-None-Match is a comma-separated list of
+  // entity-tags, or "*". The old check did a single exact-string compare,
+  // ignoring both the list grammar and the wildcard.
+  test("(#207) a comma-separated If-None-Match list matches when any entry equals the ETag", async () => {
+    const first = await fetch(`${base()}/__keyway/dashboard/index.html`);
+    expect(first.status).toBe(200);
+    await first.arrayBuffer();
+    const etag = first.headers.get("etag");
+    expect(etag).toBeTruthy();
+
+    const second = await fetch(`${base()}/__keyway/dashboard/index.html`, {
+      headers: { "If-None-Match": `"wrong-one", ${etag}` },
+    });
+    expect(second.status).toBe(304);
+    expect((await second.text()).length).toBe(0);
+  });
+
+  test("(#207) If-None-Match: * always matches", async () => {
+    const res = await fetch(`${base()}/__keyway/dashboard/index.html`, {
+      headers: { "If-None-Match": "*" },
+    });
+    expect(res.status).toBe(304);
+    expect((await res.text()).length).toBe(0);
+  });
+
+  // Control: a single non-matching entity-tag must still serve the file —
+  // guards against over-matching once list/wildcard support is added.
+  test("(#207) a non-matching If-None-Match still serves the file (control)", async () => {
+    const res = await fetch(`${base()}/__keyway/dashboard/index.html`, {
+      headers: { "If-None-Match": '"definitely-wrong"' },
+    });
+    expect(res.status).toBe(200);
+  });
+});
