@@ -130,6 +130,14 @@ fn isEngineOwnedHeader(name: []const u8) bool {
         std.ascii.eqlIgnoreCase(n, "connection");
 }
 
+/// True if `cl` could never be satisfied — the read buffer never grows past
+/// config.READ_BUFFER_SIZE, so a Content-Length beyond it is either an
+/// oversized body or (unchecked) an integer-overflow DoS on the
+/// `bytes_consumed + cl` framing arithmetic below (#223).
+fn exceedsReadBuffer(cl: usize) bool {
+    return cl > config.READ_BUFFER_SIZE;
+}
+
 /// True if `s` is a valid HTTP field-value integer: 1*DIGIT, nothing else.
 /// `std.fmt.parseInt` alone also accepts a leading '+', '-', and Zig's '_'
 /// digit separators — none of which RFC 7230 permits for Content-Length.
@@ -290,6 +298,10 @@ pub fn parseRequest(allocator: std.mem.Allocator, buf: []const u8) !Request {
     }
 
     const cl = content_length orelse 0;
+    if (exceedsReadBuffer(cl)) {
+        allocator.free(headers);
+        return error.RequestTooLarge;
+    }
     const total_needed = bytes_consumed + cl;
     if (buf.len < total_needed) {
         // Body not fully received yet — need more data
@@ -566,6 +578,34 @@ test "http parser - rejects Content-Length with digit separator" {
     const request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 1_0\r\n\r\nping";
     const result = parseRequest(allocator, request);
     try std.testing.expectError(error.InvalidRequest, result);
+}
+
+test "http parser - rejects Content-Length that would overflow bytes_consumed + cl (#223)" {
+    const allocator = std.testing.allocator;
+
+    // 18446744073709551600 is a valid u64 value on its own, but adding
+    // bytes_consumed (the header length) to it overflows usize — this is
+    // the exact DoS primitive #223 fixes.
+    const request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 18446744073709551600\r\n\r\n";
+    const result = parseRequest(allocator, request);
+    try std.testing.expectError(error.RequestTooLarge, result);
+}
+
+test "http parser - rejects Content-Length just above READ_BUFFER_SIZE (#223)" {
+    const allocator = std.testing.allocator;
+
+    const request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 65537\r\n\r\n";
+    const result = parseRequest(allocator, request);
+    try std.testing.expectError(error.RequestTooLarge, result);
+}
+
+test "http parser - accepts a normal small Content-Length" {
+    const allocator = std.testing.allocator;
+
+    const request = "POST /test HTTP/1.1\r\nHost: localhost\r\nContent-Length: 4\r\n\r\nping";
+    const request_result = try parseRequest(allocator, request);
+    defer allocator.free(request_result.headers);
+    try std.testing.expectEqualStrings("ping", request_result.body);
 }
 
 test "http parser - plain Transfer-Encoding: chunked decodes" {
