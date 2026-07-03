@@ -62,6 +62,9 @@ pub fn handleWsUpgrade(conn: *Connection, exchange: *HttpExchange, request: *con
         // engine-owned Connection header that Response.serialize strips from
         // tenant output — so emit it verbatim here (#194).
         conn.logAccess(426);
+        // Advertises Connection: close; flag so onWrite actually closes
+        // instead of recycling the socket (#180).
+        conn.close_after_write = true;
         conn.sendRawResponse("HTTP/1.1 426 Upgrade Required\r\nSec-WebSocket-Version: 13\r\nConnection: close\r\nContent-Length: 0\r\n\r\n");
         return;
     }

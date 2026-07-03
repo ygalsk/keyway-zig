@@ -105,16 +105,22 @@ pub fn logError(
 }
 
 /// Send an error response for a category. Logs the error and sends the pre-serialized response.
+/// The response advertises `Connection: close` (comptimeErrorResponse); flag
+/// the connection so onWrite actually closes instead of recycling it (#180).
 pub fn sendError(conn: *Connection, category: ErrorCategory, internal_msg: []const u8) void {
     logError(category, category.defaultStatus(), conn.http_state.request_method, conn.http_state.request_path, internal_msg);
+    conn.close_after_write = true;
     conn.sendRawResponse(statusResponse(category.defaultStatus()).?);
 }
 
 /// Send an error response for a specific status code.
 /// Uses pre-serialized response for known statuses, falls back to category default.
+/// The response advertises `Connection: close`; flag the connection so onWrite
+/// actually closes instead of recycling it (#180).
 pub fn sendErrorStatus(conn: *Connection, status: u16, internal_msg: []const u8) void {
     const category: ErrorCategory = if (status >= 500) .server_error else .client_error;
     logError(category, status, conn.http_state.request_method, conn.http_state.request_path, internal_msg);
+    conn.close_after_write = true;
     if (statusResponse(status)) |resp| {
         conn.sendRawResponse(resp);
     } else {
@@ -124,8 +130,11 @@ pub fn sendErrorStatus(conn: *Connection, status: u16, internal_msg: []const u8)
 
 /// Send 405 Method Not Allowed with an Allow header (RFC 7231 §6.5.5).
 /// `allow` is the header value, e.g. "GET, HEAD".
+/// The response advertises `Connection: close`; flag the connection so
+/// onWrite actually closes instead of recycling it (#180).
 pub fn send405(conn: *Connection, allow: []const u8) void {
     logError(.client_error, 405, conn.http_state.request_method, conn.http_state.request_path, "method not allowed");
+    conn.close_after_write = true;
     const body = "Method Not Allowed";
     const resp = std.fmt.allocPrint(conn.arena.allocator(), "HTTP/1.1 405 Method Not Allowed\r\nAllow: {s}\r\nContent-Length: {d}\r\nConnection: close\r\n\r\n{s}", .{ allow, body.len, body }) catch {
         conn.sendRawResponse(statusResponse(400).?);

@@ -44,6 +44,52 @@ export async function rawStatus(port: number, request: string): Promise<number> 
   return Number(resp.split(" ")[1]);
 }
 
+/// Send a raw request on its own socket and observe whether the SERVER closes
+/// the connection (FIN/EOF) after responding, as opposed to keeping it open
+/// for keep-alive. Unlike `rawResponse` (which closes the socket itself on
+/// seeing the header terminator), this waits for the response headers, then
+/// watches a short quiet window for the socket's `close` callback to fire.
+/// See #180 (error responses advertise `Connection: close` but must also
+/// actually close the socket).
+export async function rawResponseAndClose(
+  port: number,
+  request: string,
+  waitMs = 500,
+): Promise<{ response: string; serverClosed: boolean }> {
+  let buf = "";
+  const { promise: headersPromise, resolve: resolveHeaders } = Promise.withResolvers<void>();
+  const { promise: closedPromise, resolve: resolveClosed } = Promise.withResolvers<void>();
+  let headersSeen = false;
+  const socket = await Bun.connect({
+    hostname: "127.0.0.1",
+    port,
+    socket: {
+      data(_s, data) {
+        buf += data.toString();
+        if (!headersSeen && buf.includes("\r\n\r\n")) {
+          headersSeen = true;
+          resolveHeaders();
+        }
+      },
+      close() {
+        resolveClosed();
+      },
+      error() {
+        resolveClosed();
+      },
+    },
+  });
+  socket.write(request);
+  socket.flush();
+  await Promise.race([headersPromise, Bun.sleep(1500).then(() => {})]);
+  const serverClosed = await Promise.race([
+    closedPromise.then(() => true),
+    Bun.sleep(waitMs).then(() => false),
+  ]);
+  socket.end();
+  return { response: buf, serverClosed };
+}
+
 export async function withServer(fn: (server: { base: string; port: number }) => Promise<void>) {
   const port = 10000 + Math.floor(Math.random() * 50000);
   const proc = Bun.spawn(

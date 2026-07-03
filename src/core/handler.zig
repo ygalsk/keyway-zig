@@ -136,6 +136,11 @@ pub const Connection = struct {
     timer_cancel_completion: xev.Completion = .{},
     timed_out: bool = false,
     timer_armed: bool = false,
+    // Set by an error/reject response funnel (error_response.zig, WS 426) whose
+    // canned response advertises `Connection: close`. onWrite closes instead of
+    // recycling the socket once this write completes, so the header isn't a
+    // protocol lie (#180). Never reset — a set flag always leads to close().
+    close_after_write: bool = false,
     // In-flight timer completions (timer + timer_remove). Guards maybeFinishClose
     // so Connection outlives all armed timer CQEs — prevents use-after-free.
     pending_timer_ops: u8 = 0,
@@ -950,10 +955,14 @@ pub const Connection = struct {
         if (self.proxy_state != null) {
             proxy_mod.cleanupProxy(self);
         }
-        // If this write was the 504 timeout response, close instead of recycling.
-        // pending_timer_ops/pending_io_ops may still be non-zero (in-flight
-        // completions), so close() -> maybeFinishClose() defers deinit until they drain.
-        if (self.timed_out) {
+        // If this write was the 504 timeout response, or any other error/reject
+        // response whose canned reply advertises `Connection: close`, close
+        // instead of recycling (#180). pending_timer_ops/pending_io_ops may
+        // still be non-zero (in-flight completions), so close() ->
+        // maybeFinishClose() defers deinit until they drain.
+        // (Honoring the *client's* Connection: close request header on success
+        // responses is separate — deferred to #204.)
+        if (self.timed_out or self.close_after_write) {
             self.close();
             return .disarm;
         }
