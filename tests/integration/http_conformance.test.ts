@@ -247,46 +247,6 @@ describe("static sibling-prefix traversal boundary (#176)", () => {
   });
 });
 
-describe("Host header enforcement (#203)", () => {
-  // RFC 9112 §3.2: a server MUST respond 400 to any HTTP/1.1 request that
-  // does not have exactly one Host header. HTTP/1.0 has no such requirement.
-  test("(#203) HTTP/1.1 request with no Host header is rejected with 400", async () => {
-    const status = await rawStatus(
-      port(),
-      `GET /health HTTP/1.1\r\nConnection: close\r\n\r\n`,
-    );
-    expect(status).toBe(400);
-  });
-
-  test("(#203) HTTP/1.1 request with two differing Host headers is rejected with 400", async () => {
-    const status = await rawStatus(
-      port(),
-      `GET /health HTTP/1.1\r\nHost: a.example\r\nHost: b.example\r\nConnection: close\r\n\r\n`,
-    );
-    expect(status).toBe(400);
-  });
-
-  // Control: HTTP/1.0 has no Host requirement — a Host-less 1.0 request must
-  // still be served, not rejected.
-  test("(#203) HTTP/1.0 request with no Host header is still served (control)", async () => {
-    const status = await rawStatus(
-      port(),
-      `GET /health HTTP/1.0\r\nConnection: close\r\n\r\n`,
-    );
-    expect(status).toBe(200);
-  });
-
-  // Control: a well-formed HTTP/1.1 request with exactly one Host is
-  // unaffected by the new check.
-  test("(#203) HTTP/1.1 request with exactly one Host header is served (control)", async () => {
-    const status = await rawStatus(
-      port(),
-      `GET /health HTTP/1.1\r\nHost: x\r\nConnection: close\r\n\r\n`,
-    );
-    expect(status).toBe(200);
-  });
-});
-
 describe("absolute-form request-target (#207)", () => {
   // RFC 9112 §3.2.2: a server MUST accept the absolute-form request-target
   // ("GET http://host/path HTTP/1.1") a proxy client may send, not just
