@@ -161,6 +161,34 @@ fn isDigitsOnly(s: []const u8) bool {
     return true;
 }
 
+/// Convert picohttpparser's `phr_header` array into zero-copy `Header` slices,
+/// rejecting obs-fold (#245).
+///
+/// picohttpparser *accepts* an obs-fold continuation line (a header line
+/// starting with SP/HTAB) and signals it by setting `name = NULL, name_len = 0`
+/// — it is the only way a NULL name reaches us, since a genuinely empty name
+/// is already a -1 there. Slicing that NULL is a null deref, and letting it
+/// through means the fold reaches routing and, on the proxy path, gets
+/// re-emitted upstream as a bare `: value` line. RFC 9112 §5.2 says a server
+/// must reject obs-fold with 400 rather than interpret it, so we do.
+///
+/// Both parse entry points funnel through here so the NULL can't come back:
+/// the request path (client-triggered) and the response path (upstream-triggered).
+fn toHeaders(allocator: std.mem.Allocator, c_headers: []const c.struct_phr_header) ![]Header {
+    const headers = try allocator.alloc(Header, c_headers.len);
+    for (c_headers, headers) |h, *out| {
+        if (h.name == null) {
+            allocator.free(headers);
+            return error.InvalidRequest;
+        }
+        out.* = Header{
+            .name = h.name[0..h.name_len],
+            .value = h.value[0..h.value_len],
+        };
+    }
+    return headers;
+}
+
 /// Parse HTTP request from buffer
 /// Returns Request on success, error.Incomplete if partial, or other error
 pub fn parseRequest(allocator: std.mem.Allocator, buf: []const u8) !Request {
@@ -202,14 +230,7 @@ pub fn parseRequest(allocator: std.mem.Allocator, buf: []const u8) !Request {
     const path = path_ptr[0..path_len];
 
     // Convert headers
-    var headers = try allocator.alloc(Header, num_headers);
-    for (0..num_headers) |i| {
-        const h = c_headers[i];
-        headers[i] = Header{
-            .name = h.name[0..h.name_len],
-            .value = h.value[0..h.value_len],
-        };
-    }
+    const headers = try toHeaders(allocator, c_headers[0..num_headers]);
 
     // Body: use Content-Length to determine exact body boundaries.
     // Without this, leftover body bytes corrupt the next keep-alive request.
@@ -226,13 +247,12 @@ pub fn parseRequest(allocator: std.mem.Allocator, buf: []const u8) !Request {
     var host_count: usize = 0;
     var conn_close = false;
     var conn_keep_alive = false;
-    for (0..num_headers) |i| {
-        const h = c_headers[i];
-        const name = h.name[0..h.name_len];
+    for (headers) |h| {
+        const name = h.name;
         if (std.ascii.eqlIgnoreCase(name, "host")) {
             host_count += 1;
         } else if (std.ascii.eqlIgnoreCase(name, "content-length")) {
-            const val = h.value[0..h.value_len];
+            const val = h.value;
             if (!isDigitsOnly(val)) {
                 allocator.free(headers);
                 return error.InvalidRequest;
@@ -250,9 +270,9 @@ pub fn parseRequest(allocator: std.mem.Allocator, buf: []const u8) !Request {
                 content_length = parsed;
             }
         } else if (std.ascii.eqlIgnoreCase(name, "transfer-encoding")) {
-            transfer_encoding = h.value[0..h.value_len];
+            transfer_encoding = h.value;
         } else if (std.ascii.eqlIgnoreCase(name, "connection")) {
-            var it = std.mem.splitScalar(u8, h.value[0..h.value_len], ',');
+            var it = std.mem.splitScalar(u8, h.value, ',');
             while (it.next()) |tok| {
                 const trimmed = std.mem.trim(u8, tok, " \t");
                 if (std.ascii.eqlIgnoreCase(trimmed, "close")) conn_close = true;
@@ -380,14 +400,7 @@ pub fn parseResponseHead(allocator: std.mem.Allocator, buf: []const u8) !Respons
 
     const reason = msg_ptr[0..msg_len];
 
-    var headers = try allocator.alloc(Header, num_headers);
-    for (0..num_headers) |i| {
-        const h = c_headers[i];
-        headers[i] = Header{
-            .name = h.name[0..h.name_len],
-            .value = h.value[0..h.value_len],
-        };
-    }
+    const headers = try toHeaders(allocator, c_headers[0..num_headers]);
 
     return ResponseHead{
         .status = @intCast(status),
@@ -729,6 +742,23 @@ test "http parser - rejects Transfer-Encoding with non-chunked final coding" {
     try std.testing.expectError(error.InvalidRequest, result);
 }
 
+test "http parser - rejects obs-fold continuation line, SP (#245)" {
+    const allocator = std.testing.allocator;
+
+    // RFC 9112 §5.2: obs-fold in a request is a 400. picohttpparser accepts
+    // the fold and reports it as a header with a NULL name, which is both a
+    // null deref and a smuggling primitive if it reaches the upstream.
+    const request = "POST /a HTTP/1.1\r\nHost: x\r\nX-Y: 1\r\n  2\r\nContent-Length: 0\r\n\r\n";
+    try std.testing.expectError(error.InvalidRequest, parseRequest(allocator, request));
+}
+
+test "http parser - rejects obs-fold continuation line, HTAB (#245)" {
+    const allocator = std.testing.allocator;
+
+    const request = "POST /a HTTP/1.1\r\nHost: x\r\nX-Y: 1\r\n\t2\r\nContent-Length: 0\r\n\r\n";
+    try std.testing.expectError(error.InvalidRequest, parseRequest(allocator, request));
+}
+
 test "http parser - rejects HTTP/1.1 request with no Host header" {
     const allocator = std.testing.allocator;
 
@@ -1020,6 +1050,14 @@ test "parseResponseHead parses status, reason, headers, and head_len" {
 test "parseResponseHead rejects a malformed status line" {
     const allocator = std.testing.allocator;
     const buf = "not an http response at all\r\n\r\n";
+    try std.testing.expectError(error.InvalidRequest, parseResponseHead(allocator, buf));
+}
+
+test "parseResponseHead rejects an obs-fold continuation line (#245)" {
+    const allocator = std.testing.allocator;
+    // Same NULL-name hazard as the request path, but triggered by the
+    // upstream: a folded response header would crash the proxy.
+    const buf = "HTTP/1.1 200 OK\r\nX-Y: 1\r\n  2\r\nContent-Length: 0\r\n\r\n";
     try std.testing.expectError(error.InvalidRequest, parseResponseHead(allocator, buf));
 }
 
