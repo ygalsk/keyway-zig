@@ -63,17 +63,29 @@ describe("Autobahn|Testsuite RFC 6455 conformance", () => {
       })
     );
 
-    const proc = Bun.spawnSync([
+    // MUST stay async. spawnSync blocks bun's event loop for the whole ~12
+    // minute run, which stops it draining the keyway stderr pipe that
+    // preload.ts opens. keyway blocks in write(2) once that 64 KiB pipe fills
+    // (#248), so the server froze partway through section 9 and every case
+    // after it reported "The WebSocket opening handshake was never completed!".
+    // That cost ~120 phantom failures and truncated the run to 386-396 cases,
+    // making sections 10, 12 and 13 look broken when they pass.
+    const proc = Bun.spawn([
       bin, "run", "--rm", "--network", "host",
       "-v", `${DIR}:/ws:Z`,
       IMAGE, "wstest", "-m", "fuzzingclient", "-s", "/ws/fuzzingclient.json",
+    ], { stdout: "pipe", stderr: "pipe" });
+
+    const [stdout, stderr, exitCode] = await Promise.all([
+      new Response(proc.stdout).text(),
+      new Response(proc.stderr).text(),
+      proc.exited,
     ]);
 
     const index = resolve(REPORTS, "index.json");
     if (!existsSync(index)) {
       throw new Error(
-        `wstest produced no report (exit ${proc.exitCode}):\n` +
-          `${proc.stderr.toString()}\n${proc.stdout.toString()}`
+        `wstest produced no report (exit ${exitCode}):\n${stderr}\n${stdout}`
       );
     }
     results = (await Bun.file(index).json()).keyway;
