@@ -741,15 +741,11 @@ pub const Connection = struct {
     pub fn completeHandler(self: *Connection) void {
         const s = self.suspended orelse return;
 
-        // Return coroutine thread to cache for reuse
-        if (s.coroutine_ref != 0) {
-            if (self.lua_state.cached_thread_ref == 0) {
-                self.lua_state.cached_thread_ref = s.coroutine_ref;
-                self.lua_state.cached_thread = @ptrCast(@alignCast(s.coroutine_thread));
-            } else {
-                self.lua_state.lua.unref(Lua.PseudoIndex.Registry, s.coroutine_ref);
-            }
-        }
+        // Return the coroutine thread for reuse. dispatchResume also lands here
+        // after a *failed* resume on a WS connection, where the thread is dead —
+        // recycleThread checks the thread's status rather than trusting the
+        // caller, so the corpse is dropped instead of cached (#242).
+        self.lua_state.recycleThread(s.coroutine_ref, s.coroutine_thread);
 
         self.suspended = null;
 

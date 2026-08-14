@@ -182,6 +182,43 @@ pub const LuaState = struct {
         ws: lua_api.WsContext,
     };
 
+    /// Hand a finished coroutine thread back: cache it for reuse if it can be
+    /// dispatched on again, discard it otherwise.
+    ///
+    /// LuaJIT's `lua_resume` rejects any thread whose status is not LUA_OK with
+    /// "cannot resume non-suspended coroutine", and clearing the stack does not
+    /// reset that status — a coroutine that raised an error is dead for good,
+    /// and one still marked LUA_YIELD would resume into the middle of its old
+    /// handler. Caching either wedges every later coroutine dispatch on this
+    /// worker (#242), so the thread's own status decides, not the caller's
+    /// control flow: `completeHandler` is reached from both the completed and
+    /// the errored WS path and cannot tell them apart.
+    pub fn recycleThread(self: *LuaState, ref: i32, thread: *anyopaque) void {
+        if (ref == 0) return;
+        // 0 == LUA_OK. Anything else is unusable, including LUA_YIELD.
+        if (c.lua_status(@ptrCast(thread)) == 0 and self.cached_thread_ref == 0) {
+            self.cached_thread = @ptrCast(@alignCast(thread));
+            self.cached_thread_ref = ref;
+            return;
+        }
+        self.lua.unref(Lua.PseudoIndex.Registry, ref);
+    }
+
+    /// Release the thread a dispatch ran on, once it is known not to be yielding.
+    /// An `errored` thread is dead (see `recycleThread`), so the cache has to be
+    /// re-primed with a fresh one — otherwise every later dispatch on this
+    /// worker resumes the corpse (#242).
+    fn releaseDispatchThread(self: *LuaState, errored: bool) void {
+        if (self.cached_thread_ref == 0) {
+            self.lua.pop(1); // ad-hoc newThread(), still on the main stack
+            return;
+        }
+        if (!errored) return; // completed cleanly — re-primable by setTop(0)
+        self.lua.unref(Lua.PseudoIndex.Registry, self.cached_thread_ref);
+        self.cached_thread = self.lua.newThread();
+        self.cached_thread_ref = self.lua.ref(Lua.PseudoIndex.Registry);
+    }
+
     /// Generic coroutine dispatch: get/reuse thread, push handler + userdata, resume.
     /// Used by both HTTP handler dispatch and WebSocket on_message dispatch.
     pub fn dispatchCoroutine(self: *LuaState, lua_ref: i32, ud_kind: UserdataKind) !HandlerResult {
@@ -196,7 +233,7 @@ pub const LuaState = struct {
         // Push handler function onto thread's stack (registry is shared across threads)
         const handler_type = thread.getTableIndexRaw(Lua.PseudoIndex.Registry, lua_ref);
         if (handler_type != .function) {
-            if (self.cached_thread_ref == 0) self.lua.pop(1);
+            self.releaseDispatchThread(false);
             return error.NotAFunction;
         }
 
@@ -232,7 +269,7 @@ pub const LuaState = struct {
                 // LUA_OK — handler completed normally
                 prom.luaCoroutineFinished();
                 self.recordCoroutineDuration();
-                if (self.cached_thread_ref == 0) self.lua.pop(1);
+                self.releaseDispatchThread(false);
                 return .completed;
             },
             1 => {
@@ -260,13 +297,13 @@ pub const LuaState = struct {
                             thread.callProtected(2, 1, 0) catch {
                                 log.err().string("msg", "coroutine error").int("ref", lua_ref).string("error", std.mem.span(err_msg)).log();
                                 thread.setTop(0);
-                                if (self.cached_thread_ref == 0) self.lua.pop(1);
+                                self.releaseDispatchThread(true);
                                 return error.Runtime;
                             };
                             const tb_msg = thread.toString(-1) catch err_msg;
                             log.err().string("msg", "coroutine error").int("ref", lua_ref).string("traceback", std.mem.span(tb_msg)).log();
                             thread.setTop(0);
-                            if (self.cached_thread_ref == 0) self.lua.pop(1);
+                            self.releaseDispatchThread(true);
                             return error.Runtime;
                         }
                         thread.pop(2); // pop non-function + debug table
@@ -275,7 +312,7 @@ pub const LuaState = struct {
                     }
                     log.err().string("msg", "coroutine error").int("ref", lua_ref).string("error", std.mem.span(err_msg)).log();
                 }
-                if (self.cached_thread_ref == 0) self.lua.pop(1);
+                self.releaseDispatchThread(true);
                 return error.Runtime;
             },
         }

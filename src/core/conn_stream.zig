@@ -137,9 +137,7 @@ pub fn handleStreamPostWrite(self: *Connection) void {
                 // (deinit would otherwise see stream_state still set and
                 // double-handle it).
                 prom.luaCoroutineFinished();
-                if (ss.coroutine_ref != 0) {
-                    self.lua_state.lua.unref(Lua.PseudoIndex.Registry, ss.coroutine_ref);
-                }
+                self.lua_state.recycleThread(ss.coroutine_ref, ss.coroutine_thread);
                 self.stream_state = null;
                 self.close();
                 return;
@@ -154,14 +152,7 @@ fn sendTerminalChunk(self: *Connection) void {
     const ss = self.stream_state.?;
     // Match dispatchCoroutine's start-of-request increment (prom.luaCoroutineStarted).
     prom.luaCoroutineFinished();
-    if (ss.coroutine_ref != 0) {
-        if (self.lua_state.cached_thread_ref == 0) {
-            self.lua_state.cached_thread_ref = ss.coroutine_ref;
-            self.lua_state.cached_thread = @ptrCast(@alignCast(ss.coroutine_thread));
-        } else {
-            self.lua_state.lua.unref(Lua.PseudoIndex.Registry, ss.coroutine_ref);
-        }
-    }
+    self.lua_state.recycleThread(ss.coroutine_ref, ss.coroutine_thread);
     self.stream_state = null;
 
     // Send terminal chunk — onWrite will dispatch to handleHttpPostWrite for keep-alive
