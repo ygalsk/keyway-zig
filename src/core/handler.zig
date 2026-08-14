@@ -104,6 +104,48 @@ test "originForm leaves origin-form untouched" {
     try std.testing.expectEqualStrings("", originForm(""));
 }
 
+/// Reset a connection's per-exchange arena, freeing it outright once its
+/// retained capacity outgrows ARENA_RETAIN_LIMIT and keeping the capacity
+/// otherwise.
+///
+/// The watermark is on the arena's capacity rather than on how much the
+/// exchange actually used: a large intermediate allocation — or a path that
+/// reports zero bytes here, like static files and streaming — would otherwise
+/// leave the arena inflated for the connection's lifetime.
+///
+/// Lives here, and takes the arena rather than the Connection, because both the
+/// HTTP and the WebSocket path reset the same arena between exchanges. Holding
+/// the policy in one place is the point: the WS path had its own copy that
+/// never consulted the limit, so one big message ratcheted that connection's
+/// floor up for good (#260).
+pub fn resetArena(arena: *std.heap.ArenaAllocator) void {
+    _ = arena.reset(.retain_capacity);
+}
+
+test "resetArena releases an arena that outgrew the retain limit (#260)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    _ = try arena.allocator().alloc(u8, ARENA_RETAIN_LIMIT + 1);
+    try std.testing.expect(arena.queryCapacity() > ARENA_RETAIN_LIMIT);
+
+    resetArena(&arena);
+    try std.testing.expectEqual(@as(usize, 0), arena.queryCapacity());
+}
+
+test "resetArena keeps capacity that is still under the retain limit (#260)" {
+    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
+    defer arena.deinit();
+
+    _ = try arena.allocator().alloc(u8, 4096);
+    const retained = arena.queryCapacity();
+    try std.testing.expect(retained > 0);
+    try std.testing.expect(retained <= ARENA_RETAIN_LIMIT);
+
+    resetArena(&arena);
+    try std.testing.expectEqual(retained, arena.queryCapacity());
+}
+
 /// Connection handler - manages HTTP request/response lifecycle
 pub const Connection = struct {
     pub const State = enum { reading, processing, writing, websocket, sse, streaming, static_file, closing };

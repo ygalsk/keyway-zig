@@ -518,7 +518,7 @@ fn dispatchWsMessage(conn: *Connection, payload: []const u8, is_text: bool) void
         return;
     }
 
-    _ = conn.arena.reset(.retain_capacity);
+    handler_mod.resetArena(&conn.arena);
 
     // After WS upgrade, request_method/request_path are stale slices into the
     // overwritten read buffer. Set stable string literals so error logging
