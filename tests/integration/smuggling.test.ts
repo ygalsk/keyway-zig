@@ -57,4 +57,50 @@ describe("request smuggling regressions", () => {
     );
     expect(status).toBe(400);
   });
+
+  // (#245) RFC 9112 §5.2. picohttpparser accepts obs-fold and reports the
+  // folded line as a header with a NULL name: a null deref in safe builds,
+  // and in ReleaseFast a bare `: value` line forwarded to the upstream.
+  for (const [label, ws] of [
+    ["SP", "  "],
+    ["HTAB", "\t"],
+  ] as const) {
+    test(`rejects obs-fold continuation line (${label})`, async () => {
+      const status = await rawStatus(
+        port(),
+        `POST /test/echo HTTP/1.1\r\n` +
+          `Host: 127.0.0.1:${port()}\r\n` +
+          `X-Y: 1\r\n${ws}2\r\n` +
+          `Content-Length: 0\r\n` +
+          `Connection: close\r\n\r\n`,
+      );
+      expect(status).toBe(400);
+    });
+  }
+
+  // (#245) These two were reported alongside obs-fold as hangs; they were
+  // always correct — the obs-fold crash was killing the run around them.
+  test("rejects whitespace before the header colon", async () => {
+    const status = await rawStatus(
+      port(),
+      `POST /test/echo HTTP/1.1\r\n` +
+        `Host: 127.0.0.1:${port()}\r\n` +
+        `Foo : bar\r\n` +
+        `Content-Length: 0\r\n` +
+        `Connection: close\r\n\r\n`,
+    );
+    expect(status).toBe(400);
+  });
+
+  test("rejects Transfer-Encoding with a non-chunked final coding", async () => {
+    const status = await rawStatus(
+      port(),
+      `POST /test/echo HTTP/1.1\r\n` +
+        `Host: 127.0.0.1:${port()}\r\n` +
+        `Transfer-Encoding: chunked, identity\r\n` +
+        `Connection: close\r\n\r\n` +
+        `0\r\n\r\n`,
+    );
+    expect(status).toBe(400);
+  });
 });
