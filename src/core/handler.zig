@@ -119,7 +119,11 @@ test "originForm leaves origin-form untouched" {
 /// never consulted the limit, so one big message ratcheted that connection's
 /// floor up for good (#260).
 pub fn resetArena(arena: *std.heap.ArenaAllocator) void {
-    _ = arena.reset(.retain_capacity);
+    if (arena.queryCapacity() > ARENA_RETAIN_LIMIT) {
+        _ = arena.reset(.free_all);
+    } else {
+        _ = arena.reset(.retain_capacity);
+    }
 }
 
 test "resetArena releases an arena that outgrew the retain limit (#260)" {
@@ -1101,7 +1105,7 @@ pub const Connection = struct {
             return;
         }
         _ = bytes_written;
-        _ = self.arena.reset(.retain_capacity);
+        resetArena(&self.arena);
         if (self.http_state.request_raw_len > 0) {
             self.read_buffer.consume(self.http_state.request_raw_len);
             self.http_state.request_raw_len = 0;
@@ -1135,16 +1139,7 @@ pub const Connection = struct {
         // Cancel the per-request deadline timer on successful response completion
         self.cancelRequestTimer();
         self.suspended = null;
-        // Free the arena if its retained capacity grew large; otherwise keep it
-        // for reuse. Watermark on the arena's actual capacity, not the response
-        // size — large intermediate allocations (and the static/streaming paths,
-        // which report zero bytes here) would otherwise leave the arena inflated
-        // for the connection's lifetime.
-        if (self.arena.queryCapacity() > ARENA_RETAIN_LIMIT) {
-            _ = self.arena.reset(.free_all);
-        } else {
-            _ = self.arena.reset(.retain_capacity);
-        }
+        resetArena(&self.arena);
 
         // Consume exactly the bytes of the completed request (headers + body).
         // This preserves any pipelined data that arrived in the same recv.
