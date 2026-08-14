@@ -157,3 +157,34 @@ keyway.routes["/test/mw"] = {
         ctx.body = "middleware ok"
     end,
 }
+
+-- (#242) Coroutine-recycle regression fixtures. An errored coroutine is
+-- permanently dead; the worker must discard it, or every later coroutine
+-- dispatch on that worker 500s ("cannot resume non-suspended coroutine").
+-- on_message errors immediately (no yield) — exercises the dispatchCoroutine
+-- error branch with the cached thread in use.
+keyway.routes["/test/coro-error"] = {
+    GET = function(ctx)
+        ctx.upgrade = "websocket"
+        ctx.on_message = function(ws)
+            local this_is_nil = nil
+            return this_is_nil.field
+        end
+        ctx.on_close = function() end
+    end,
+}
+
+-- (#242) on_message yields via ws:send, then errors on resume — exercises
+-- the resumeHandler error path (completeHandler must not re-cache the dead
+-- thread).
+keyway.routes["/test/coro-error-after-send"] = {
+    GET = function(ctx)
+        ctx.upgrade = "websocket"
+        ctx.on_message = function(ws)
+            ws:send("before-error")
+            local this_is_nil = nil
+            return this_is_nil.field
+        end
+        ctx.on_close = function() end
+    end,
+}
