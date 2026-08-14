@@ -639,6 +639,70 @@ test "coroutine dispatch - non-yielding handler" {
     allocator.free(exchange.response_body);
 }
 
+test "coroutine dispatch - errored handler does not wedge later dispatch (#242)" {
+    const allocator = std.testing.allocator;
+    const params_mod = @import("../http/params.zig");
+
+    var router = try Router.init(allocator);
+    defer router.deinit();
+
+    var state = try LuaState.init(allocator);
+    defer state.deinit();
+
+    // Two routes: one whose handler raises a runtime error (killing the
+    // coroutine), one normal handler dispatched afterwards.
+    try state.loadString(
+        \\keyway.routes = {
+        \\    ["/boom"] = {
+        \\        GET = function(ctx)
+        \\            local this_is_nil = nil
+        \\            return this_is_nil.field
+        \\        end,
+        \\    },
+        \\    ["/ok"] = {
+        \\        GET = function(ctx)
+        \\            ctx.status = 200
+        \\            ctx.body = "recovered"
+        \\        end,
+        \\    },
+        \\}
+    );
+    try state.processRouteTable(&router);
+
+    var url_params = params_mod.ParamArray{};
+    var query = params_mod.QueryArray{};
+    const boom_ref = (try router.match("GET", "/boom", &url_params)).?.lua_ref;
+    const ok_ref = (try router.match("GET", "/ok", &url_params)).?.lua_ref;
+
+    var response_headers = try std.ArrayList(http.Header).initCapacity(allocator, 4);
+    defer response_headers.deinit(allocator);
+
+    var exchange = HttpExchange{
+        .method = "GET",
+        .path = "/boom",
+        .headers = &[_]http.Header{},
+        .params = &url_params,
+        .query = &query,
+        .body = "",
+        .status = 200,
+        .response_headers = response_headers,
+        .response_body = "",
+        .allocator = allocator,
+    };
+
+    // The erroring dispatch kills the coroutine — Runtime is expected, and
+    // the main Lua stack must stay balanced across the errored dispatch.
+    const top_before = state.lua.getTop();
+    try std.testing.expectError(error.Runtime, state.callLuaHandler(boom_ref, &exchange));
+    try std.testing.expectEqual(top_before, state.lua.getTop());
+
+    // The next dispatch must get a usable coroutine, not the dead one (#242).
+    const result = try state.callLuaHandler(ok_ref, &exchange);
+    try std.testing.expectEqual(HandlerResult.completed, result);
+    try std.testing.expectEqualStrings("recovered", exchange.response_body);
+    allocator.free(exchange.response_body);
+}
+
 test "lua package library and require" {
     const allocator = std.testing.allocator;
 
