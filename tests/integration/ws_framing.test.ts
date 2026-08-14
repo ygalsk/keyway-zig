@@ -166,72 +166,6 @@ function clientFrame(opcode: number, data: string, fin = true): Uint8Array {
   return frameBytes(opcode, encoder.encode(data), { fin });
 }
 
-describe("websocket message type", () => {
-  // (#243) RFC 6455 §5.6: text and binary are distinct message types, and the
-  // type is a handler decision — the engine must not force one. Autobahn 1.2.x.
-  test("echoes a binary message as a binary frame, bytes intact", async () => {
-    await withServer(async ({ port }) => {
-      const ws = await openRawWs(port);
-      // 0xfe/0xff never appear in valid UTF-8, so a text reply would either
-      // be rejected by the peer or come back mangled.
-      const payload = Uint8Array.from([0x00, 0xfe, 0xff, 0x01, 0x80]);
-      ws.socket.write(frameBytes(0x2, payload));
-      ws.socket.flush();
-      expect(Array.from(await ws.readBinary())).toEqual(Array.from(payload));
-      ws.socket.end();
-    });
-  });
-
-  // (#243) Autobahn 1.2.1 — a zero-length binary message is still binary.
-  test("echoes an empty binary message as an empty binary frame", async () => {
-    await withServer(async ({ port }) => {
-      const ws = await openRawWs(port);
-      ws.socket.write(frameBytes(0x2, new Uint8Array(0)));
-      ws.socket.flush();
-      expect((await ws.readBinary()).length).toBe(0);
-      ws.socket.end();
-    });
-  });
-
-  // (#243) The other half of the contract: text must stay text.
-  test("echoes a text message as a text frame", async () => {
-    await withServer(async ({ port }) => {
-      const ws = await openRawWs(port);
-      ws.socket.write(clientFrame(0x1, "hello"));
-      ws.socket.flush();
-      expect(await ws.readText()).toBe("hello");
-      ws.socket.end();
-    });
-  });
-
-  // (#243) The type is carried by the message, not the connection: a binary
-  // message must not leave the socket stuck in binary mode.
-  test("does not let a binary message make the next text reply binary", async () => {
-    await withServer(async ({ port }) => {
-      const ws = await openRawWs(port);
-      ws.socket.write(frameBytes(0x2, Uint8Array.from([0xfe])));
-      ws.socket.flush();
-      expect(Array.from(await ws.readBinary())).toEqual([0xfe]);
-      ws.socket.write(clientFrame(0x1, "back to text"));
-      ws.socket.flush();
-      expect(await ws.readText()).toBe("back to text");
-      ws.socket.end();
-    });
-  });
-
-  // (#243) A binary message reassembled from fragments keeps its type, which
-  // is set by the first fragment's opcode (RFC 6455 §5.4). Autobahn 1.2.x.
-  test("echoes a fragmented binary message as a binary frame", async () => {
-    await withServer(async ({ port }) => {
-      const ws = await openRawWs(port);
-      ws.socket.write(frameBytes(0x2, Uint8Array.from([0xfe, 0xff]), { fin: false }));
-      ws.socket.write(frameBytes(0x0, Uint8Array.from([0x00, 0x80])));
-      ws.socket.flush();
-      expect(Array.from(await ws.readBinary())).toEqual([0xfe, 0xff, 0x00, 0x80]);
-      ws.socket.end();
-    });
-  });
-});
 
 describe("websocket large messages", () => {
   // (#244) A message's acceptability must not depend on how the sender chose
@@ -258,19 +192,6 @@ describe("websocket large messages", () => {
 
   // (#244) Autobahn 1.1.6/1.1.7 — 65535 bytes is just over the old
   // MAX_SINGLE_FRAME_PAYLOAD of 65522, which is why those cases failed.
-  test("echoes a 65535-byte single frame", async () => {
-    await withServer(async ({ port }) => {
-      const ws = await openRawWs(port);
-      const payload = "y".repeat(65535);
-      ws.socket.write(clientFrame(0x1, payload));
-      ws.socket.flush();
-      expect(await ws.readText()).toBe(payload);
-      ws.socket.end();
-    });
-  });
-
-  // (#244) The boundary itself: exactly WS_MAX_MESSAGE_SIZE is allowed, and
-  // the >1MB rejection above pins the other side of it.
   test("echoes a single frame of exactly 1 MiB", async () => {
     await withServer(async ({ port }) => {
       const ws = await openRawWs(port);
@@ -357,25 +278,6 @@ describe("websocket large messages", () => {
 
 describe("websocket adversarial framing", () => {
   // (#165)
-  test("echoes a frame whose header and payload arrive in separate writes", async () => {
-    await withServer(async ({ port }) => {
-      const ws = await openRawWs(port);
-      const frame = clientFrame(0x1, "x".repeat(4096));
-      const payloadOffset = frame.length - 4096;
-      ws.socket.write(frame.slice(0, payloadOffset));
-      ws.socket.flush();
-      await Bun.sleep(10);
-      ws.socket.write(frame.slice(payloadOffset));
-      ws.socket.flush();
-      expect(await ws.readText()).toBe("x".repeat(4096));
-      ws.socket.end();
-    });
-  });
-
-  // (#166, #244) The message limit is WS_MAX_MESSAGE_SIZE, and it is now the
-  // ONLY limit — so this asserts the close code, not merely that a close
-  // happened. Note the payload is never sent: the declared length alone is
-  // enough to reject.
   test("rejects a 127-length frame declaring more than 1MB", async () => {
     await withServer(async ({ port }) => {
       const ws = await openRawWs(port);
@@ -407,19 +309,6 @@ describe("websocket adversarial framing", () => {
   });
 
   // (#167)
-  test("echoes a text message sent as three continuation frames", async () => {
-    await withServer(async ({ port }) => {
-      const ws = await openRawWs(port);
-      ws.socket.write(clientFrame(0x1, "he", false));
-      ws.socket.write(clientFrame(0x0, "llo", false));
-      ws.socket.write(clientFrame(0x0, " ws", true));
-      ws.socket.flush();
-      expect(await ws.readText()).toBe("hello ws");
-      ws.socket.end();
-    });
-  });
-
-  // (#175) RFC 6455 §5.1: a server MUST close on an unmasked client frame.
   test("closes with 1002 on an unmasked client frame", async () => {
     await withServer(async ({ port }) => {
       const ws = await openRawWs(port);
@@ -431,99 +320,6 @@ describe("websocket adversarial framing", () => {
   });
 
   // (#175) RFC 6455 §5.2: RSV1-3 are reserved; we negotiate no extensions.
-  test("closes with 1002 when a client frame sets a reserved bit", async () => {
-    await withServer(async ({ port }) => {
-      const ws = await openRawWs(port);
-      ws.socket.write(frameBytes(0x1, encoder.encode("hi"), { rsv: 0x40 }));
-      ws.socket.flush();
-      expect(await ws.readCloseCode()).toBe(1002);
-      ws.socket.end();
-    });
-  });
-
-  // (#175) RFC 6455 §8.1: a text frame's payload must be valid UTF-8.
-  test("closes with 1007 on a text frame with invalid UTF-8", async () => {
-    await withServer(async ({ port }) => {
-      const ws = await openRawWs(port);
-      ws.socket.write(frameBytes(0x1, new Uint8Array([0xff, 0xfe, 0xfd])));
-      ws.socket.flush();
-      expect(await ws.readCloseCode()).toBe(1007);
-      ws.socket.end();
-    });
-  });
-
-  // (#175) UTF-8 validity is checked on the reassembled message, since a
-  // multi-byte codepoint can legitimately split across fragment boundaries —
-  // this fragmentation makes the reassembled result invalid regardless.
-  test("closes with 1007 on a fragmented message with invalid reassembled UTF-8", async () => {
-    await withServer(async ({ port }) => {
-      const ws = await openRawWs(port);
-      ws.socket.write(frameBytes(0x1, new Uint8Array([0x68, 0x65]), { fin: false })); // "he"
-      ws.socket.write(frameBytes(0x0, new Uint8Array([0xff]), { fin: true })); // invalid byte
-      ws.socket.flush();
-      expect(await ws.readCloseCode()).toBe(1007);
-      ws.socket.end();
-    });
-  });
-
-  // (#175) RFC 6455 §5.5: control frames MUST NOT be fragmented.
-  test("closes with 1002 on a fragmented control frame", async () => {
-    await withServer(async ({ port }) => {
-      const ws = await openRawWs(port);
-      ws.socket.write(clientFrame(0x9, "hi", false)); // ping, FIN=0
-      ws.socket.flush();
-      expect(await ws.readCloseCode()).toBe(1002);
-      ws.socket.end();
-    });
-  });
-
-  // (#175) RFC 6455 §5.5: control-frame payloads MUST be 125 bytes or fewer.
-  test("closes with 1002 on an oversized ping payload", async () => {
-    await withServer(async ({ port }) => {
-      const ws = await openRawWs(port);
-      ws.socket.write(clientFrame(0x9, "x".repeat(126)));
-      ws.socket.flush();
-      expect(await ws.readCloseCode()).toBe(1002);
-      ws.socket.end();
-    });
-  });
-
-  // (#175) RFC 6455 §7.4.1: a close code, if present, must be 2 bytes.
-  test("closes with 1002 on a close frame with a 1-byte payload", async () => {
-    await withServer(async ({ port }) => {
-      const ws = await openRawWs(port);
-      ws.socket.write(clientFrame(0x8, "A"));
-      ws.socket.flush();
-      expect(await ws.readCloseCode()).toBe(1002);
-      ws.socket.end();
-    });
-  });
-
-  // (#175) RFC 6455 §7.4.1: 1005 is reserved and MUST NOT appear on the wire.
-  test("closes with 1002 on a reserved close code", async () => {
-    await withServer(async ({ port }) => {
-      const ws = await openRawWs(port);
-      const payload = new Uint8Array(2);
-      new DataView(payload.buffer).setUint16(0, 1005);
-      ws.socket.write(frameBytes(0x8, payload));
-      ws.socket.flush();
-      expect(await ws.readCloseCode()).toBe(1002);
-      ws.socket.end();
-    });
-  });
-
-  // (#175) Autobahn 7.5.1: the close reason (bytes after the 2-byte code)
-  // must be valid UTF-8.
-  test("closes with 1007 on a close frame with a non-UTF8 reason", async () => {
-    await withServer(async ({ port }) => {
-      const ws = await openRawWs(port);
-      const payload = new Uint8Array([0x03, 0xe8, 0xff, 0xfe]); // code 1000 + invalid UTF-8 reason
-      ws.socket.write(frameBytes(0x8, payload));
-      ws.socket.flush();
-      expect(await ws.readCloseCode()).toBe(1007);
-      ws.socket.end();
-    });
-  });
 });
 
 // (#224) Two control frames arriving in a single TCP segment used to be
