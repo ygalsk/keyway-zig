@@ -4,6 +4,7 @@
   "type": "module",
   "scripts": {
     "test": "bun test integration/ --preload ./preload.ts --timeout 10000",
-    "test:ci": "CLAUDECODE=1 bun test integration/ --preload ./preload.ts --bail --timeout 10000"
+    "test:ci": "CLAUDECODE=1 bun test integration/ --preload ./preload.ts --bail --timeout 10000",
+    "test:autobahn": "bun test autobahn/ --preload ./preload.ts --timeout 900000"
   }
 }
