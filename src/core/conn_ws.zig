@@ -10,17 +10,34 @@ const castUserdata = @import("../util/helpers.zig").castUserdata;
 const Lua = @import("luajit").Lua;
 const config = @import("../util/config.zig");
 
+/// A data frame whose declared payload is larger than the read buffer, so it
+/// is being drained across several recvs into `fragment_buf` (#244).
+const PartialFrame = struct {
+    /// FIN of the frame being drained — when the last byte lands, this says
+    /// whether the message is complete or more frames follow.
+    fin: bool,
+    /// Payload bytes of this frame still to come.
+    remaining: usize,
+    mask_key: [4]u8,
+    /// Payload bytes of this frame already unmasked, to keep the 4-byte mask
+    /// phase correct across a chunk boundary.
+    unmasked: usize,
+};
+
 /// WebSocket connection state — set after successful 101 upgrade.
 /// Stores Lua callback refs and reassembly buffer for fragmented messages.
 pub const WsState = struct {
     on_message_ref: i32,
     on_close_ref: i32,
-    /// Reassembly buffer for fragmented messages (continuation frames).
-    /// Null when no fragmented message is in progress.
+    /// Reassembly buffer for a message that isn't a single buffered frame —
+    /// either fragmented across frames (continuations) or a single frame too
+    /// large for the read buffer. Null when no such message is in progress.
     fragment_buf: ?std.ArrayListUnmanaged(u8) = null,
     /// Message type, set by the first data frame (RFC 6455 §5.4: all fragments
     /// of a message share the type set by the first fragment's opcode).
     fragment_opcode: ws.Opcode = .text,
+    /// Set while a frame's payload is still arriving. Null otherwise.
+    partial: ?PartialFrame = null,
 };
 
 /// True if the comma-separated header `value` contains `token` (case-insensitive).
@@ -140,11 +157,10 @@ fn armWsRecv(conn: *Connection) void {
         }
         break :blk cb.writeSlice();
     } else blk: {
-        // Defensive fallback: parseFrame now rejects any single frame whose
-        // declared length exceeds ws.MAX_SINGLE_FRAME_PAYLOAD before this
-        // point, so a legal frame should never fill the buffer without
-        // completing (#228). A bare close() here would still mean a bug
-        // upstream, not an expected path.
+        // Defensive fallback: a frame larger than the buffer is drained
+        // incrementally (#244) and a header is at most 14 bytes, so after
+        // compact() there is always room. Reaching this means a bug upstream,
+        // not an expected path.
         if (conn.read_buffer.availableWrite() == 0) {
             conn.close();
             return;
@@ -215,23 +231,162 @@ fn onWsRead(
     return .disarm;
 }
 
+/// Close the connection with the status code a frame parse error calls for.
+fn closeOnFrameError(conn: *Connection, err: anyerror) void {
+    if (err == error.FrameTooLarge) {
+        log.err().string("msg", "ws frame too large, sending close 1009").log();
+        sendWsClose(conn, 1009);
+    } else {
+        log.err().string("msg", "ws frame parse error, sending close 1002").log();
+        sendWsClose(conn, 1002);
+    }
+}
+
+/// Drop any in-progress reassembly. Used on the error paths, where the
+/// message will never be delivered.
+fn discardFragments(conn: *Connection) void {
+    const wss = &conn.ws_state.?;
+    if (wss.fragment_buf) |*fb| fb.deinit(conn.arena.allocator());
+    wss.fragment_buf = null;
+    wss.partial = null;
+}
+
+/// Dispatch the reassembled message sitting in fragment_buf, then clear it.
+fn dispatchFragmented(conn: *Connection) void {
+    const wss = &conn.ws_state.?;
+    var fb = wss.fragment_buf.?;
+    // dispatchWsMessage resets the arena that backs fb, so copy out first.
+    const payload = conn.base_allocator.dupe(u8, fb.items) catch {
+        discardFragments(conn);
+        sendWsClose(conn, 1011);
+        return;
+    };
+    defer conn.base_allocator.free(payload);
+    fb.deinit(conn.arena.allocator());
+    wss.fragment_buf = null;
+    dispatchWsMessage(conn, payload, wss.fragment_opcode == .text);
+}
+
+/// Begin draining a data frame whose payload is larger than the read buffer
+/// (#244). Such a frame can never be parsed in one shot, so its payload is
+/// accumulated into fragment_buf across recvs — the same buffer, and the same
+/// WS_MAX_MESSAGE_SIZE ceiling, that a fragmented message already uses.
+/// Returns false if the connection was closed instead.
+fn beginPartialFrame(conn: *Connection, hdr: ws.FrameHeader) bool {
+    const wss = &conn.ws_state.?;
+
+    switch (hdr.opcode) {
+        .text, .binary => {
+            // A new message while one is still being reassembled.
+            if (wss.fragment_buf != null) {
+                sendWsClose(conn, 1002);
+                return false;
+            }
+            wss.fragment_opcode = hdr.opcode;
+            wss.fragment_buf = .empty;
+        },
+        .continuation => {
+            if (wss.fragment_buf == null) {
+                sendWsClose(conn, 1002);
+                return false;
+            }
+        },
+        else => {
+            // RFC 6455 §5.5 caps control frames at 125 bytes, so one too big
+            // for the buffer is a protocol error, not something to drain.
+            sendWsClose(conn, 1002);
+            return false;
+        },
+    }
+
+    if (wss.fragment_buf.?.items.len + hdr.payload_len > config.WS_MAX_MESSAGE_SIZE) {
+        discardFragments(conn);
+        sendWsClose(conn, 1009);
+        return false;
+    }
+
+    conn.read_buffer.consume(hdr.header_len);
+    wss.partial = .{
+        .fin = hdr.fin,
+        .remaining = hdr.payload_len,
+        .mask_key = hdr.mask_key,
+        .unmasked = 0,
+    };
+    return true;
+}
+
+/// Append whatever of the in-progress frame's payload has arrived. Returns
+/// true if the frame finished and the caller should keep draining the buffer;
+/// false if the caller must return (awaiting more data, or closed).
+fn drainPartialFrame(conn: *Connection) bool {
+    const wss = &conn.ws_state.?;
+    const p = &wss.partial.?;
+
+    const data = conn.read_buffer.readSlice();
+    if (data.len == 0) {
+        armWsRecv(conn);
+        return false;
+    }
+
+    const take = @min(data.len, p.remaining);
+    const chunk = @as([*]u8, @constCast(data.ptr))[0..take];
+    ws.unmask(chunk, p.mask_key, p.unmasked);
+
+    var fb = wss.fragment_buf.?;
+    fb.appendSlice(conn.arena.allocator(), chunk) catch {
+        discardFragments(conn);
+        sendWsClose(conn, 1011);
+        return false;
+    };
+    wss.fragment_buf = fb;
+
+    conn.read_buffer.consume(take);
+    p.unmasked += take;
+    p.remaining -= take;
+    if (p.remaining > 0) {
+        armWsRecv(conn);
+        return false;
+    }
+
+    const was_final = p.fin;
+    wss.partial = null;
+    // Not FIN: more frames of this message follow, keep reading them.
+    if (!was_final) return true;
+
+    dispatchFragmented(conn);
+    return false;
+}
+
 /// Process complete WebSocket frames from the read buffer.
 pub fn processWsFrames(conn: *Connection) void {
     while (true) {
+        // Finish any frame still being drained before looking for a new header.
+        if (conn.ws_state.?.partial != null) {
+            if (!drainPartialFrame(conn)) return;
+            continue;
+        }
+
         const data = conn.read_buffer.readSlice();
         log.debug().string("msg", "ws processWsFrames").int("data_len", data.len).log();
         if (data.len == 0) break;
 
+        // Peek the header: a frame whose payload can never fit the buffer has
+        // to be drained incrementally rather than waited on (#244).
+        const peeked = ws.parseFrameHeader(data) catch |err| {
+            closeOnFrameError(conn, err);
+            return;
+        };
+        if (peeked) |hdr| {
+            if (hdr.header_len + hdr.payload_len > conn.read_buffer.data.len) {
+                if (!beginPartialFrame(conn, hdr)) return;
+                continue;
+            }
+        }
+
         // parseFrame needs mutable slice for in-place unmasking
         const mutable = @as([*]u8, @constCast(data.ptr))[0..data.len];
         const parse_result = ws.parseFrame(mutable) catch |err| {
-            if (err == error.FrameTooLarge) {
-                log.err().string("msg", "ws frame too large, sending close 1009").log();
-                sendWsClose(conn, 1009);
-            } else {
-                log.err().string("msg", "ws frame parse error, sending close 1002").log();
-                sendWsClose(conn, 1002);
-            }
+            closeOnFrameError(conn, err);
             return;
         };
 
@@ -311,30 +466,19 @@ pub fn processWsFrames(conn: *Connection) void {
                     };
                     // Check reassembled size limit
                     if (fb.items.len + f.frame.payload.len > config.WS_MAX_MESSAGE_SIZE) {
-                        fb.deinit(conn.arena.allocator());
-                        wss.fragment_buf = null;
+                        discardFragments(conn);
                         sendWsClose(conn, 1009); // message too big
                         return;
                     }
                     fb.appendSlice(conn.arena.allocator(), f.frame.payload) catch {
-                        fb.deinit(conn.arena.allocator());
-                        wss.fragment_buf = null;
+                        discardFragments(conn);
                         sendWsClose(conn, 1011);
                         return;
                     };
                     wss.fragment_buf = fb;
                     if (f.frame.fin) {
                         // Final fragment — dispatch the reassembled message
-                        const payload = conn.base_allocator.dupe(u8, fb.items) catch {
-                            fb.deinit(conn.arena.allocator());
-                            wss.fragment_buf = null;
-                            sendWsClose(conn, 1011);
-                            return;
-                        };
-                        defer conn.base_allocator.free(payload);
-                        fb.deinit(conn.arena.allocator());
-                        wss.fragment_buf = null;
-                        dispatchWsMessage(conn, payload, wss.fragment_opcode == .text);
+                        dispatchFragmented(conn);
                         return;
                     }
                 } else {

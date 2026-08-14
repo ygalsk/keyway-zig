@@ -22,11 +22,24 @@ pub const ParseResult = union(enum) {
     incomplete,
 };
 
-/// Parse a single WebSocket frame from data. Unmasking is done in-place.
-/// Client frames MUST be masked per RFC 6455 §5.1 (unmasked -> protocol
-/// error). RSV1-3 must be unset since we negotiate no extensions (§5.2).
-pub fn parseFrame(data: []u8) !ParseResult {
-    if (data.len < 2) return .incomplete;
+/// A frame's header, parsed without requiring its payload to be buffered.
+/// `payload_len` is the declared length; the payload may still be arriving.
+pub const FrameHeader = struct {
+    fin: bool,
+    opcode: Opcode,
+    payload_len: usize,
+    mask_key: [4]u8,
+    header_len: usize,
+};
+
+/// Parse just the frame header, which is 2-14 bytes. Returns null when fewer
+/// than that many bytes are buffered.
+///
+/// Split out from parseFrame (#244) so a frame larger than the read buffer can
+/// be recognised and drained incrementally instead of being rejected: the
+/// header is all you need to start streaming the payload.
+pub fn parseFrameHeader(data: []const u8) !?FrameHeader {
+    if (data.len < 2) return null;
 
     const b0 = data[0];
     const b1 = data[1];
@@ -41,45 +54,61 @@ pub fn parseFrame(data: []u8) !ParseResult {
     var pos: usize = 2;
 
     if (payload_len == 126) {
-        if (data.len < pos + 2) return .incomplete;
+        if (data.len < pos + 2) return null;
         payload_len = std.mem.readInt(u16, data[pos..][0..2], .big);
         pos += 2;
     } else if (payload_len == 127) {
-        if (data.len < pos + 8) return .incomplete;
+        if (data.len < pos + 8) return null;
         payload_len = std.mem.readInt(u64, data[pos..][0..8], .big);
         pos += 8;
     }
 
-    // A single frame's payload must fit the read buffer in one shot — it can
-    // never be assembled otherwise (#228). This is stricter than (and
-    // supersedes) the reassembled-message limit: a fragmented message may
-    // still reach WS_MAX_MESSAGE_SIZE across many frames, each ≤ this cap.
-    if (payload_len > @as(u64, MAX_SINGLE_FRAME_PAYLOAD)) return error.FrameTooLarge;
-    const payload_len_usize: usize = @intCast(payload_len);
+    // A frame is at most a whole message, so the message limit bounds it.
+    // Rejecting on the declared length means an absurd 64-bit length is a
+    // clean 1009 before a single payload byte is buffered.
+    if (payload_len > @as(u64, config.WS_MAX_MESSAGE_SIZE)) return error.FrameTooLarge;
 
-    if (masked) {
-        if (data.len < pos + 4) return .incomplete;
-        const mask_key = data[pos..][0..4];
-        pos += 4;
+    // RFC 6455 §5.1: a server MUST close the connection upon receiving
+    // an unmasked frame from a client.
+    if (!masked) return error.UnmaskedFrame;
+    if (data.len < pos + 4) return null;
+    const mask_key = data[pos..][0..4].*;
+    pos += 4;
 
-        const end = std.math.add(usize, pos, payload_len_usize) catch return error.FrameTooLarge;
-        if (data.len < end) return .incomplete;
+    return FrameHeader{
+        .fin = fin,
+        .opcode = opcode,
+        .payload_len = @intCast(payload_len),
+        .mask_key = mask_key,
+        .header_len = pos,
+    };
+}
 
-        const payload = data[pos..end];
-        // Unmask in-place
-        for (payload, 0..) |*b, i| {
-            b.* ^= mask_key[i % 4];
-        }
-
-        return .{ .frame = .{
-            .frame = .{ .fin = fin, .opcode = opcode, .payload = payload },
-            .consumed = end,
-        } };
-    } else {
-        // RFC 6455 §5.1: a server MUST close the connection upon receiving
-        // an unmasked frame from a client.
-        return error.UnmaskedFrame;
+/// Unmask `payload` in place. `offset` is how many bytes of this frame's
+/// payload were already unmasked, so the 4-byte mask phase carries correctly
+/// across a chunk boundary that isn't a multiple of 4 (#244).
+pub fn unmask(payload: []u8, mask_key: [4]u8, offset: usize) void {
+    for (payload, 0..) |*b, i| {
+        b.* ^= mask_key[(offset + i) % 4];
     }
+}
+
+/// Parse a single WebSocket frame whose payload is fully buffered. Unmasking
+/// is done in-place, so the payload is a zero-copy slice of `data`. Callers
+/// with a frame too large to buffer use parseFrameHeader + unmask instead.
+pub fn parseFrame(data: []u8) !ParseResult {
+    const hdr = try parseFrameHeader(data) orelse return .incomplete;
+
+    const end = std.math.add(usize, hdr.header_len, hdr.payload_len) catch return error.FrameTooLarge;
+    if (data.len < end) return .incomplete;
+
+    const payload = data[hdr.header_len..end];
+    unmask(payload, hdr.mask_key, 0);
+
+    return .{ .frame = .{
+        .frame = .{ .fin = hdr.fin, .opcode = hdr.opcode, .payload = payload },
+        .consumed = end,
+    } };
 }
 
 /// Serialize a server-to-client WebSocket frame (no mask).
@@ -119,18 +148,17 @@ pub const MAX_FRAME_OVERHEAD = 10;
 /// RFC 6455 §5.3: client frames carry a 4-byte mask key we don't emit ourselves.
 const MASK_KEY_SIZE = 4;
 
-/// Largest single (unfragmented) frame payload guaranteed to fit the read
-/// buffer in one recv. `config.READ_BUFFER_SIZE` is the hard cap on how much
-/// of one frame we can ever hold; a frame declaring more than this can never
-/// be assembled, so parseFrame rejects it up front (clean 1009) instead of
-/// spinning on `.incomplete` until the buffer fills (#228).
-pub const MAX_SINGLE_FRAME_PAYLOAD = config.READ_BUFFER_SIZE - MAX_FRAME_OVERHEAD - MASK_KEY_SIZE;
-
 comptime {
-    // Defined here (not config.zig) to avoid an import cycle: ws.zig already
-    // imports config.zig for READ_BUFFER_SIZE.
+    // A frame header (up to 14 bytes) must fit the read buffer, or no frame
+    // could ever be parsed. Defined here rather than config.zig to avoid an
+    // import cycle: ws.zig already imports config.zig.
+    //
+    // There is deliberately no cap tying a frame's *payload* to
+    // READ_BUFFER_SIZE (#244). A payload larger than the buffer is drained
+    // across recvs; the only ceiling is config.WS_MAX_MESSAGE_SIZE, which
+    // applies to the message however the sender chose to frame it.
     if (config.READ_BUFFER_SIZE <= MAX_FRAME_OVERHEAD + MASK_KEY_SIZE)
-        @compileError("READ_BUFFER_SIZE too small to hold even an empty WS frame");
+        @compileError("READ_BUFFER_SIZE too small to hold a WS frame header");
 }
 
 /// Compute the Sec-WebSocket-Accept value per RFC 6455 Section 4.2.2.

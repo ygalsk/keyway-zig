@@ -233,6 +233,128 @@ describe("websocket message type", () => {
   });
 });
 
+describe("websocket large messages", () => {
+  // (#244) A message's acceptability must not depend on how the sender chose
+  // to chop it. Before this, 100 KB in one frame was 1009 while the identical
+  // 100 KB in two 50 KB fragments echoed fine.
+  test("echoes the same 100 KB message whether sent as one frame or two", async () => {
+    await withServer(async ({ port }) => {
+      const payload = "x".repeat(100_000);
+
+      const one = await openRawWs(port);
+      one.socket.write(clientFrame(0x1, payload));
+      one.socket.flush();
+      expect(await one.readText()).toBe(payload);
+      one.socket.end();
+
+      const two = await openRawWs(port);
+      two.socket.write(clientFrame(0x1, payload.slice(0, 50_000), false));
+      two.socket.write(frameBytes(0x0, encoder.encode(payload.slice(50_000))));
+      two.socket.flush();
+      expect(await two.readText()).toBe(payload);
+      two.socket.end();
+    });
+  });
+
+  // (#244) Autobahn 1.1.6/1.1.7 — 65535 bytes is just over the old
+  // MAX_SINGLE_FRAME_PAYLOAD of 65522, which is why those cases failed.
+  test("echoes a 65535-byte single frame", async () => {
+    await withServer(async ({ port }) => {
+      const ws = await openRawWs(port);
+      const payload = "y".repeat(65535);
+      ws.socket.write(clientFrame(0x1, payload));
+      ws.socket.flush();
+      expect(await ws.readText()).toBe(payload);
+      ws.socket.end();
+    });
+  });
+
+  // (#244) The boundary itself: exactly WS_MAX_MESSAGE_SIZE is allowed, and
+  // the >1MB rejection above pins the other side of it.
+  test("echoes a single frame of exactly 1 MiB", async () => {
+    await withServer(async ({ port }) => {
+      const ws = await openRawWs(port);
+      const payload = "z".repeat(1_048_576);
+      ws.socket.write(clientFrame(0x2, payload));
+      ws.socket.flush();
+      expect((await ws.readBinary()).length).toBe(1_048_576);
+      ws.socket.end();
+    });
+  });
+
+  // (#244) Autobahn 1.1.8 — the same large frame dribbled in across many
+  // recvs. This is the case that needs the resumable payload drain, including
+  // carrying the mask offset across chunk boundaries that aren't multiples of 4.
+  test("echoes a large frame arriving in many small TCP chunks", async () => {
+    await withServer(async ({ port }) => {
+      const ws = await openRawWs(port);
+      const payload = "q".repeat(200_000);
+      const frame = clientFrame(0x1, payload);
+      // 4093 is coprime with 4, so chunk boundaries land on every mask phase.
+      for (let i = 0; i < frame.length; i += 4093) {
+        ws.socket.write(frame.slice(i, i + 4093));
+        ws.socket.flush();
+      }
+      expect(await ws.readText()).toBe(payload);
+      ws.socket.end();
+    });
+  });
+
+  // (#244) Large and small frames mix freely within one message, in either
+  // order — the drain path and the buffered path both feed fragment_buf, so
+  // both orderings have to reassemble identically.
+  test("reassembles a message mixing a large fragment with a small one", async () => {
+    await withServer(async ({ port }) => {
+      const big = "b".repeat(120_000);
+      const small = "s".repeat(10);
+
+      const largeFirst = await openRawWs(port);
+      largeFirst.socket.write(clientFrame(0x1, big, false));
+      largeFirst.socket.write(frameBytes(0x0, encoder.encode(small)));
+      largeFirst.socket.flush();
+      expect(await largeFirst.readText()).toBe(big + small);
+      largeFirst.socket.end();
+
+      const smallFirst = await openRawWs(port);
+      smallFirst.socket.write(clientFrame(0x1, small, false));
+      smallFirst.socket.write(frameBytes(0x0, encoder.encode(big)));
+      smallFirst.socket.flush();
+      expect(await smallFirst.readText()).toBe(small + big);
+      smallFirst.socket.end();
+    });
+  });
+
+  // (#244) The message ceiling still applies when the total is only reached
+  // by accumulating across frames, not by any single frame's length.
+  test("closes 1009 when large fragments together exceed the message limit", async () => {
+    await withServer(async ({ port }) => {
+      const ws = await openRawWs(port);
+      const chunk = "c".repeat(600_000);
+      ws.socket.write(clientFrame(0x1, chunk, false));
+      ws.socket.write(frameBytes(0x0, encoder.encode(chunk)));
+      ws.socket.flush();
+      expect(await ws.readCloseCode()).toBe(1009);
+      ws.socket.end();
+    });
+  });
+
+  // (#244) A control frame must still be handled promptly while a large data
+  // frame is mid-drain (RFC 6455 §5.5 — control frames may be interleaved).
+  test("keeps the connection healthy across a large frame followed by a ping", async () => {
+    await withServer(async ({ port }) => {
+      const ws = await openRawWs(port);
+      const payload = "w".repeat(150_000);
+      ws.socket.write(clientFrame(0x1, payload));
+      ws.socket.flush();
+      expect(await ws.readText()).toBe(payload);
+      ws.socket.write(frameBytes(0x9, encoder.encode("hb")));
+      ws.socket.flush();
+      expect(await ws.readPong()).toBe("hb");
+      ws.socket.end();
+    });
+  });
+});
+
 describe("websocket adversarial framing", () => {
   // (#165)
   test("echoes a frame whose header and payload arrive in separate writes", async () => {
@@ -250,7 +372,10 @@ describe("websocket adversarial framing", () => {
     });
   });
 
-  // (#166)
+  // (#166, #244) The message limit is WS_MAX_MESSAGE_SIZE, and it is now the
+  // ONLY limit — so this asserts the close code, not merely that a close
+  // happened. Note the payload is never sent: the declared length alone is
+  // enough to reject.
   test("rejects a 127-length frame declaring more than 1MB", async () => {
     await withServer(async ({ port }) => {
       const ws = await openRawWs(port);
@@ -261,28 +386,14 @@ describe("websocket adversarial framing", () => {
       frame.set([1, 2, 3, 4], 10);
       ws.socket.write(frame);
       ws.socket.flush();
-      expect(await ws.readClose()).toBe(true);
-      ws.socket.end();
-    });
-  });
-
-  // (#228) A legal single (unfragmented) frame whose declared length is under
-  // the 1MB message limit but over the 64KB read buffer used to be
-  // unassemblable: parseFrame kept returning `.incomplete` until the buffer
-  // filled, then armWsRecv gave up with a bare `close()` (client sees 1006).
-  // It must instead get a clean 1009, same as the existing >1MB case above.
-  test("closes with 1009 on a legal single frame too large for the read buffer", async () => {
-    await withServer(async ({ port }) => {
-      const ws = await openRawWs(port);
-      ws.socket.write(clientFrame(0x2, "x".repeat(100_000))); // binary, ~100KB
-      ws.socket.flush();
       expect(await ws.readCloseCode()).toBe(1009);
       ws.socket.end();
     });
   });
 
-  // (#228) The largest single-frame payload guaranteed to fit the read
-  // buffer: 65536 (READ_BUFFER_SIZE) - 10 (max frame header) - 4 (mask key).
+  // (#228) The largest single-frame payload that fits the read buffer in one
+  // recv: 65536 (READ_BUFFER_SIZE) - 10 (max frame header) - 4 (mask key).
+  // Still the zero-copy fast path after #244 — it must not regress.
   test("echoes a single frame at the read-buffer capacity and keeps the worker alive", async () => {
     await withServer(async ({ port }) => {
       const ws = await openRawWs(port);
