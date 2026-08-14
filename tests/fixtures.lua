@@ -106,7 +106,9 @@ keyway.routes["/test/ws"] = {
     GET = function(ctx)
         ctx.upgrade = "websocket"
         ctx.on_message = function(ws)
-            ws:send(ws.message)
+            -- Type-preserving echo: RFC 6455 says text and binary are
+            -- distinct message types, so an echo has to carry the type back.
+            ws:send(ws.message, ws.binary)
         end
         ctx.on_close = function() end
     end,
