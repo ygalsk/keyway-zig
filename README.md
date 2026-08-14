@@ -48,7 +48,7 @@ keyway.routes = {
         GET = function(ctx)
             ctx.upgrade = "websocket"
             ctx.on_message = function(ws)
-                ws:send(ws.message)
+                ws:send(ws.message, ws.binary)
             end
             ctx.on_close = function() end
         end,
@@ -151,7 +151,7 @@ Access is restricted to localhost (`127.0.0.1` / `::1`). Manual reload: `POST /_
 
 | Protocol | Directive | Notes |
 |---|---|---|
-| WebSocket | `ctx.upgrade = "websocket"` | Set `ctx.on_message` and `ctx.on_close` |
+| WebSocket | `ctx.upgrade = "websocket"` | Set `ctx.on_message` and `ctx.on_close`. In `on_message`: read `ws.message` / `ws.binary`, reply with `ws:send(data[, binary])` — omitting `binary` sends text |
 | SSE | `ctx.upgrade = "sse"` | Set `ctx.sse_room` for room-based broadcast |
 | Streaming | `ctx.upgrade = "stream"` | `coroutine.yield()` flushes each chunk |
 

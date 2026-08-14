@@ -38,6 +38,13 @@ const embedded_modules = .{
 /// Result of calling or resuming a Lua handler
 pub const HandlerResult = enum { completed, yielded };
 
+/// One outbound WebSocket message: payload plus the type it is to be framed
+/// as. Kept as a single value so the two can never drift apart (#243).
+pub const WsSend = struct {
+    data: []const u8,
+    binary: bool,
+};
+
 pub const LuaState = struct {
     lua: *Lua,
     allocator: std.mem.Allocator,
@@ -46,10 +53,15 @@ pub const LuaState = struct {
     cached_thread: *Lua = undefined,
     cached_thread_ref: i32 = 0,
 
-    // WS send payload written by keyway_ws_send during lua_resume, read by
+    // WS message written by keyway_ws_send during lua_resume, read by
     // conn_ws.submitWsSend after LUA_YIELD. libxev is single-threaded per
     // worker — no concurrent access between write and read.
-    pending_ws_send: ?[]const u8 = null,
+    //
+    // RFC 6455 §5.6 makes text and binary distinct message types, so the
+    // payload and its type travel together in one optional (#243): they must
+    // not be settable independently, or a stale type could frame the next
+    // message.
+    pending_ws_send: ?WsSend = null,
 
     // Temporary coroutine state (copied to Connection after yield)
     coroutine_ref: i32 = 0,
@@ -352,8 +364,11 @@ pub const LuaState = struct {
         }
     }
 
-    /// __keyway_ws_send(data) → yields, resumes after WS frame is sent.
-    /// arg 1 = self (WsContext userdata, from ws:send() colon syntax), arg 2 = data string.
+    /// __keyway_ws_send(data, binary) → yields, resumes after WS frame is sent.
+    /// arg 1 = self (WsContext userdata, from ws:send() colon syntax),
+    /// arg 2 = data string, arg 3 = optional truthy flag selecting a binary
+    /// frame (RFC 6455 opcode 0x2). Absent/false means text — so handlers
+    /// written before #243 keep sending text.
     fn keyway_ws_send(lua: *Lua) callconv(.c) c_int {
         const ud = lua.toUserdata(Lua.PseudoIndex.upvalue(1)) orelse {
             lua.pushString("ws_send: expected LuaState upvalue");
@@ -368,7 +383,7 @@ pub const LuaState = struct {
             return 0;
         };
 
-        state.pending_ws_send = data;
+        state.pending_ws_send = .{ .data = data, .binary = lua.toBoolean(3) };
 
         return c.lua_yield(@ptrCast(lua), 0);
     }

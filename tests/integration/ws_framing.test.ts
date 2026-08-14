@@ -70,6 +70,9 @@ async function openRawWs(port: number) {
   return {
     socket,
     readText: () => waitFor(() => readFrame(bytes, 0x1)),
+    // (#243) Binary echo must come back as opcode 0x2 with the bytes intact,
+    // so this returns the raw payload rather than a UTF-8 decode.
+    readBinary: () => waitFor(() => readFrameBytes(bytes, 0x2)),
     // (#224) Reads a pong frame (opcode 0xA) by payload.
     readPong: () => waitFor(() => readFrame(bytes, 0xa)),
     readClose: () => waitFor(() => (closed || readFrame(bytes, 0x8) !== null ? true : null)),
@@ -79,7 +82,7 @@ async function openRawWs(port: number) {
   };
 }
 
-function readFrame(bytes: number[], opcode: number): string | null {
+function readFrameBytes(bytes: number[], opcode: number): Uint8Array | null {
   if (bytes.length < 2) return null;
   let len = bytes[1] & 0x7f;
   let pos = 2;
@@ -96,7 +99,12 @@ function readFrame(bytes: number[], opcode: number): string | null {
   if ((bytes[0] & 0x0f) !== opcode) return null;
   const payload = Uint8Array.from(bytes.slice(pos, pos + len));
   bytes.splice(0, pos + len);
-  return decoder.decode(payload);
+  return payload;
+}
+
+function readFrame(bytes: number[], opcode: number): string | null {
+  const payload = readFrameBytes(bytes, opcode);
+  return payload === null ? null : decoder.decode(payload);
 }
 
 // (#175) Reads a close frame (opcode 0x8) and returns its status code, or 0
@@ -157,6 +165,73 @@ function frameBytes(
 function clientFrame(opcode: number, data: string, fin = true): Uint8Array {
   return frameBytes(opcode, encoder.encode(data), { fin });
 }
+
+describe("websocket message type", () => {
+  // (#243) RFC 6455 §5.6: text and binary are distinct message types, and the
+  // type is a handler decision — the engine must not force one. Autobahn 1.2.x.
+  test("echoes a binary message as a binary frame, bytes intact", async () => {
+    await withServer(async ({ port }) => {
+      const ws = await openRawWs(port);
+      // 0xfe/0xff never appear in valid UTF-8, so a text reply would either
+      // be rejected by the peer or come back mangled.
+      const payload = Uint8Array.from([0x00, 0xfe, 0xff, 0x01, 0x80]);
+      ws.socket.write(frameBytes(0x2, payload));
+      ws.socket.flush();
+      expect(Array.from(await ws.readBinary())).toEqual(Array.from(payload));
+      ws.socket.end();
+    });
+  });
+
+  // (#243) Autobahn 1.2.1 — a zero-length binary message is still binary.
+  test("echoes an empty binary message as an empty binary frame", async () => {
+    await withServer(async ({ port }) => {
+      const ws = await openRawWs(port);
+      ws.socket.write(frameBytes(0x2, new Uint8Array(0)));
+      ws.socket.flush();
+      expect((await ws.readBinary()).length).toBe(0);
+      ws.socket.end();
+    });
+  });
+
+  // (#243) The other half of the contract: text must stay text.
+  test("echoes a text message as a text frame", async () => {
+    await withServer(async ({ port }) => {
+      const ws = await openRawWs(port);
+      ws.socket.write(clientFrame(0x1, "hello"));
+      ws.socket.flush();
+      expect(await ws.readText()).toBe("hello");
+      ws.socket.end();
+    });
+  });
+
+  // (#243) The type is carried by the message, not the connection: a binary
+  // message must not leave the socket stuck in binary mode.
+  test("does not let a binary message make the next text reply binary", async () => {
+    await withServer(async ({ port }) => {
+      const ws = await openRawWs(port);
+      ws.socket.write(frameBytes(0x2, Uint8Array.from([0xfe])));
+      ws.socket.flush();
+      expect(Array.from(await ws.readBinary())).toEqual([0xfe]);
+      ws.socket.write(clientFrame(0x1, "back to text"));
+      ws.socket.flush();
+      expect(await ws.readText()).toBe("back to text");
+      ws.socket.end();
+    });
+  });
+
+  // (#243) A binary message reassembled from fragments keeps its type, which
+  // is set by the first fragment's opcode (RFC 6455 §5.4). Autobahn 1.2.x.
+  test("echoes a fragmented binary message as a binary frame", async () => {
+    await withServer(async ({ port }) => {
+      const ws = await openRawWs(port);
+      ws.socket.write(frameBytes(0x2, Uint8Array.from([0xfe, 0xff]), { fin: false }));
+      ws.socket.write(frameBytes(0x0, Uint8Array.from([0x00, 0x80])));
+      ws.socket.flush();
+      expect(Array.from(await ws.readBinary())).toEqual([0xfe, 0xff, 0x00, 0x80]);
+      ws.socket.end();
+    });
+  });
+});
 
 describe("websocket adversarial framing", () => {
   // (#165)

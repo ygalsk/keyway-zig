@@ -18,7 +18,8 @@ pub const WsState = struct {
     /// Reassembly buffer for fragmented messages (continuation frames).
     /// Null when no fragmented message is in progress.
     fragment_buf: ?std.ArrayListUnmanaged(u8) = null,
-    /// Original opcode of the first fragment (text or binary).
+    /// Message type, set by the first data frame (RFC 6455 §5.4: all fragments
+    /// of a message share the type set by the first fragment's opcode).
     fragment_opcode: ws.Opcode = .text,
 };
 
@@ -392,7 +393,7 @@ fn dispatchWsMessage(conn: *Connection, payload: []const u8, is_text: bool) void
     // Dispatch via shared coroutine infrastructure
     const result = conn.lua_state.dispatchCoroutine(
         wss.on_message_ref,
-        .{ .ws = .{ .message = payload_copy } },
+        .{ .ws = .{ .message = payload_copy, .binary = !is_text } },
     ) catch {
         conn.lua_state.current_connection = null;
         startWsRead(conn);
@@ -420,24 +421,25 @@ fn dispatchWsMessage(conn: *Connection, payload: []const u8, is_text: bool) void
 
 /// Take the pending WS send payload and frame+send it.
 fn submitWsSend(conn: *Connection) void {
-    const raw_data = conn.lua_state.pending_ws_send orelse {
+    const pending = conn.lua_state.pending_ws_send orelse {
         conn.resumeWithError(.server_error, "ws_send: no pending I/O");
         return;
     };
     conn.lua_state.pending_ws_send = null;
 
     // Arena-dupe send_data (Lua string may be GC'd across yield)
-    const data = conn.arena.allocator().dupe(u8, raw_data) catch {
+    const data = conn.arena.allocator().dupe(u8, pending.data) catch {
         conn.resumeWithError(.server_error, "ws_send: arena alloc failed");
         return;
     };
 
-    // Serialize as WS text frame
+    // Message type is the handler's call, per message (#243) — the engine
+    // never infers it from the inbound opcode.
     const frame_buf = conn.arena.allocator().alloc(u8, data.len + ws.MAX_FRAME_OVERHEAD) catch {
         conn.resumeWithError(.server_error, "ws_send: arena alloc failed");
         return;
     };
-    const frame_len = ws.serializeFrame(.text, data, frame_buf);
+    const frame_len = ws.serializeFrame(if (pending.binary) .binary else .text, data, frame_buf);
     const frame_data = frame_buf[0..frame_len];
 
     // frame_data is arena-owned, no dupe needed

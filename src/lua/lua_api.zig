@@ -251,10 +251,16 @@ fn luaHeadersNewIndex(lua: *Lua) callconv(.c) c_int {
 
 // === WsContext (WebSocket message context for on_message callbacks) ===
 
-/// WsContext userdata — holds a pointer to the current message payload.
-/// Created fresh per WS message dispatch.
+/// WsContext userdata — holds a pointer to the current message payload and
+/// its type. Created fresh per WS message dispatch.
+///
+/// RFC 6455 §5.6 gives text and binary different contracts (text is
+/// UTF-8-validated, binary is opaque), so the type is part of the message,
+/// not metadata about it. LuaJIT has a single binary-safe string type, so the
+/// type cannot be inferred from the payload and must be carried (#243).
 pub const WsContext = struct {
     message: []const u8,
+    binary: bool,
 };
 
 /// Helper: Get WsContext from userdata at given stack index.
@@ -277,6 +283,12 @@ fn luaWsContextIndex(lua: *Lua) callconv(.c) c_int {
             return 1;
         };
         lua.pushLString(ws_ctx.message);
+    } else if (std.mem.eql(u8, key_str, "binary")) {
+        const ws_ctx = getWsContext(lua, 1) orelse {
+            lua.pushNil();
+            return 1;
+        };
+        lua.pushBoolean(ws_ctx.binary);
     } else if (std.mem.eql(u8, key_str, "send")) {
         // Return the __keyway_ws_send global (C closure with LuaState upvalue)
         _ = lua.getGlobal("__keyway_ws_send");
@@ -286,7 +298,7 @@ fn luaWsContextIndex(lua: *Lua) callconv(.c) c_int {
     return 1;
 }
 
-/// ws:send(data) — Lua wrapper calls __keyway_ws_send(data) which is a C closure with LuaState upvalue.
+/// ws:send(data[, binary]) — Lua wrapper calls __keyway_ws_send which is a C closure with LuaState upvalue.
 /// Registered via registerAsyncApi in lua_state.zig.
 
 // === Metatable Registration ===
