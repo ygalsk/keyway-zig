@@ -1,6 +1,7 @@
 const std = @import("std");
 const logz = @import("logz");
 const cli = @import("../util/cli.zig");
+const log_ring = @import("log_ring.zig");
 
 /// Per-worker identity, set once at thread start via worker.zig
 pub threadlocal var worker_id: u16 = 0;
@@ -213,27 +214,88 @@ pub fn deinit() void {
     removeStderrPump();
 }
 
-pub fn info() logz.Logger {
-    if (!initialized) return logz.noop;
-    return logz.info().int("worker", worker_id);
+/// Wraps logz.Logger so every call site's `.log()` also tees the fully
+/// formatted line into the shared log ring (log_ring.zig, #230) before
+/// flushing to the real sink — the ring surfaces Lua tracebacks and other
+/// warn/error events in the dashboard console without a log aggregator.
+///
+/// Forwards exactly the five builder methods this codebase actually chains
+/// (string/stringSafe/int/err/fmt — verified across every call site). Add
+/// more only when a call site needs them.
+pub const Logger = struct {
+    inner: logz.Logger,
+    lvl: std.log.Level,
+
+    pub fn string(self: Logger, key: []const u8, value: ?[]const u8) Logger {
+        return .{ .inner = self.inner.string(key, value), .lvl = self.lvl };
+    }
+
+    pub fn stringSafe(self: Logger, key: []const u8, value: ?[]const u8) Logger {
+        return .{ .inner = self.inner.stringSafe(key, value), .lvl = self.lvl };
+    }
+
+    pub fn int(self: Logger, key: []const u8, value: anytype) Logger {
+        return .{ .inner = self.inner.int(key, value), .lvl = self.lvl };
+    }
+
+    pub fn err(self: Logger, value: anyerror) Logger {
+        return .{ .inner = self.inner.err(value), .lvl = self.lvl };
+    }
+
+    pub fn fmt(self: Logger, key: []const u8, comptime format: []const u8, values: anytype) Logger {
+        return .{ .inner = self.inner.fmt(key, format, values), .lvl = self.lvl };
+    }
+
+    /// Flush to the real sink (stderr, per logz config) and, first, tee the
+    /// fully-formatted line into the log ring.
+    ///
+    /// The capture calls the concrete logger's own `logTo` (LogFmt/Json)
+    /// directly — NOT the outer `logz.Logger.logTo`/`.log()` wrappers.
+    /// Those release the pooled logger back to logz's pool as a side
+    /// effect; logz's pool has no reentrancy guard, so calling two of them
+    /// on the same value would release it twice (use-after-free / a
+    /// duplicate pool entry another thread could then hand out twice).
+    /// Calling the concrete type's `logTo` directly writes bytes with no
+    /// such side effect, so it's safe to do here before the real `.log()`.
+    pub fn log(self: Logger) void {
+        var buf: [log_ring.MSG_CAP]u8 = undefined;
+        var w = std.Io.Writer.fixed(&buf);
+        switch (self.inner.inner) {
+            .noop => {},
+            inline else => |l| l.logTo(&w) catch {},
+        }
+        const captured = std.mem.trimEnd(u8, w.buffered(), " \n");
+        if (captured.len > 0) log_ring.push(self.lvl, worker_id, captured);
+        self.inner.log();
+    }
+};
+
+pub fn info() Logger {
+    return .{ .inner = if (!initialized) logz.noop else logz.info().int("worker", worker_id), .lvl = .info };
 }
 
-pub fn err() logz.Logger {
-    if (!initialized) return logz.noop;
-    return logz.err().int("worker", worker_id);
+pub fn err() Logger {
+    return .{ .inner = if (!initialized) logz.noop else logz.err().int("worker", worker_id), .lvl = .err };
 }
 
-pub fn warn() logz.Logger {
-    if (!initialized) return logz.noop;
-    return logz.warn().int("worker", worker_id);
+pub fn warn() Logger {
+    return .{ .inner = if (!initialized) logz.noop else logz.warn().int("worker", worker_id), .lvl = .warn };
 }
 
-pub fn debug() logz.Logger {
-    if (!initialized) return logz.noop;
-    return logz.debug().int("worker", worker_id);
+pub fn debug() Logger {
+    return .{ .inner = if (!initialized) logz.noop else logz.debug().int("worker", worker_id), .lvl = .debug };
 }
 
 /// Log a completed HTTP request in structured access format.
+///
+/// Deliberately bypasses the Logger wrapper above — every request
+/// (including a dashboard poll of GET /__keyway/api/log itself) completes
+/// with an access log line, so teeing this into the ring would make each
+/// poll's response perpetually "one behind": the poll's own access log
+/// entry lands in the ring just after the response snapshot is taken, and
+/// shows up as a spurious "new" entry on the very next poll. Access
+/// volume/detail already lives in /metrics; the ring is for the
+/// warn/error-level engine events (Lua tracebacks) that metrics can't show.
 pub fn accessLog(method: []const u8, path: []const u8, status: u16, dur_us: i64) void {
     if (!initialized) return;
     logz.info()
@@ -265,7 +327,7 @@ pub fn logFn(
     defer in_log = false;
 
     const logz_level = comptime toLogzLevel(level);
-    var logger = logz.loggerL(logz_level).int("worker", worker_id);
+    var logger: Logger = .{ .inner = logz.loggerL(logz_level).int("worker", worker_id), .lvl = level };
 
     const scope_str = if (comptime scope != .default) @tagName(scope) else "";
     if (scope_str.len > 0) {
@@ -273,4 +335,28 @@ pub fn logFn(
     }
 
     logger.fmt("msg", format, args).log();
+}
+
+// =============================================================================
+// Tests
+// =============================================================================
+
+test "log: err() tees the formatted line into the shared log ring" {
+    const allocator = std.testing.allocator;
+    try init(allocator, .debug, .logfmt, 1);
+    defer deinit();
+
+    err().string("msg", "boom-test-marker").int("code", 42).log();
+
+    const result = try log_ring.collectSince(allocator, 0);
+    defer log_ring.freeEntries(allocator, result.entries);
+
+    var found = false;
+    for (result.entries) |e| {
+        if (std.mem.indexOf(u8, e.msg, "boom-test-marker") != null) {
+            found = true;
+            try std.testing.expectEqual(std.log.Level.err, e.level);
+        }
+    }
+    try std.testing.expect(found);
 }

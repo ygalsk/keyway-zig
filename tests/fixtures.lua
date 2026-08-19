@@ -150,6 +150,29 @@ keyway.routes["/test/header-injection"] = {
     end,
 }
 
+-- (#230) Deliberately raises a Lua runtime error so the coroutine-error
+-- path in src/lua/lua_state.zig builds a debug.traceback and logs it —
+-- exercises the engine log ring end-to-end (tests/integration/log.test.ts).
+--
+-- A plain HTTP route won't do: every route under keyway.routes inherits the
+-- dashboard's global `localhost_guard` middleware (dashboard/keyway.lua),
+-- and __keyway_wrap_chain's pcall catches a handler error before it ever
+-- reaches the coroutine-level traceback path — it's logged as "middleware
+-- error" instead (no traceback field). WS on_message dispatch
+-- (dispatchCoroutine, called directly from conn_ws.zig) is NOT
+-- middleware-wrapped, so an error there is the one that actually exercises
+-- lines 249/255/264 of lua_state.zig.
+keyway.routes["/test/ws-error"] = {
+    GET = function(ctx)
+        ctx.upgrade = "websocket"
+        ctx.on_message = function(ws)
+            local this_is_nil = nil
+            this_is_nil.boom() -- indexing nil raises a Lua error
+        end
+        ctx.on_close = function() end
+    end,
+}
+
 keyway.routes["/test/mw"] = {
     middleware = { mw_before, mw_after },
     GET = function(ctx)

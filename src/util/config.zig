@@ -65,6 +65,14 @@ pub const PROXY_UPSTREAM_TIMEOUT_MS: u64 = 30_000;
 /// further — dropping individual events would silently corrupt the stream.
 pub const SSE_MAX_QUEUED_BYTES: usize = 1_048_576;
 
+/// Entry count for the in-memory engine log ring (#230). Fixed-size, shared
+/// across workers — oldest entries are overwritten once it fills.
+pub const LOG_RING_ENTRIES: usize = 1024;
+
+/// Per-entry message cap for the log ring (#230). Messages longer than this
+/// are truncated, not overflowed — bounded copy, no allocation on push.
+pub const LOG_RING_MSG_CAP: usize = 512;
+
 comptime {
     // Buffer sizes must be at least 4096 for reasonable HTTP operation
     if (READ_BUFFER_SIZE < 4096)
@@ -89,4 +97,8 @@ comptime {
         @compileError("STATIC_READ_SIZE must be >= 4096");
     if (PROXY_UPSTREAM_TIMEOUT_MS == 0)
         @compileError("PROXY_UPSTREAM_TIMEOUT_MS must be > 0");
+    if (LOG_RING_ENTRIES == 0)
+        @compileError("LOG_RING_ENTRIES must be > 0");
+    if (LOG_RING_MSG_CAP == 0)
+        @compileError("LOG_RING_MSG_CAP must be > 0");
 }

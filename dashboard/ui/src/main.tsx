@@ -177,7 +177,7 @@ import { ConsoleCore } from "./views/console";
 
 const WS_MESSAGE_MAX = 200;
 const ERROR_MAX = 10;
-const METRICS_POLL_MS = 2000;
+export const METRICS_POLL_MS = 2000;
 const MAC = typeof navigator !== "undefined" && /Mac/.test(navigator.userAgent);
 const CONSOLE_MIN_H = 120;
 const CONSOLE_MAX_VH = 70;

@@ -21,6 +21,8 @@ One worker thread per CPU core, pinned for cache locality. Each worker exclusive
 
 **No Lua state is shared. No cross-thread access. No mutexes on the hot path.** The only cross-worker mechanism is `SseBroadcastBus` (per-worker mutex-protected inboxes + `xev.Async` notifiers). eBPF can optionally pin a client to the same worker.
 
+**Two more documented exceptions**, both for admin/debug endpoints where per-worker state would be invisible to the rest: an inbound HTTP GET lands on one arbitrary worker (`SO_REUSEPORT`) and keep-alive pins the client to it, so a single global instance is the only way the other workers' activity is visible at all. `observability/prom.zig` (Prometheus metrics, atomics) and `observability/log_ring.zig` (bounded in-memory log ring behind `GET /__keyway/api/log`, per-slot seqlock — #230) both take this exception; neither is on the request hot path.
+
 ## 3. Request Lifecycle
 
 ```
@@ -54,7 +56,7 @@ Source lives under `src/`, grouped by responsibility. Read the directory, not a 
 | `lua/` | LuaJIT: `lua_state` (state, handler dispatch, coroutine lifecycle, async C functions: ws_send/sse_broadcast), `lua_api` (ctx/headers/params metatables), `lua_file_io` (admin file read/write/list C functions), `json`. |
 | `protocol/` | Protocol helpers and registries: `ws` frame codec, `sse` registry + broadcast bus. Connection-bound protocol adapters live in `core/`. |
 | `tls/` | `tls` (TlsContext/TlsConn/kTLS), `conn_tls` (inbound handshake). |
-| `observability/` | `prom` (Prometheus export, per-worker atomics), `log`. |
+| `observability/` | `prom` (Prometheus export, per-worker atomics), `log`, `log_ring` (in-memory log ring for the dashboard console, per-slot seqlock). |
 | `util/` | `buffer` (LinearBuffer), `config` (tunable constants), `cli`, `helpers` (`castUserdata`). |
 
 ## 6. The Lua Contract

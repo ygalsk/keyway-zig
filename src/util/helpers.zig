@@ -35,6 +35,15 @@ pub fn realtimeSeconds() i64 {
     return @as(i64, @intCast(ts.sec));
 }
 
+/// Wall-clock time in milliseconds since the Unix epoch. Same vDSO read as
+/// `realtimeSeconds`, millisecond-resolution for callers (e.g. the log ring,
+/// #230) that need to distinguish events within the same second.
+pub fn realtimeMillis() i64 {
+    var ts: std.os.linux.timespec = undefined;
+    _ = std.os.linux.clock_gettime(.REALTIME, &ts);
+    return @as(i64, @intCast(ts.sec)) * std.time.ms_per_s + @divTrunc(@as(i64, @intCast(ts.nsec)), std.time.ns_per_ms);
+}
+
 /// Format a Unix timestamp as an RFC 7231 IMF-fixdate HTTP-date, e.g.
 /// "Sun, 06 Nov 1994 08:49:37 GMT". Shared by the Date response header and
 /// static file Last-Modified.

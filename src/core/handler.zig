@@ -34,6 +34,7 @@ const error_response = @import("../http/error_response.zig");
 const ErrorCategory = error_response.ErrorCategory;
 const Server = @import("server.zig").Server;
 const prom = @import("../observability/prom.zig");
+const log_ring = @import("../observability/log_ring.zig");
 const static_mod = @import("../http/static.zig");
 const proxy_mod = @import("../http/proxy.zig");
 
@@ -857,6 +858,16 @@ pub const Connection = struct {
             return null;
         }
 
+        // Engine log ring endpoint (#230): surfaces Lua tracebacks and other
+        // warn/error engine events for the dashboard console. Handled before
+        // Lua routing, same as /health and /metrics.
+        if (std.mem.eql(u8, clean_path, "/__keyway/api/log")) {
+            const since_str = self.query_cache.get("since") orelse "0";
+            const since = std.fmt.parseInt(u64, since_str, 10) catch 0;
+            self.serveLogRing(self.arena.allocator(), since);
+            return null;
+        }
+
         // Reverse proxy routes: forward matching prefixes to upstream servers
         if (self.router.matchProxy(clean_path)) |proxy_match| {
             proxy_mod.serveProxy(self, request, proxy_match);
@@ -1049,6 +1060,27 @@ pub const Connection = struct {
         } else {
             self.sendJsonResponse(alloc, 503, "Service Unavailable", "{\"error\":\"reload not available\"}");
         }
+    }
+
+    /// Engine log ring endpoint (#230): GET /__keyway/api/log?since=<seq>.
+    fn serveLogRing(self: *Connection, alloc: std.mem.Allocator, since: u64) void {
+        self.writeLogRingJson(alloc, since) catch {
+            error_response.sendError(self, .server_error, "log read failed");
+        };
+    }
+
+    fn writeLogRingJson(self: *Connection, alloc: std.mem.Allocator, since: u64) !void {
+        const result = try log_ring.collectSince(alloc, since);
+        var aw: std.Io.Writer.Allocating = .init(alloc);
+        try aw.writer.writeAll("{\"entries\":[");
+        for (result.entries, 0..) |e, i| {
+            if (i > 0) try aw.writer.writeByte(',');
+            try aw.writer.print("{{\"seq\":{d},\"ts\":{d},\"level\":\"{s}\",\"worker\":{d},\"msg\":", .{ e.seq, e.ts_ms, @tagName(e.level), e.worker });
+            try std.json.Stringify.encodeJsonString(e.msg, .{}, &aw.writer);
+            try aw.writer.writeByte('}');
+        }
+        try aw.writer.print("],\"latest\":{d}}}", .{result.latest});
+        self.sendJsonResponse(alloc, 200, "OK", aw.writer.buffered());
     }
 
     /// pub: proxy.zig passes this directly as the completion callback for the
